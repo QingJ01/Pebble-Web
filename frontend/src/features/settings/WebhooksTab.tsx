@@ -170,7 +170,7 @@ export default function WebhooksTab() {
   }
 
   function buildConfig(): WebhookConfig {
-    const clean = (value: string) => value === SECRET_PLACEHOLDER ? "" : value.trim();
+    const clean = (value: string) => value === SECRET_PLACEHOLDER ? undefined : value.trim();
     switch (form.provider) {
       case "telegram":
         return { botToken: clean(form.botToken), chatId: form.chatId.trim() };
@@ -186,7 +186,7 @@ export default function WebhooksTab() {
         return { serverUrl: form.serverUrl.trim(), token: clean(form.token), priority: form.priority };
       case "feishu":
       case "dingtalk":
-        return { url: clean(form.url), secret: clean(form.secret) || undefined };
+        return { url: clean(form.url), secret: clean(form.secret) };
       default:
         return { url: clean(form.url) };
     }
@@ -230,7 +230,7 @@ export default function WebhooksTab() {
       if (endpoint) {
         await testSavedWebhook(endpoint.id);
       } else {
-        await testWebhook(form.provider, buildConfig());
+        await testWebhook(form.provider, buildConfig(), form.id);
       }
       addToast({ message: t("webhooks.testSent", "Test notification sent"), type: "success" });
     } catch (err) {
@@ -372,10 +372,7 @@ export default function WebhooksTab() {
           </label>
           {error && <p style={{ color: "#ef4444", fontSize: "12px" }}>{error}</p>}
           <div style={{ display: "flex", gap: "8px", justifyContent: "flex-end", marginTop: "4px" }}>
-            <button onClick={() => {
-              const saved = endpoints.find((endpoint) => endpoint.id === form.id);
-              saved ? void runTest(saved) : void runTest();
-            }} style={secondaryButtonStyle}>{t("webhooks.test", "Test")}</button>
+            <button onClick={() => void runTest()} style={secondaryButtonStyle}>{t("webhooks.test", "Test")}</button>
             <button onClick={() => { setEditing(false); setForm(emptyForm); }} style={secondaryButtonStyle}>{t("common.cancel")}</button>
             <button
               onClick={save}

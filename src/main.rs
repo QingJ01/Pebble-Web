@@ -35,13 +35,12 @@ async fn main() {
         let notification_state = state.clone();
         tokio::spawn(async move {
             while let Some(stored) = message_rx.recv().await {
-                if stored.notify {
-                    crate::rules_engine::handle_new_message(
-                        notification_state.clone(),
-                        stored.message,
-                    )
-                    .await;
-                }
+                crate::rules_engine::handle_new_message(
+                    notification_state.clone(),
+                    stored.message,
+                    stored.notify,
+                )
+                .await;
             }
         });
     }

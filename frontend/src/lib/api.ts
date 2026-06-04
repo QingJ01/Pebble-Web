@@ -579,8 +579,12 @@ export async function deleteWebhook(endpointId: string): Promise<void> {
   await api.delete(`/webhooks/${endpointId}`);
 }
 
-export async function testWebhook(provider: WebhookProvider, config: WebhookConfig): Promise<void> {
-  await api.post("/webhooks/test", { provider, config });
+export async function testWebhook(
+  provider: WebhookProvider,
+  config: WebhookConfig,
+  existingEndpointId?: string | null,
+): Promise<void> {
+  await api.post("/webhooks/test", { provider, config, existingEndpointId });
 }
 
 export async function testSavedWebhook(endpointId: string): Promise<void> {

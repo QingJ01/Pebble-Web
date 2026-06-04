@@ -18,9 +18,11 @@ struct RuleAction {
     value: Option<String>,
 }
 
-pub async fn handle_new_message(state: AppStateRef, message: Message) {
+pub async fn handle_new_message(state: AppStateRef, message: Message, notify_new_mail: bool) {
     let notification = NotificationMessage::from_message(&message);
-    send_new_mail_notifications(&state, &notification).await;
+    if notify_new_mail {
+        send_new_mail_notifications(&state, &notification).await;
+    }
     apply_rules(&state, &message, &notification).await;
 }
 
@@ -87,6 +89,23 @@ fn parse_conditions(json: &str) -> Vec<RuleCondition> {
         array.clone()
     } else if let Some(array) = value.get("conditions").and_then(Value::as_array) {
         array.clone()
+    } else if let Some(object) = value.as_object() {
+        return object
+            .iter()
+            .filter_map(|(field, value)| {
+                if field == "operator" || field == "conditions" {
+                    return None;
+                }
+                Some(RuleCondition {
+                    field: field.clone(),
+                    op: if field == "has_attachment" { "equals" } else { "contains" }.to_string(),
+                    value: value
+                        .as_str()
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| value.to_string()),
+                })
+            })
+            .collect();
     } else {
         Vec::new()
     };
@@ -108,7 +127,7 @@ fn parse_actions(json: &str) -> Vec<RuleAction> {
 fn parse_action_value(value: Value) -> Option<RuleAction> {
     if let Some(action_type) = value.as_str() {
         return Some(RuleAction {
-            action_type: action_type.to_string(),
+            action_type: normalize_action_type(action_type).to_string(),
             value: None,
         });
     }
@@ -116,7 +135,7 @@ fn parse_action_value(value: Value) -> Option<RuleAction> {
     let object = value.as_object()?;
     if let Some(action_type) = object.get("type").and_then(Value::as_str) {
         return Some(RuleAction {
-            action_type: action_type.to_string(),
+            action_type: normalize_action_type(action_type).to_string(),
             value: object
                 .get("value")
                 .and_then(Value::as_str)
@@ -126,9 +145,22 @@ fn parse_action_value(value: Value) -> Option<RuleAction> {
 
     let (action_type, value) = object.iter().next()?;
     Some(RuleAction {
-        action_type: action_type.clone(),
+        action_type: normalize_action_type(action_type).to_string(),
         value: value.as_str().map(ToString::to_string).or_else(|| Some(value.to_string())),
     })
+}
+
+fn normalize_action_type(action_type: &str) -> &str {
+    match action_type {
+        "archive" => "Archive",
+        "mark_read" | "markread" => "MarkRead",
+        "add_label" | "label" => "AddLabel",
+        "move_to_folder" | "move" => "MoveToFolder",
+        "set_kanban_column" => "SetKanbanColumn",
+        "send_webhook" | "webhook" => "SendWebhook",
+        "star" => "Star",
+        _ => action_type,
+    }
 }
 
 fn condition_matches(condition: &RuleCondition, message: &Message) -> bool {
@@ -177,7 +209,11 @@ async fn execute_action(
     match action.action_type.as_str() {
         "AddLabel" => state
             .store
-            .add_label(&message.id, required_value(action, "Label name")?)
+            .add_label_for_account(
+                &message.account_id,
+                &message.id,
+                required_value(action, "Label name")?,
+            )
             .map_err(|e| e.to_string()),
         "MoveToFolder" => {
             let value = required_value(action, "Folder")?;
@@ -196,6 +232,10 @@ async fn execute_action(
         "MarkRead" => state
             .store
             .update_message_flags(&message.id, Some(true), None)
+            .map_err(|e| e.to_string()),
+        "Star" => state
+            .store
+            .update_message_flags(&message.id, None, Some(true))
             .map_err(|e| e.to_string()),
         "Archive" => state.store.archive_message(&message.id).map_err(|e| e.to_string()),
         "SetKanbanColumn" => {

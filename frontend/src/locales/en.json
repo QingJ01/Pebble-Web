@@ -593,6 +593,7 @@
     "actionValue": "Action value",
     "kanbanColumn": "Kanban column",
     "conditionValueRequired": "Condition values cannot be empty.",
+    "actionValueRequired": "Action values cannot be empty.",
     "contextRuleName": "Selected text rule"
   },
   "webhooks": {

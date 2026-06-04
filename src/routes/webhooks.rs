@@ -24,6 +24,7 @@ pub struct SaveWebhookEndpointRequest {
 pub struct TestWebhookRequest {
     pub provider: WebhookProvider,
     pub config: Value,
+    pub existing_endpoint_id: Option<String>,
 }
 
 pub async fn list_webhooks(
@@ -80,8 +81,10 @@ pub async fn update_webhook(
         .ok_or_else(|| ApiError::NotFound("Webhook endpoint not found".to_string()))?;
 
     let mut config = parse_config(body.config)?;
-    let existing_config = decrypt_config(&state, &existing.encrypted_config)?;
-    merge_missing_config_fields(&mut config, existing_config);
+    if existing.endpoint.provider == body.provider {
+        let existing_config = decrypt_config(&state, &existing.encrypted_config)?;
+        merge_missing_config_fields(&mut config, existing_config);
+    }
     crate::notifications::validate_config(&body.provider, &config).map_err(ApiError::BadRequest)?;
     let encrypted_config = encrypt_config(&state, &config)?;
 
@@ -116,9 +119,21 @@ pub async fn delete_webhook(
 }
 
 pub async fn test_webhook(
+    State(state): State<AppStateRef>,
     Json(body): Json<TestWebhookRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let config = parse_config(body.config)?;
+    let mut config = parse_config(body.config)?;
+    if let Some(id) = body.existing_endpoint_id.as_deref() {
+        let existing = state
+            .store
+            .get_webhook_endpoint(id)
+            .map_err(|e| ApiError::Internal(format!("Failed to load webhook: {e}")))?
+            .ok_or_else(|| ApiError::NotFound("Webhook endpoint not found".to_string()))?;
+        if existing.endpoint.provider == body.provider {
+            let existing_config = decrypt_config(&state, &existing.encrypted_config)?;
+            merge_missing_config_fields(&mut config, existing_config);
+        }
+    }
     send_notification(&body.provider, &config, &NotificationMessage::test())
         .await
         .map_err(ApiError::BadRequest)?;
@@ -164,28 +179,28 @@ fn parse_config(value: Value) -> Result<WebhookConfig, ApiError> {
 }
 
 fn merge_missing_config_fields(config: &mut WebhookConfig, existing: WebhookConfig) {
-    if config.url.as_deref().unwrap_or_default().trim().is_empty() {
+    if config.url.is_none() {
         config.url = existing.url;
     }
-    if config.bot_token.as_deref().unwrap_or_default().trim().is_empty() {
+    if config.bot_token.is_none() {
         config.bot_token = existing.bot_token;
     }
-    if config.chat_id.as_deref().unwrap_or_default().trim().is_empty() {
+    if config.chat_id.is_none() {
         config.chat_id = existing.chat_id;
     }
-    if config.parse_mode.as_deref().unwrap_or_default().trim().is_empty() {
+    if config.parse_mode.is_none() {
         config.parse_mode = existing.parse_mode;
     }
-    if config.secret.as_deref().unwrap_or_default().trim().is_empty() {
+    if config.secret.is_none() {
         config.secret = existing.secret;
     }
-    if config.server_url.as_deref().unwrap_or_default().trim().is_empty() {
+    if config.server_url.is_none() {
         config.server_url = existing.server_url;
     }
-    if config.topic.as_deref().unwrap_or_default().trim().is_empty() {
+    if config.topic.is_none() {
         config.topic = existing.topic;
     }
-    if config.token.as_deref().unwrap_or_default().trim().is_empty() {
+    if config.token.is_none() {
         config.token = existing.token;
     }
 }

@@ -53,6 +53,13 @@ function serializeActions(actions: RuleAction[]): string {
   return serializeRuleActions(actions);
 }
 
+function needsActionValue(type: ActionType): boolean {
+  return type === "AddLabel"
+    || type === "MoveToFolder"
+    || type === "SetKanbanColumn"
+    || type === "SendWebhook";
+}
+
 // ── Form state ──────────────────────────────────────────────────
 interface RuleFormData {
   name: string;
@@ -154,6 +161,10 @@ export default function RulesTab() {
     }
     if (form.conditions.some((c) => !c.value.trim())) {
       setError(t("rules.conditionValueRequired", "Condition values cannot be empty."));
+      return;
+    }
+    if (form.actions.some((action) => needsActionValue(action.type) && !action.value?.trim())) {
+      setError(t("rules.actionValueRequired", "Action values cannot be empty."));
       return;
     }
 
