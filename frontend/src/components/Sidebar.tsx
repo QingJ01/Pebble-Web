@@ -12,6 +12,8 @@ import {
   Search,
   Clock,
   Star,
+  ChevronLeft,
+  ChevronRight,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { useUIStore } from "../stores/ui.store";
@@ -59,6 +61,7 @@ export default function Sidebar() {
   const activeView = useUIStore((s) => s.activeView);
   const setActiveView = useUIStore((s) => s.setActiveView);
   const sidebarCollapsed = useUIStore((s) => s.sidebarCollapsed);
+  const toggleSidebar = useUIStore((s) => s.toggleSidebar);
   const activeFolderId = useMailStore((s) => s.activeFolderId);
   const activeAccountId = useMailStore((s) => s.activeAccountId);
   const setActiveAccountId = useMailStore((s) => s.setActiveAccountId);
@@ -169,6 +172,9 @@ export default function Sidebar() {
     textAlign: "left",
     justifyContent: sidebarCollapsed ? "center" : "flex-start",
   };
+  const sidebarToggleLabel = sidebarCollapsed
+    ? t("sidebar.expand", "Expand sidebar")
+    : t("sidebar.collapse", "Collapse sidebar");
 
   return (
     <aside
@@ -187,6 +193,16 @@ export default function Sidebar() {
         pointerEvents: "auto",
       }}
     >
+      <button
+        type="button"
+        className="sidebar-toggle"
+        onClick={toggleSidebar}
+        aria-label={sidebarToggleLabel}
+        title={sidebarToggleLabel}
+      >
+        {sidebarCollapsed ? <ChevronRight size={16} /> : <ChevronLeft size={16} />}
+      </button>
+
       {/* Search button */}
       <nav aria-label={t("sidebar.search", "Search")} style={{ padding: "8px 6px 0", display: "flex", flexDirection: "column", gap: "1px" }}>
         <SidebarButton

@@ -100,6 +100,29 @@ html, body, #root {
   box-shadow: -1px 0 3px rgba(0, 0, 0, 0.15), 0 -1px 3px rgba(0, 0, 0, 0.1);
 }
 
+.sidebar-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  align-self: flex-end;
+  flex-shrink: 0;
+  width: 32px;
+  height: 32px;
+  margin: 6px 6px 0;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+
+.sidebar-toggle:hover {
+  background: var(--color-sidebar-hover);
+  border-color: var(--color-border);
+  color: var(--color-text-primary);
+}
+
 .app-shell--with-background .app-main-scroll {
   background-color: color-mix(in srgb, var(--color-main-bg) 68%, transparent);
   backdrop-filter: blur(16px) saturate(1.02);
