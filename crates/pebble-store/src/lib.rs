@@ -17,6 +17,7 @@ pub mod snooze;
 pub mod sync_failures;
 pub mod translate_config;
 pub mod trusted_senders;
+pub mod webhooks;
 
 use pebble_core::{PebbleError, Result};
 use r2d2::Pool;

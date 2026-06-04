@@ -2,7 +2,9 @@ mod auth;
 mod config;
 mod credentials;
 mod error;
+mod notifications;
 mod routes;
+mod rules_engine;
 mod state;
 mod sync;
 mod ws;
@@ -28,6 +30,21 @@ async fn main() {
 
     let state = AppState::init(config).expect("Failed to initialize app state");
     let state: AppStateRef = Arc::new(state);
+
+    if let Some(mut message_rx) = state.sync_manager.take_message_rx().await {
+        let notification_state = state.clone();
+        tokio::spawn(async move {
+            while let Some(stored) = message_rx.recv().await {
+                if stored.notify {
+                    crate::rules_engine::handle_new_message(
+                        notification_state.clone(),
+                        stored.message,
+                    )
+                    .await;
+                }
+            }
+        });
+    }
 
     // Spawn background sync for all configured accounts.
     let sync_manager = state.sync_manager.clone();

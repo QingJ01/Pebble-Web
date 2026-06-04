@@ -33,6 +33,9 @@ export type {
   TranslateConfig,
   TranslateResult,
   TrustedSender,
+  WebhookConfig,
+  WebhookEndpoint,
+  WebhookProvider,
 } from "./ipc-types";
 
 import type {
@@ -65,6 +68,9 @@ import type {
   TranslateConfig,
   TranslateResult,
   TrustedSender,
+  WebhookConfig,
+  WebhookEndpoint,
+  WebhookProvider,
 } from "./ipc-types";
 
 // ─── Account API ─────────────────────────────────────────────────────────────
@@ -530,6 +536,55 @@ export async function updateRule(rule: Rule): Promise<void> {
 
 export async function deleteRule(ruleId: string): Promise<void> {
   await api.delete(`/rules/${ruleId}`);
+}
+
+// ─── Webhook API ─────────────────────────────────────────────────────────────
+
+export async function listWebhooks(): Promise<WebhookEndpoint[]> {
+  const res = await api.get<WebhookEndpoint[]>("/webhooks");
+  return res.data;
+}
+
+export async function createWebhook(
+  name: string,
+  provider: WebhookProvider,
+  config: WebhookConfig,
+  isEnabled: boolean,
+  notifyOnNewMail: boolean,
+): Promise<WebhookEndpoint> {
+  const res = await api.post<WebhookEndpoint>("/webhooks", {
+    name,
+    provider,
+    config,
+    isEnabled,
+    notifyOnNewMail,
+  });
+  return res.data;
+}
+
+export async function updateWebhook(
+  endpoint: WebhookEndpoint,
+  config: WebhookConfig,
+): Promise<void> {
+  await api.put(`/webhooks/${endpoint.id}`, {
+    name: endpoint.name,
+    provider: endpoint.provider,
+    config,
+    isEnabled: endpoint.is_enabled,
+    notifyOnNewMail: endpoint.notify_on_new_mail,
+  });
+}
+
+export async function deleteWebhook(endpointId: string): Promise<void> {
+  await api.delete(`/webhooks/${endpointId}`);
+}
+
+export async function testWebhook(provider: WebhookProvider, config: WebhookConfig): Promise<void> {
+  await api.post("/webhooks/test", { provider, config });
+}
+
+export async function testSavedWebhook(endpointId: string): Promise<void> {
+  await api.post(`/webhooks/${endpointId}/test`);
 }
 
 // ─── Compose API ─────────────────────────────────────────────────────────────

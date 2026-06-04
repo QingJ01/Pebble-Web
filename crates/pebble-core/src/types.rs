@@ -214,6 +214,37 @@ pub struct Rule {
     pub updated_at: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum WebhookProvider {
+    Generic,
+    Slack,
+    Discord,
+    Telegram,
+    Feishu,
+    Dingtalk,
+    Wecom,
+    Ntfy,
+    Gotify,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebhookEndpoint {
+    pub id: String,
+    pub name: String,
+    pub provider: WebhookProvider,
+    pub is_enabled: bool,
+    pub notify_on_new_mail: bool,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct StoredWebhookEndpoint {
+    pub endpoint: WebhookEndpoint,
+    pub encrypted_config: Vec<u8>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PrivacyMode {
     Strict,
