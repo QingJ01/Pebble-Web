@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Plus, Pencil, Trash2, ShieldCheck, X } from "lucide-react";
-import { createRule, deleteRule, listRules, updateRule, type Rule } from "@/lib/api";
+import { createRule, deleteRule, listRules, listWebhooks, updateRule, type Rule, type WebhookEndpoint } from "@/lib/api";
 import ConfirmDialog from "@/components/ConfirmDialog";
 import { useToastStore } from "@/stores/toast.store";
 import { useUIStore } from "@/stores/ui.store";
@@ -23,7 +23,7 @@ interface Condition {
   value: string;
 }
 
-type ActionType = "AddLabel" | "MoveToFolder" | "MarkRead" | "Archive" | "SetKanbanColumn";
+type ActionType = "AddLabel" | "MoveToFolder" | "MarkRead" | "Archive" | "SetKanbanColumn" | "SendWebhook";
 type KanbanColumn = "todo" | "waiting" | "done";
 
 interface RuleAction {
@@ -33,7 +33,7 @@ interface RuleAction {
 
 const CONDITION_FIELDS: ConditionField[] = ["from", "to", "subject", "body", "has_attachment", "domain"];
 const CONDITION_OPS: ConditionOp[] = ["contains", "not_contains", "equals", "starts_with", "ends_with"];
-const ACTION_TYPES: ActionType[] = ["AddLabel", "MoveToFolder", "MarkRead", "Archive", "SetKanbanColumn"];
+const ACTION_TYPES: ActionType[] = ["AddLabel", "MoveToFolder", "MarkRead", "Archive", "SetKanbanColumn", "SendWebhook"];
 const KANBAN_COLUMNS: KanbanColumn[] = ["todo", "waiting", "done"];
 
 // ── Helpers to convert between visual model and JSON string ─────
@@ -51,6 +51,13 @@ function parseActions(json: string): RuleAction[] {
 
 function serializeActions(actions: RuleAction[]): string {
   return serializeRuleActions(actions);
+}
+
+function needsActionValue(type: ActionType): boolean {
+  return type === "AddLabel"
+    || type === "MoveToFolder"
+    || type === "SetKanbanColumn"
+    || type === "SendWebhook";
 }
 
 // ── Form state ──────────────────────────────────────────────────
@@ -87,6 +94,7 @@ export default function RulesTab() {
   const pendingRuleDraftText = useUIStore((s) => s.pendingRuleDraftText);
   const setPendingRuleDraftText = useUIStore((s) => s.setPendingRuleDraftText);
   const [rules, setRules] = useState<Rule[]>([]);
+  const [webhooks, setWebhooks] = useState<WebhookEndpoint[]>([]);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [form, setForm] = useState<RuleFormData>(emptyForm);
   const [error, setError] = useState<string | null>(null);
@@ -106,6 +114,9 @@ export default function RulesTab() {
 
   useEffect(() => {
     fetchRules();
+    listWebhooks()
+      .then(setWebhooks)
+      .catch((err) => console.error("Failed to fetch webhooks:", err));
   }, []);
 
   useEffect(() => {
@@ -150,6 +161,10 @@ export default function RulesTab() {
     }
     if (form.conditions.some((c) => !c.value.trim())) {
       setError(t("rules.conditionValueRequired", "Condition values cannot be empty."));
+      return;
+    }
+    if (form.actions.some((action) => needsActionValue(action.type) && !action.value?.trim())) {
+      setError(t("rules.actionValueRequired", "Action values cannot be empty."));
       return;
     }
 
@@ -318,7 +333,7 @@ export default function RulesTab() {
 
   // ── Action row renderer ─────────────────────────────────────
   function renderActionRow(action: RuleAction, index: number) {
-    const needsValue = action.type === "AddLabel" || action.type === "MoveToFolder" || action.type === "SetKanbanColumn";
+    const needsValue = action.type === "AddLabel" || action.type === "MoveToFolder" || action.type === "SetKanbanColumn" || action.type === "SendWebhook";
 
     return (
       <div key={index} style={{ display: "flex", gap: "6px", alignItems: "center" }}>
@@ -327,7 +342,11 @@ export default function RulesTab() {
           value={action.type}
           onChange={(e) => {
             const newType = e.target.value as ActionType;
-            const val = newType === "SetKanbanColumn" ? "todo" : "";
+            const val = newType === "SetKanbanColumn"
+              ? "todo"
+              : newType === "SendWebhook"
+                ? webhooks[0]?.id || ""
+                : "";
             updateAction(index, { type: newType, value: val });
           }}
           style={{ ...selectStyle, flex: "0 0 160px" }}
@@ -346,6 +365,18 @@ export default function RulesTab() {
             >
               {KANBAN_COLUMNS.map((c) => (
                 <option key={c} value={c}>{t(`rules.kanban_${c}`, c)}</option>
+              ))}
+            </select>
+          ) : action.type === "SendWebhook" ? (
+            <select
+              aria-label={t("rules.webhookEndpoint", "Webhook endpoint")}
+              value={action.value || ""}
+              onChange={(e) => updateAction(index, { value: e.target.value })}
+              style={{ ...selectStyle, flex: 1 }}
+            >
+              <option value="">{t("rules.selectWebhook", "Select webhook")}</option>
+              {webhooks.map((endpoint) => (
+                <option key={endpoint.id} value={endpoint.id}>{endpoint.name}</option>
               ))}
             </select>
           ) : (

@@ -17,6 +17,7 @@ pub mod sync;
 pub mod threads;
 pub mod translate;
 pub mod trusted_senders;
+pub mod webhooks;
 
 use crate::state::AppStateRef;
 use crate::ws;
@@ -194,6 +195,20 @@ pub fn build_router(state: AppStateRef, static_dir: &str) -> Router {
         .route(
             "/api/v1/rules/{id}",
             put(rules::update_rule).delete(rules::delete_rule),
+        )
+        // Webhooks
+        .route(
+            "/api/v1/webhooks",
+            get(webhooks::list_webhooks).post(webhooks::create_webhook),
+        )
+        .route("/api/v1/webhooks/test", post(webhooks::test_webhook))
+        .route(
+            "/api/v1/webhooks/{id}",
+            put(webhooks::update_webhook).delete(webhooks::delete_webhook),
+        )
+        .route(
+            "/api/v1/webhooks/{id}/test",
+            post(webhooks::test_saved_webhook),
         )
         // Labels
         .route("/api/v1/labels", get(labels::list_labels))

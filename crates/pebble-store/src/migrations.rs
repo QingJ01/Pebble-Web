@@ -2,7 +2,7 @@ use pebble_core::{PebbleError, Result};
 use rusqlite::Connection;
 use std::collections::HashSet;
 
-const CURRENT_VERSION: u32 = 12;
+const CURRENT_VERSION: u32 = 13;
 const ACCOUNT_COLOR_PRESETS: [&str; 12] = [
     "#0ea5e9", "#22c55e", "#f59e0b", "#8b5cf6", "#f43f5e", "#14b8a6", "#6366f1", "#f97316",
     "#06b6d4", "#ec4899", "#84cc16", "#3b82f6",
@@ -289,17 +289,46 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
         let tx = conn
             .unchecked_transaction()
             .map_err(|e| PebbleError::Storage(format!("Migration V12 begin failed: {e}")))?;
+        let labels_exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'labels')",
+            [],
+            |row| row.get(0),
+        )?;
         let has_account_id: bool = tx.prepare("SELECT account_id FROM labels LIMIT 0").is_ok();
-        if !has_account_id {
+        if labels_exists && !has_account_id {
             tx.execute_batch(
                 "ALTER TABLE labels ADD COLUMN account_id TEXT REFERENCES accounts(id) ON DELETE CASCADE;
                  CREATE INDEX IF NOT EXISTS idx_labels_account ON labels(account_id);",
             )
             .map_err(|e| PebbleError::Storage(format!("Migration V12 failed: {e}")))?;
         }
-        set_schema_version(&tx, CURRENT_VERSION)?;
+        set_schema_version(&tx, 12)?;
         tx.commit()
             .map_err(|e| PebbleError::Storage(format!("Migration V12 commit failed: {e}")))?;
+    }
+
+    if version < 13 {
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| PebbleError::Storage(format!("Migration V13 begin failed: {e}")))?;
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS webhook_endpoints (
+                 id TEXT PRIMARY KEY,
+                 name TEXT NOT NULL,
+                 provider TEXT NOT NULL CHECK(provider IN ('generic', 'slack', 'discord', 'telegram', 'feishu', 'dingtalk', 'wecom', 'ntfy', 'gotify')),
+                 encrypted_config BLOB NOT NULL,
+                 is_enabled INTEGER NOT NULL DEFAULT 1,
+                 notify_on_new_mail INTEGER NOT NULL DEFAULT 0,
+                 created_at INTEGER NOT NULL,
+                 updated_at INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_webhook_endpoints_enabled
+                 ON webhook_endpoints(is_enabled, notify_on_new_mail);",
+        )
+        .map_err(|e| PebbleError::Storage(format!("Migration V13 failed: {e}")))?;
+        set_schema_version(&tx, CURRENT_VERSION)?;
+        tx.commit()
+            .map_err(|e| PebbleError::Storage(format!("Migration V13 commit failed: {e}")))?;
     }
 
     Ok(())
@@ -435,6 +464,20 @@ CREATE TABLE IF NOT EXISTS rules (
     updated_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS webhook_endpoints (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    provider TEXT NOT NULL CHECK(provider IN ('generic', 'slack', 'discord', 'telegram', 'feishu', 'dingtalk', 'wecom', 'ntfy', 'gotify')),
+    encrypted_config BLOB NOT NULL,
+    is_enabled INTEGER NOT NULL DEFAULT 1,
+    notify_on_new_mail INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_webhook_endpoints_enabled
+    ON webhook_endpoints(is_enabled, notify_on_new_mail);
+
 CREATE TABLE IF NOT EXISTS translate_config (
     id TEXT PRIMARY KEY DEFAULT 'active',
     provider_type TEXT NOT NULL CHECK(provider_type IN ('deeplx', 'deepl', 'generic_api', 'llm')),
@@ -470,9 +513,11 @@ mod tests {
         let version: u32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 11);
+        assert_eq!(version, CURRENT_VERSION);
         conn.prepare("SELECT color FROM accounts LIMIT 0")
             .expect("accounts.color should exist after V11");
+        conn.prepare("SELECT id FROM webhook_endpoints LIMIT 0")
+            .expect("webhook_endpoints should exist after V13");
     }
 
     #[test]
