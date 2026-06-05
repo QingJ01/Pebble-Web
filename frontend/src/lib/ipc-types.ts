@@ -251,6 +251,42 @@ export interface Rule {
   updated_at: number;
 }
 
+export type WebhookProvider =
+  | "generic"
+  | "slack"
+  | "discord"
+  | "telegram"
+  | "feishu"
+  | "dingtalk"
+  | "wecom"
+  | "ntfy"
+  | "gotify";
+
+export interface WebhookConfig {
+  url?: string;
+  method?: string;
+  headers?: Record<string, string>;
+  botToken?: string;
+  chatId?: string;
+  parseMode?: string;
+  secret?: string;
+  serverUrl?: string;
+  topic?: string;
+  token?: string;
+  priority?: number;
+}
+
+/** @rust pebble-core/src/types.rs → WebhookEndpoint */
+export interface WebhookEndpoint {
+  id: string;
+  name: string;
+  provider: WebhookProvider;
+  is_enabled: boolean;
+  notify_on_new_mail: boolean;
+  created_at: number;
+  updated_at: number;
+}
+
 // ─── Search types ───────────────────────────────────────────────────────────────
 
 /**

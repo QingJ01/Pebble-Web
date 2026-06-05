@@ -5,7 +5,7 @@ import { useComposeStore } from "./compose.store";
 import { useMailStore } from "./mail.store";
 
 export type ActiveView = "inbox" | "kanban" | "settings" | "search" | "snoozed" | "starred" | "compose";
-export type SettingsTab = "accounts" | "general" | "proxy" | "appearance" | "privacy" | "rules" | "remoteWrites" | "translation" | "shortcuts" | "cloudSync" | "about";
+export type SettingsTab = "accounts" | "general" | "proxy" | "appearance" | "privacy" | "rules" | "webhooks" | "remoteWrites" | "translation" | "shortcuts" | "cloudSync" | "about";
 export type Theme = "light" | "dark" | "system";
 export type { Language } from "@/lib/language";
 export type NetworkStatus = "online" | "offline";

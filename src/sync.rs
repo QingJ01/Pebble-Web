@@ -5,7 +5,8 @@ use std::sync::Arc;
 use pebble_core::ProviderType;
 use pebble_crypto::CryptoService;
 use pebble_mail::{
-    ConnectionSecurity, ImapConfig, ImapMailProvider, SyncConfig, SyncTrigger, SyncWorker,
+    ConnectionSecurity, ImapConfig, ImapMailProvider, StoredMessage, SyncConfig, SyncTrigger,
+    SyncWorker,
 };
 use pebble_store::Store;
 use tokio::sync::{broadcast, mpsc, watch, Mutex};
@@ -29,6 +30,8 @@ pub struct SyncManager {
     attachments_dir: PathBuf,
     sync_interval_secs: u64,
     ws_tx: broadcast::Sender<String>,
+    message_tx: mpsc::UnboundedSender<StoredMessage>,
+    message_rx: Mutex<Option<mpsc::UnboundedReceiver<StoredMessage>>>,
 }
 
 impl SyncManager {
@@ -39,6 +42,7 @@ impl SyncManager {
         sync_interval_secs: u64,
         ws_tx: broadcast::Sender<String>,
     ) -> Self {
+        let (message_tx, message_rx) = mpsc::unbounded_channel();
         Self {
             handles: Mutex::new(HashMap::new()),
             store,
@@ -46,7 +50,13 @@ impl SyncManager {
             attachments_dir,
             sync_interval_secs,
             ws_tx,
+            message_tx,
+            message_rx: Mutex::new(Some(message_rx)),
         }
+    }
+
+    pub async fn take_message_rx(&self) -> Option<mpsc::UnboundedReceiver<StoredMessage>> {
+        self.message_rx.lock().await.take()
     }
 
     /// Start sync workers for all configured accounts.
@@ -117,7 +127,8 @@ impl SyncManager {
             self.store.clone(),
             stop_rx,
             self.attachments_dir.clone(),
-        );
+        )
+        .with_message_tx(self.message_tx.clone());
 
         let sync_config = SyncConfig {
             poll_interval_secs: self.sync_interval_secs,

@@ -51,6 +51,48 @@ impl Store {
         })
     }
 
+    pub fn find_or_create_label_for_account(&self, account_id: &str, name: &str) -> Result<String> {
+        self.with_write(|conn| {
+            let existing: Option<String> = conn
+                .query_row(
+                    "SELECT id FROM labels
+                     WHERE name = ?1 AND (account_id = ?2 OR account_id IS NULL)
+                     ORDER BY CASE WHEN account_id = ?2 THEN 0 ELSE 1 END
+                     LIMIT 1",
+                    rusqlite::params![name, account_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+
+            if let Some(id) = existing {
+                return Ok(id);
+            }
+
+            let id = new_id();
+            conn.execute(
+                "INSERT INTO labels (id, account_id, name, color, is_system) VALUES (?1, ?2, ?3, '#808080', 0)",
+                rusqlite::params![id, account_id, name],
+            )?;
+            Ok(id)
+        })
+    }
+
+    pub fn add_label_for_account(
+        &self,
+        account_id: &str,
+        message_id: &str,
+        label_name: &str,
+    ) -> Result<()> {
+        let label_id = self.find_or_create_label_for_account(account_id, label_name)?;
+        self.with_write(|conn| {
+            conn.execute(
+                "INSERT OR IGNORE INTO message_labels (message_id, label_id) VALUES (?1, ?2)",
+                rusqlite::params![message_id, label_id],
+            )?;
+            Ok(())
+        })
+    }
+
     /// Remove a label from a message (by label name).
     pub fn remove_label(&self, message_id: &str, label_name: &str) -> Result<()> {
         self.with_write(|conn| {
