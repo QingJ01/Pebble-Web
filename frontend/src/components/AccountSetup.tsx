@@ -4,7 +4,7 @@ import { useConfirmStore } from "@/stores/confirm.store";
 import { X } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { useQueryClient, type QueryClient } from "@tanstack/react-query";
-import { addAccount, startSync, testImapConnection } from "@/lib/api";
+import { addAccount, listOAuthProviders, startOAuthFlow, startSync, testImapConnection } from "@/lib/api";
 import type { AddAccountRequest } from "@/lib/api";
 import { accountsQueryKey } from "@/hooks/queries";
 import { extractErrorMessage } from "@/lib/extractErrorMessage";
@@ -99,13 +99,29 @@ export default function AccountSetup({ onClose }: Props) {
   const initialFormRef = useRef(initialForm);
 
   const [loading, setLoading] = useState(false);
+  const [oauthLoading, setOauthLoading] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [testLoading, setTestLoading] = useState(false);
   const [testResult, setTestResult] = useState<{ ok: boolean; message: string } | null>(null);
+  const [oauthProviders, setOauthProviders] = useState<string[]>([]);
 
   const dialogRef = useRef<HTMLDivElement>(null);
   const formRef = useRef(form);
   formRef.current = form;
+
+  useEffect(() => {
+    let cancelled = false;
+    listOAuthProviders()
+      .then((res) => {
+        if (!cancelled) setOauthProviders(res.providers);
+      })
+      .catch(() => {
+        if (!cancelled) setOauthProviders([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const requestClose = async () => {
     const current = formRef.current;
@@ -204,6 +220,18 @@ export default function AccountSetup({ onClose }: Props) {
     });
   }
 
+  async function handleOAuth(provider: "gmail" | "outlook") {
+    setError(null);
+    setOauthLoading(provider);
+    try {
+      const url = await startOAuthFlow(provider);
+      window.location.assign(url);
+    } catch (err) {
+      setError(extractErrorMessage(err));
+      setOauthLoading(null);
+    }
+  }
+
   async function handleSubmit(e: React.SyntheticEvent<HTMLFormElement>) {
     e.preventDefault();
     setError(null);
@@ -235,6 +263,10 @@ export default function AccountSetup({ onClose }: Props) {
     flexDirection: "column",
     gap: "0",
   };
+
+  const showGmailOAuth = oauthProviders.includes("gmail");
+  const showOutlookOAuth = oauthProviders.includes("outlook");
+  const showOAuth = showGmailOAuth || showOutlookOAuth;
 
   return (
     <div
@@ -305,6 +337,72 @@ export default function AccountSetup({ onClose }: Props) {
 
         {/* Scrollable body */}
         <div className="scroll-region account-setup-scroll" style={{ overflowY: "auto", padding: "20px" }}>
+          {showOAuth && (
+            <div style={{ marginBottom: "20px" }}>
+              <span style={{ ...labelStyle, marginBottom: "8px" }}>
+                {t("accountSetup.oauthSignIn", "Sign in with provider")}
+              </span>
+              <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
+                {showGmailOAuth && (
+                  <button
+                    type="button"
+                    disabled={!!oauthLoading || loading}
+                    onClick={() => void handleOAuth("gmail")}
+                    style={{
+                      padding: "8px 14px",
+                      borderRadius: "6px",
+                      border: "1px solid var(--color-border)",
+                      backgroundColor: "var(--color-bg-secondary, transparent)",
+                      color: "var(--color-text-primary)",
+                      fontSize: "13px",
+                      fontWeight: 500,
+                      cursor: oauthLoading ? "wait" : "pointer",
+                    }}
+                  >
+                    {oauthLoading === "gmail"
+                      ? t("accountSetup.redirecting", "Redirecting…")
+                      : t("accountSetup.signInGoogle", "Sign in with Google")}
+                  </button>
+                )}
+                {showOutlookOAuth && (
+                  <button
+                    type="button"
+                    disabled={!!oauthLoading || loading}
+                    onClick={() => void handleOAuth("outlook")}
+                    style={{
+                      padding: "8px 14px",
+                      borderRadius: "6px",
+                      border: "1px solid var(--color-border)",
+                      backgroundColor: "var(--color-bg-secondary, transparent)",
+                      color: "var(--color-text-primary)",
+                      fontSize: "13px",
+                      fontWeight: 500,
+                      cursor: oauthLoading ? "wait" : "pointer",
+                    }}
+                  >
+                    {oauthLoading === "outlook"
+                      ? t("accountSetup.redirecting", "Redirecting…")
+                      : t("accountSetup.signInOutlook", "Sign in with Outlook")}
+                  </button>
+                )}
+              </div>
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: "10px",
+                  marginTop: "16px",
+                  color: "var(--color-text-secondary)",
+                  fontSize: "12px",
+                }}
+              >
+                <div style={{ flex: 1, height: "1px", background: "var(--color-border)" }} />
+                <span>{t("accountSetup.orManual", "or add with password")}</span>
+                <div style={{ flex: 1, height: "1px", background: "var(--color-border)" }} />
+              </div>
+            </div>
+          )}
+
           {/* Preset buttons */}
           <div style={{ marginBottom: "20px" }}>
             <span style={{ ...labelStyle, marginBottom: "8px" }}>{t("accountSetup.quickSetup", "Quick setup")}</span>

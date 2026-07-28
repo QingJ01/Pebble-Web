@@ -134,6 +134,21 @@ The frontend development server proxies application requests to the backend.
 | `PEBBLE_STATIC_DIR` | No | `./frontend/dist` | Frontend static files directory |
 | `PEBBLE_SYNC_INTERVAL` | No | `300` | Mail sync interval in seconds |
 | `PEBBLE_ENCRYPTION_KEY` | No | auto-generated | 32-byte hex-encoded encryption key |
+| `PEBBLE_PUBLIC_URL` | No | `http://localhost:8080` | Public base URL used to build OAuth redirect URIs |
+| `GOOGLE_CLIENT_ID` | No | unset | Enables Gmail OAuth when set |
+| `GOOGLE_CLIENT_SECRET` | No | unset | Usually required for Google Web clients |
+| `MICROSOFT_CLIENT_ID` | No | unset | Enables Outlook OAuth when set |
+| `MICROSOFT_CLIENT_SECRET` | No | unset | Required for confidential Microsoft clients |
+
+### OAuth mailbox login (Gmail / Outlook)
+
+Web supports OAuth 2.0 Authorization Code + PKCE. Register this redirect URI with Google / Microsoft:
+
+```text
+{PEBBLE_PUBLIC_URL}/api/v1/oauth/callback
+```
+
+When the corresponding `*_CLIENT_ID` is unset, the OAuth button for that provider is hidden; IMAP app-password login remains available.
 
 Security notes:
 

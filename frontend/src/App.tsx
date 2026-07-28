@@ -4,6 +4,47 @@ import Layout from "./app/Layout";
 import { logStartupTiming } from "@/lib/startupTiming";
 import { isAuthenticated } from "./api-client";
 import { LoginPage } from "./features/auth/LoginPage";
+import { useUIStore } from "@/stores/ui.store";
+import { useToastStore } from "@/stores/toast.store";
+import { accountsQueryKey } from "@/hooks/queries";
+import { queryClient } from "@/lib/query-client";
+
+function consumeOAuthCallbackParams() {
+  const params = new URLSearchParams(window.location.search);
+  const oauth = params.get("oauth");
+  if (!oauth) return;
+
+  useUIStore.getState().setActiveView("settings");
+  useUIStore.getState().setSettingsTab("accounts");
+
+  if (oauth === "success") {
+    const email = params.get("email");
+    useToastStore.getState().addToast({
+      message: email
+        ? i18next.t("accountSetup.oauthSuccessWithEmail", "OAuth account added: {{email}}", { email })
+        : i18next.t("accountSetup.oauthSuccess", "OAuth account added successfully"),
+      type: "success",
+    });
+    void queryClient.invalidateQueries({ queryKey: accountsQueryKey });
+  } else if (oauth === "error") {
+    const message =
+      params.get("message") ||
+      i18next.t("accountSetup.oauthFailed", "OAuth sign-in failed");
+    useToastStore.getState().addToast({
+      message,
+      type: "error",
+    });
+  }
+
+  params.delete("oauth");
+  params.delete("accountId");
+  params.delete("email");
+  params.delete("message");
+  params.delete("tab");
+  const next = params.toString();
+  const cleanUrl = `${window.location.pathname}${next ? `?${next}` : ""}${window.location.hash}`;
+  window.history.replaceState({}, "", cleanUrl);
+}
 
 class ErrorBoundary extends Component<
   { children: ReactNode },
@@ -52,6 +93,12 @@ class ErrorBoundary extends Component<
 
 export default function App() {
   const [authed, setAuthed] = useState(isAuthenticated());
+
+  useEffect(() => {
+    if (authed) {
+      consumeOAuthCallbackParams();
+    }
+  }, [authed]);
 
   useEffect(() => {
     logStartupTiming("react app mounted");

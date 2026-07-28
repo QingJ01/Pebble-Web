@@ -67,3 +67,4 @@ pebble-search = { path = "crates/pebble-search" }
 pebble-crypto = { path = "crates/pebble-crypto" }
 pebble-mail = { path = "crates/pebble-mail" }
 pebble-translate = { path = "crates/pebble-translate" }
+pebble-oauth = { path = "crates/pebble-oauth" }

@@ -2,6 +2,7 @@ mod auth;
 mod config;
 mod credentials;
 mod error;
+mod oauth;
 mod routes;
 mod state;
 mod sync;

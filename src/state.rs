@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::oauth::OAuthSessionStore;
 use crate::sync::SyncManager;
 use pebble_crypto::CryptoService;
 use pebble_search::TantivySearch;
@@ -17,6 +18,7 @@ pub struct AppState {
     pub attachments_dir: PathBuf,
     pub sync_manager: Arc<SyncManager>,
     pub ws_broadcast: broadcast::Sender<String>,
+    pub oauth_sessions: OAuthSessionStore,
 }
 
 impl AppState {
@@ -48,6 +50,9 @@ impl AppState {
             crypto.clone(),
             attachments_dir.clone(),
             config.sync_interval_secs,
+            config.google_oauth.clone(),
+            config.microsoft_oauth.clone(),
+            config.oauth_callback_url(),
             ws_broadcast.clone(),
         ));
 
@@ -59,6 +64,7 @@ impl AppState {
             attachments_dir,
             sync_manager,
             ws_broadcast,
+            oauth_sessions: OAuthSessionStore::new(),
         })
     }
 }

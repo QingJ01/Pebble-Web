@@ -390,55 +390,83 @@ pub async fn test_account_connection(
     State(state): State<AppStateRef>,
     Path(account_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let store = state.store.clone();
-
-    let sync_state_json = store
-        .with_read_async(move |conn| {
-            let result: Option<Option<String>> = conn
-                .query_row(
-                    "SELECT sync_state FROM accounts WHERE id = ?1",
-                    rusqlite::params![account_id],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            Ok(result.flatten())
-        })
-        .await
+    let account = state
+        .store
+        .get_account(&account_id)
         .map_err(|e| ApiError::Internal(format!("Failed to get account: {e}")))?
-        .ok_or_else(|| ApiError::NotFound("Account not found or has no credentials".to_string()))?;
+        .ok_or_else(|| ApiError::NotFound("Account not found".to_string()))?;
 
-    let sync_state: serde_json::Value = serde_json::from_str(&sync_state_json)
-        .map_err(|e| ApiError::Internal(format!("Invalid sync state: {e}")))?;
+    match account.provider {
+        ProviderType::Gmail | ProviderType::Outlook => {
+            let provider = match account.provider {
+                ProviderType::Gmail => "gmail",
+                ProviderType::Outlook => "outlook",
+                ProviderType::Imap => unreachable!(),
+            };
+            let stored = crate::oauth::read_oauth_tokens(&state.crypto, &state.store, &account_id)
+                .map_err(|e| ApiError::Internal(e))?;
+            let (email, name) = crate::oauth::fetch_userinfo(provider, &stored.access_token)
+                .await
+                .map_err(|e| ApiError::BadRequest(format!("Connection failed: {e}")))?;
+            Ok(Json(serde_json::json!({
+                "ok": true,
+                "report": format!("OAuth OK — {name} <{email}>")
+            })))
+        }
+        ProviderType::Imap => {
+            let store = state.store.clone();
 
-    let encrypted_hex = sync_state["credentials"]
-        .as_str()
-        .ok_or_else(|| ApiError::BadRequest("No credentials in account".to_string()))?;
+            let sync_state_json = store
+                .with_read_async(move |conn| {
+                    let result: Option<Option<String>> = conn
+                        .query_row(
+                            "SELECT sync_state FROM accounts WHERE id = ?1",
+                            rusqlite::params![account_id],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    Ok(result.flatten())
+                })
+                .await
+                .map_err(|e| ApiError::Internal(format!("Failed to get account: {e}")))?
+                .ok_or_else(|| {
+                    ApiError::NotFound("Account not found or has no credentials".to_string())
+                })?;
 
-    let creds = crate::credentials::decrypt_credentials(&state.crypto, encrypted_hex)
-        .map_err(|e| ApiError::Internal(format!("Failed to decrypt credentials: {e}")))?;
+            let sync_state: serde_json::Value = serde_json::from_str(&sync_state_json)
+                .map_err(|e| ApiError::Internal(format!("Invalid sync state: {e}")))?;
 
-    let imap_creds = match &creds {
-        crate::credentials::AccountCredentials::Imap { imap, .. } => imap,
-    };
+            let encrypted_hex = sync_state["credentials"]
+                .as_str()
+                .ok_or_else(|| ApiError::BadRequest("No credentials in account".to_string()))?;
 
-    let security = match imap_creds.security.as_str() {
-        "starttls" => pebble_mail::ConnectionSecurity::StartTls,
-        "plain" => pebble_mail::ConnectionSecurity::Plain,
-        _ => pebble_mail::ConnectionSecurity::Tls,
-    };
+            let creds = crate::credentials::decrypt_credentials(&state.crypto, encrypted_hex)
+                .map_err(|e| ApiError::Internal(format!("Failed to decrypt credentials: {e}")))?;
 
-    let config = pebble_mail::ImapConfig {
-        host: imap_creds.host.clone(),
-        port: imap_creds.port,
-        username: imap_creds.username.clone(),
-        password: imap_creds.password.clone(),
-        security,
-        proxy: None,
-    };
+            let imap_creds = match &creds {
+                crate::credentials::AccountCredentials::Imap { imap, .. } => imap,
+            };
 
-    match pebble_mail::ImapProvider::test_connection_with_login(&config).await {
-        Ok(report) => Ok(Json(serde_json::json!({ "ok": true, "report": report }))),
-        Err(e) => Err(ApiError::BadRequest(format!("Connection failed: {e}"))),
+            let security = match imap_creds.security.as_str() {
+                "starttls" => pebble_mail::ConnectionSecurity::StartTls,
+                "plain" => pebble_mail::ConnectionSecurity::Plain,
+                _ => pebble_mail::ConnectionSecurity::Tls,
+            };
+
+            let config = pebble_mail::ImapConfig {
+                host: imap_creds.host.clone(),
+                port: imap_creds.port,
+                username: imap_creds.username.clone(),
+                password: imap_creds.password.clone(),
+                security,
+                proxy: None,
+            };
+
+            match pebble_mail::ImapProvider::test_connection_with_login(&config).await {
+                Ok(report) => Ok(Json(serde_json::json!({ "ok": true, "report": report }))),
+                Err(e) => Err(ApiError::BadRequest(format!("Connection failed: {e}"))),
+            }
+        }
     }
 }
 

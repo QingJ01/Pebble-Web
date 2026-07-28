@@ -20,7 +20,14 @@ pub struct OAuthConfig {
     pub auth_url: String,
     pub token_url: String,
     pub scopes: Vec<String>,
+    /// Used when [`Self::redirect_url`] is `None` to build `http://127.0.0.1:{port}/callback`
+    /// (desktop / native PKCE flow).
     pub redirect_port: u16,
+    /// Explicit redirect URI for web deployments. When set, overrides the localhost redirect.
+    pub redirect_url: Option<String>,
+    /// Extra query parameters added to the authorization request
+    /// (e.g. Google `access_type=offline`, `prompt=consent`).
+    pub extra_auth_params: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -110,11 +117,12 @@ impl OAuthManager {
             .map_err(|e| OAuthError::Config(format!("Invalid auth URL: {}", e)))?;
         let token_url = TokenUrl::new(self.config.token_url.clone())
             .map_err(|e| OAuthError::Config(format!("Invalid token URL: {}", e)))?;
-        let redirect_url = RedirectUrl::new(format!(
-            "http://127.0.0.1:{}/callback",
-            self.config.redirect_port
-        ))
-        .map_err(|e| OAuthError::Config(format!("Invalid redirect URL: {}", e)))?;
+        let redirect_raw = match &self.config.redirect_url {
+            Some(url) if !url.trim().is_empty() => url.clone(),
+            _ => format!("http://127.0.0.1:{}/callback", self.config.redirect_port),
+        };
+        let redirect_url = RedirectUrl::new(redirect_raw)
+            .map_err(|e| OAuthError::Config(format!("Invalid redirect URL: {}", e)))?;
         Ok(ParsedUrls {
             auth_url,
             token_url,
@@ -145,6 +153,10 @@ impl OAuthManager {
 
         for scope in &self.config.scopes {
             auth_request = auth_request.add_scope(Scope::new(scope.clone()));
+        }
+
+        for (key, value) in &self.config.extra_auth_params {
+            auth_request = auth_request.add_extra_param(key.clone(), value.clone());
         }
 
         let (auth_url, csrf_token) = auth_request.url();
@@ -281,7 +293,24 @@ mod tests {
             token_url: "https://oauth2.googleapis.com/token".into(),
             scopes: vec!["https://mail.google.com/".into()],
             redirect_port: 8765,
+            redirect_url: None,
+            extra_auth_params: vec![],
         }
+    }
+
+    #[tokio::test]
+    async fn start_auth_uses_explicit_redirect_url_and_extra_params() {
+        let mut cfg = test_config();
+        cfg.redirect_url = Some("https://mail.example.com/api/v1/oauth/callback".into());
+        cfg.extra_auth_params = vec![
+            ("access_type".into(), "offline".into()),
+            ("prompt".into(), "consent".into()),
+        ];
+        let mgr = OAuthManager::new(cfg);
+        let (url, _) = mgr.start_auth().await.unwrap();
+        assert!(url.contains("redirect_uri=https%3A%2F%2Fmail.example.com%2Fapi%2Fv1%2Foauth%2Fcallback"));
+        assert!(url.contains("access_type=offline"));
+        assert!(url.contains("prompt=consent"));
     }
 
     #[test]
@@ -396,6 +425,8 @@ mod tests {
             token_url: format!("http://{addr}/token"),
             scopes: vec![],
             redirect_port: 8765,
+            redirect_url: None,
+            extra_auth_params: vec![],
         });
         let token_pair = manager
             .complete_auth(

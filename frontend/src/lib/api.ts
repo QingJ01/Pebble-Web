@@ -118,14 +118,33 @@ export async function updateGlobalProxy(
   console.warn("[api] updateGlobalProxy not implemented in web");
 }
 
+export async function listOAuthProviders(): Promise<{
+  providers: string[];
+  redirectUri: string;
+}> {
+  const res = await api.get<{ providers: string[]; redirectUri: string }>("/oauth/providers");
+  return res.data;
+}
+
+export async function startOAuthFlow(provider: string): Promise<string> {
+  const res = await api.post<{ authorizationUrl: string; provider: string }>("/oauth/start", {
+    provider,
+  });
+  return res.data.authorizationUrl;
+}
+
+/** @deprecated Use startOAuthFlow — Web uses browser redirect + server callback. */
 export async function completeOAuthFlow(
-  _provider: string,
+  provider: string,
   _email: string,
   _displayName: string,
   _proxyHost?: string,
   _proxyPort?: number,
 ): Promise<Account> {
-  throw new Error("OAuth flow is not supported in the web version");
+  const url = await startOAuthFlow(provider);
+  window.location.assign(url);
+  // Navigation leaves this page; never resolves in practice.
+  return new Promise(() => {});
 }
 
 export async function getOAuthAccountProxy(_accountId: string): Promise<HttpProxyConfig | null> {

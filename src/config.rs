@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use crate::oauth::{optional_oauth_credentials, OAuthProviderCredentials};
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub port: u16,
@@ -7,6 +9,10 @@ pub struct Config {
     pub password_hash: String,
     pub jwt_secret: String,
     pub sync_interval_secs: u64,
+    /// Public base URL used to build OAuth redirect URIs, e.g. `https://mail.example.com`.
+    pub public_url: String,
+    pub google_oauth: Option<OAuthProviderCredentials>,
+    pub microsoft_oauth: Option<OAuthProviderCredentials>,
 }
 
 impl Config {
@@ -38,6 +44,20 @@ impl Config {
             .parse::<u64>()
             .map_err(|e| format!("Invalid PEBBLE_SYNC_INTERVAL: {e}"))?;
 
+        let public_url = std::env::var("PEBBLE_PUBLIC_URL")
+            .unwrap_or_else(|_| format!("http://localhost:{port}"))
+            .trim_end_matches('/')
+            .to_string();
+
+        let google_oauth = optional_oauth_credentials(
+            std::env::var("GOOGLE_CLIENT_ID").ok(),
+            std::env::var("GOOGLE_CLIENT_SECRET").ok(),
+        );
+        let microsoft_oauth = optional_oauth_credentials(
+            std::env::var("MICROSOFT_CLIENT_ID").ok(),
+            std::env::var("MICROSOFT_CLIENT_SECRET").ok(),
+        );
+
         let password_hash = crate::auth::hash_password(&password)
             .map_err(|e| format!("Failed to hash password: {e}"))?;
 
@@ -47,6 +67,9 @@ impl Config {
             password_hash,
             jwt_secret,
             sync_interval_secs,
+            public_url,
+            google_oauth,
+            microsoft_oauth,
         })
     }
 
@@ -64,6 +87,10 @@ impl Config {
 
     pub fn key_file_path(&self) -> PathBuf {
         self.data_dir.join("encryption.key")
+    }
+
+    pub fn oauth_callback_url(&self) -> String {
+        crate::oauth::oauth_callback_redirect_base(&self.public_url)
     }
 }
 
