@@ -19,6 +19,7 @@ function consumeOAuthCallbackParams() {
 
   if (oauth === "success") {
     const email = params.get("email");
+    const accountId = params.get("accountId");
     useToastStore.getState().addToast({
       message: email
         ? i18next.t("accountSetup.oauthSuccessWithEmail", "OAuth account added: {{email}}", { email })
@@ -26,6 +27,25 @@ function consumeOAuthCallbackParams() {
       type: "success",
     });
     void queryClient.invalidateQueries({ queryKey: accountsQueryKey });
+    void queryClient.invalidateQueries({ queryKey: ["folders"] });
+    void queryClient.invalidateQueries({ queryKey: ["messages"] });
+    void queryClient.invalidateQueries({ queryKey: ["threads"] });
+
+    // Sync may still be listing folders; poll briefly so the sidebar fills in.
+    if (accountId) {
+      let attempts = 8;
+      const poll = () => {
+        if (attempts <= 0) return;
+        attempts -= 1;
+        window.setTimeout(() => {
+          void queryClient.invalidateQueries({ queryKey: ["folders", accountId] });
+          void queryClient.invalidateQueries({ queryKey: ["folders"] });
+          void queryClient.invalidateQueries({ queryKey: ["messages"] });
+          poll();
+        }, 2000);
+      };
+      poll();
+    }
   } else if (oauth === "error") {
     const message =
       params.get("message") ||

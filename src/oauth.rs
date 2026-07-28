@@ -212,11 +212,11 @@ pub fn token_exchange_error_message(provider: &str, error: &OAuthError) -> Strin
     };
 
     if provider.eq_ignore_ascii_case("outlook")
-        && detail
-            .to_ascii_lowercase()
-            .contains("client_secret is missing")
+        && (detail.to_ascii_lowercase().contains("client_secret is missing")
+            || detail.contains("AADSTS70002")
+            || detail.to_ascii_lowercase().contains("include a 'client_secret'"))
     {
-        return "Token exchange failed: Microsoft rejected this app registration as a confidential client. Configure it as a public client, or set MICROSOFT_CLIENT_SECRET.".to_string();
+        return "Token exchange failed: Microsoft requires MICROSOFT_CLIENT_SECRET for this app registration. Create a client secret in Entra → Certificates & secrets, put the Value (not Secret ID) into MICROSOFT_CLIENT_SECRET, then restart Pebble.".to_string();
     }
 
     if provider.eq_ignore_ascii_case("gmail")

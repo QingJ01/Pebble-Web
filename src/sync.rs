@@ -6,7 +6,8 @@ use pebble_core::ProviderType;
 use pebble_crypto::CryptoService;
 use pebble_mail::{
     ConnectionSecurity, GmailProvider, GmailSyncWorker, ImapConfig, ImapMailProvider,
-    OutlookProvider, OutlookSyncWorker, SyncConfig, SyncTrigger, SyncWorker,
+    OutlookProvider, OutlookSyncWorker, StoredMessage, SyncConfig, SyncProgress, SyncTrigger,
+    SyncWorker,
 };
 use pebble_store::Store;
 use tokio::sync::{broadcast, mpsc, watch, Mutex};
@@ -103,6 +104,14 @@ impl SyncManager {
 
         let account_id_owned = account_id.to_string();
         let ws_tx = self.ws_tx.clone();
+        let (progress_tx, progress_rx) = mpsc::unbounded_channel::<SyncProgress>();
+        let (message_tx, message_rx) = mpsc::unbounded_channel::<StoredMessage>();
+        spawn_sync_ws_bridges(
+            ws_tx.clone(),
+            account_id_owned.clone(),
+            progress_rx,
+            message_rx,
+        );
 
         let task = match account.provider {
             ProviderType::Imap => {
@@ -113,7 +122,9 @@ impl SyncManager {
                     self.store.clone(),
                     stop_rx,
                     self.attachments_dir.clone(),
-                );
+                )
+                .with_progress_tx(progress_tx)
+                .with_message_tx(message_tx);
                 tokio::spawn(async move {
                     emit_sync_started(&ws_tx, &account_id_owned);
                     info!("IMAP sync worker started for account {}", account_id_owned);
@@ -132,7 +143,9 @@ impl SyncManager {
                     stop_rx,
                     self.attachments_dir.clone(),
                 )
-                .with_token_refresher(refresher, expires_at);
+                .with_token_refresher(refresher, expires_at)
+                .with_progress_tx(progress_tx)
+                .with_message_tx(message_tx);
                 tokio::spawn(async move {
                     emit_sync_started(&ws_tx, &account_id_owned);
                     info!("Gmail sync worker started for account {}", account_id_owned);
@@ -150,7 +163,9 @@ impl SyncManager {
                     self.store.clone(),
                     self.attachments_dir.clone(),
                 )
-                .with_token_refresher(refresher, expires_at);
+                .with_token_refresher(refresher, expires_at)
+                .with_progress_tx(progress_tx)
+                .with_message_tx(message_tx);
                 tokio::spawn(async move {
                     emit_sync_started(&ws_tx, &account_id_owned);
                     info!(
@@ -323,6 +338,45 @@ fn emit_sync_complete(ws_tx: &broadcast::Sender<String>, account_id: &str) {
         })
         .to_string(),
     );
+}
+
+fn emit_new_mail(ws_tx: &broadcast::Sender<String>, account_id: &str, message_id: &str) {
+    let _ = ws_tx.send(
+        serde_json::json!({
+            "type": "new_mail",
+            "account_id": account_id,
+            "message_id": message_id,
+        })
+        .to_string(),
+    );
+}
+
+/// Forward per-poll sync progress / new messages to the frontend WebSocket.
+/// Without this, `sync_complete` only fires when the worker task exits, so the
+/// UI keeps a stale empty folders/messages cache during continuous Outlook sync.
+fn spawn_sync_ws_bridges(
+    ws_tx: broadcast::Sender<String>,
+    account_id: String,
+    mut progress_rx: mpsc::UnboundedReceiver<SyncProgress>,
+    mut message_rx: mpsc::UnboundedReceiver<StoredMessage>,
+) {
+    let progress_ws = ws_tx.clone();
+    let progress_account_id = account_id.clone();
+    tokio::spawn(async move {
+        while let Some(progress) = progress_rx.recv().await {
+            if progress.status == "completed" {
+                emit_sync_complete(&progress_ws, &progress_account_id);
+            }
+        }
+    });
+
+    tokio::spawn(async move {
+        while let Some(stored) = message_rx.recv().await {
+            if stored.notify {
+                emit_new_mail(&ws_tx, &account_id, &stored.message.id);
+            }
+        }
+    });
 }
 
 /// Convert ImapCredentials to ImapConfig for pebble-mail.

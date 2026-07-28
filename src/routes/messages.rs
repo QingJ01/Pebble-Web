@@ -14,6 +14,22 @@ use serde_json::json;
 pub struct ListMessagesParams {
     pub limit: Option<u32>,
     pub offset: Option<u32>,
+    /// Comma-separated folder IDs for "all accounts" aggregated views.
+    pub folder_ids: Option<String>,
+}
+
+fn parse_folder_ids(folder_id: &str, folder_ids: Option<&str>) -> Vec<String> {
+    let mut ids: Vec<String> = folder_ids
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+    if ids.is_empty() {
+        ids.push(folder_id.to_string());
+    }
+    ids
 }
 
 pub async fn list_messages_by_folder(
@@ -23,66 +39,15 @@ pub async fn list_messages_by_folder(
 ) -> Result<Json<Vec<MessageSummary>>, ApiError> {
     let limit = params.limit.unwrap_or(50);
     let offset = params.offset.unwrap_or(0);
+    let folder_ids = parse_folder_ids(&folder_id, params.folder_ids.as_deref());
     let store = state.store.clone();
 
-    let messages = store
-        .with_read_async(move |conn| {
-            let sql =
-                "SELECT m.id, m.account_id, m.remote_id, m.message_id_header, m.in_reply_to, \
-                 m.references_header, m.thread_id, m.subject, m.snippet, m.from_address, \
-                 m.from_name, m.to_list, m.cc_list, m.bcc_list, \
-                 m.has_attachments, m.is_read, m.is_starred, m.is_draft, \
-                 m.date, m.remote_version, m.is_deleted, m.deleted_at, m.created_at, m.updated_at \
-                 FROM messages m \
-                 JOIN message_folders mf ON m.id = mf.message_id \
-                 WHERE mf.folder_id = ?1 AND m.is_deleted = 0 \
-                 ORDER BY m.date DESC \
-                 LIMIT ?2 OFFSET ?3";
-            let mut stmt = conn.prepare(sql)?;
-            let rows = stmt.query_map(rusqlite::params![folder_id, limit, offset], |row| {
-                let to_json: String = row.get(11)?;
-                let cc_json: String = row.get(12)?;
-                let bcc_json: String = row.get(13)?;
-                let has_attachments: i32 = row.get(14)?;
-                let is_read: i32 = row.get(15)?;
-                let is_starred: i32 = row.get(16)?;
-                let is_draft: i32 = row.get(17)?;
-                let is_deleted: i32 = row.get(20)?;
-                Ok(MessageSummary {
-                    id: row.get(0)?,
-                    account_id: row.get(1)?,
-                    remote_id: row.get(2)?,
-                    message_id_header: row.get(3)?,
-                    in_reply_to: row.get(4)?,
-                    references_header: row.get(5)?,
-                    thread_id: row.get(6)?,
-                    subject: row.get(7)?,
-                    snippet: row.get(8)?,
-                    from_address: row.get(9)?,
-                    from_name: row.get(10)?,
-                    to_list: serde_json::from_str(&to_json).unwrap_or_default(),
-                    cc_list: serde_json::from_str(&cc_json).unwrap_or_default(),
-                    bcc_list: serde_json::from_str(&bcc_json).unwrap_or_default(),
-                    has_attachments: has_attachments != 0,
-                    is_read: is_read != 0,
-                    is_starred: is_starred != 0,
-                    is_draft: is_draft != 0,
-                    date: row.get(18)?,
-                    remote_version: row.get(19)?,
-                    is_deleted: is_deleted != 0,
-                    deleted_at: row.get(21)?,
-                    created_at: row.get(22)?,
-                    updated_at: row.get(23)?,
-                })
-            })?;
-            let mut messages = Vec::new();
-            for row in rows {
-                messages.push(row?);
-            }
-            Ok(messages)
-        })
-        .await
-        .map_err(|e| ApiError::Internal(format!("Failed to list messages: {e}")))?;
+    let messages = tokio::task::spawn_blocking(move || {
+        store.list_messages_by_folders(&folder_ids, limit, offset)
+    })
+    .await
+    .map_err(|e| ApiError::Internal(format!("Failed to list messages: {e}")))?
+    .map_err(|e| ApiError::Internal(format!("Failed to list messages: {e}")))?;
 
     Ok(Json(messages))
 }

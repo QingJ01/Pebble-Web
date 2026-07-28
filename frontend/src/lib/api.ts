@@ -250,10 +250,16 @@ export async function listMessages(
   folderId: string,
   limit: number,
   offset: number,
-  _folderIds?: string[],
+  folderIds?: string[],
 ): Promise<MessageSummary[]> {
   const res = await api.get<MessageSummary[]>(`/folders/${folderId}/messages`, {
-    params: { limit, offset },
+    params: {
+      limit,
+      offset,
+      ...(folderIds && folderIds.length > 1
+        ? { folder_ids: folderIds.join(",") }
+        : {}),
+    },
   });
   return res.data;
 }
@@ -639,10 +645,16 @@ export async function listThreads(
   folderId: string,
   limit: number,
   offset: number,
-  _folderIds?: string[],
+  folderIds?: string[],
 ): Promise<ThreadSummary[]> {
   const res = await api.get<ThreadSummary[]>(`/folders/${folderId}/threads`, {
-    params: { limit, offset },
+    params: {
+      limit,
+      offset,
+      ...(folderIds && folderIds.length > 1
+        ? { folder_ids: folderIds.join(",") }
+        : {}),
+    },
   });
   return res.data;
 }

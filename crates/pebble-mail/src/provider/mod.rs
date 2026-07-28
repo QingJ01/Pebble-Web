@@ -8,7 +8,9 @@ use pebble_core::traits::MailProvider;
 use pebble_core::{HttpProxyConfig, PebbleError, ProviderType, Result};
 
 pub(crate) fn http_client_with_proxy(proxy: Option<&HttpProxyConfig>) -> Result<reqwest::Client> {
-    let mut builder = reqwest::ClientBuilder::new();
+    let mut builder = reqwest::ClientBuilder::new()
+        .timeout(std::time::Duration::from_secs(60))
+        .connect_timeout(std::time::Duration::from_secs(15));
     if let Some(proxy) = proxy {
         let uri = proxy.socks5h_uri().map_err(PebbleError::Network)?;
         let reqwest_proxy = reqwest::Proxy::all(&uri)

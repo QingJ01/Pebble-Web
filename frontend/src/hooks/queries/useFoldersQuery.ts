@@ -20,7 +20,8 @@ export function useFoldersForAccountsQuery(accountIds: string[]) {
       queryKey: foldersQueryKey(accountId),
       queryFn: () => listFolders(accountId),
       enabled: !!accountId,
-      staleTime: 60_000,
+      staleTime: 15_000,
+      refetchOnMount: "always",
     })),
   });
 

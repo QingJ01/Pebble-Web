@@ -11,6 +11,22 @@ use serde::Deserialize;
 pub struct ListThreadsParams {
     pub limit: Option<u32>,
     pub offset: Option<u32>,
+    /// Comma-separated folder IDs for "all accounts" aggregated views.
+    pub folder_ids: Option<String>,
+}
+
+fn parse_folder_ids(folder_id: &str, folder_ids: Option<&str>) -> Vec<String> {
+    let mut ids: Vec<String> = folder_ids
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+    if ids.is_empty() {
+        ids.push(folder_id.to_string());
+    }
+    ids
 }
 
 pub async fn list_threads_by_folder(
@@ -20,82 +36,15 @@ pub async fn list_threads_by_folder(
 ) -> Result<Json<Vec<ThreadSummary>>, ApiError> {
     let limit = params.limit.unwrap_or(50);
     let offset = params.offset.unwrap_or(0);
+    let folder_ids = parse_folder_ids(&folder_id, params.folder_ids.as_deref());
     let store = state.store.clone();
 
-    let threads = store
-        .with_read_async(move |conn| {
-            let mut stmt = conn.prepare(
-                "WITH thread_participants AS (
-                    SELECT thread_id,
-                           GROUP_CONCAT(from_address, '||') AS participants
-                    FROM (
-                        SELECT DISTINCT m3.thread_id, m3.from_address
-                        FROM messages m3
-                        JOIN message_folders mf3 ON m3.id = mf3.message_id
-                        WHERE mf3.folder_id = ?1
-                          AND m3.is_deleted = 0
-                          AND m3.thread_id IS NOT NULL
-                    )
-                    GROUP BY thread_id
-                 )
-                 SELECT
-                    m.thread_id,
-                    MAX(m.subject) as subject,
-                    MAX(CASE WHEN m.date = max_date.md THEN m.snippet ELSE '' END) as snippet,
-                    MAX(m.date) as last_date,
-                    COUNT(*) as message_count,
-                    SUM(CASE WHEN m.is_read = 0 THEN 1 ELSE 0 END) as unread_count,
-                    MAX(m.is_starred) as is_starred,
-                    COALESCE(tp.participants, '') as participants,
-                    MAX(m.has_attachments) as has_attachments
-                 FROM messages m
-                 JOIN message_folders mf ON m.id = mf.message_id
-                 JOIN (
-                    SELECT m2.thread_id, MAX(m2.date) as md
-                    FROM messages m2
-                    JOIN message_folders mf2 ON m2.id = mf2.message_id
-                    WHERE mf2.folder_id = ?1
-                      AND m2.is_deleted = 0
-                      AND m2.thread_id IS NOT NULL
-                    GROUP BY m2.thread_id
-                 ) max_date ON m.thread_id = max_date.thread_id
-                 LEFT JOIN thread_participants tp ON m.thread_id = tp.thread_id
-                 WHERE mf.folder_id = ?1 AND m.is_deleted = 0 AND m.thread_id IS NOT NULL
-                 GROUP BY m.thread_id
-                 ORDER BY last_date DESC
-                 LIMIT ?2 OFFSET ?3",
-            )?;
-
-            let rows = stmt.query_map(rusqlite::params![folder_id, limit, offset], |row| {
-                let participants_str: String = row.get(7)?;
-                let participants: Vec<String> = participants_str
-                    .split("||")
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                let is_starred: i32 = row.get(6)?;
-                let has_attachments: i32 = row.get(8)?;
-                Ok(ThreadSummary {
-                    thread_id: row.get(0)?,
-                    subject: row.get(1)?,
-                    snippet: row.get(2)?,
-                    last_date: row.get(3)?,
-                    message_count: row.get::<_, i64>(4)? as u32,
-                    unread_count: row.get::<_, i64>(5)? as u32,
-                    is_starred: is_starred != 0,
-                    participants,
-                    has_attachments: has_attachments != 0,
-                })
-            })?;
-
-            let mut results = Vec::new();
-            for row in rows {
-                results.push(row?);
-            }
-            Ok(results)
-        })
-        .await
-        .map_err(|e| ApiError::Internal(format!("Failed to list threads: {e}")))?;
+    let threads = tokio::task::spawn_blocking(move || {
+        store.list_threads_by_folders(&folder_ids, limit, offset)
+    })
+    .await
+    .map_err(|e| ApiError::Internal(format!("Failed to list threads: {e}")))?
+    .map_err(|e| ApiError::Internal(format!("Failed to list threads: {e}")))?;
 
     Ok(Json(threads))
 }
