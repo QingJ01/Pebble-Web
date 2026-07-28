@@ -14,6 +14,24 @@ use pebble_core::{
 
 const GRAPH_API_BASE: &str = "https://graph.microsoft.com/v1.0/me";
 
+/// Percent-encode a Graph resource id for use in URL path segments.
+/// Graph folder/message ids can contain characters like `=` or `/` that break unencoded paths.
+fn encode_graph_id(id: &str) -> String {
+    let mut out = String::with_capacity(id.len());
+    for b in id.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char);
+            }
+            _ => {
+                use std::fmt::Write;
+                let _ = write!(out, "%{b:02X}");
+            }
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Microsoft Graph API response types (internal)
 // ---------------------------------------------------------------------------
@@ -307,6 +325,19 @@ impl OutlookProvider {
             .map_err(|e| PebbleError::Network(format!("Graph API GET failed: {e}")))
     }
 
+    async fn get_delta(&self, url: &str) -> Result<reqwest::Response> {
+        // Prefer header must be sent on every delta/nextLink/deltaLink request.
+        // Do not use $top for delta paging — Graph treats Prefer maxpagesize as
+        // the page size and $top has been observed to truncate the whole round.
+        self.client
+            .get(url)
+            .bearer_auth(self.token())
+            .header("Prefer", "odata.maxpagesize=50")
+            .send()
+            .await
+            .map_err(|e| PebbleError::Network(format!("Graph API GET failed: {e}")))
+    }
+
     pub async fn fetch_messages_page(
         &self,
         folder_id: &str,
@@ -317,7 +348,8 @@ impl OutlookProvider {
         let url = match cursor {
             Some(cursor) if !cursor.is_empty() => cursor.to_string(),
             _ => format!(
-                "{GRAPH_API_BASE}/mailFolders/{folder_id}/messages?$top={limit}&$select={select}"
+                "{GRAPH_API_BASE}/mailFolders/{}/messages?$top={limit}&$select={select}",
+                encode_graph_id(folder_id)
             ),
         };
         let resp = self.get(&url).await?;
@@ -355,16 +387,19 @@ impl OutlookProvider {
         folder_id: &str,
         cursor: Option<&str>,
     ) -> Result<OutlookDeltaPage> {
+        // Keep body in $select so message detail works from local DB after sync.
+        // Page size is controlled by Prefer: odata.maxpagesize (see get_delta).
         let select = "id,subject,bodyPreview,body,from,toRecipients,ccRecipients,isRead,flag,isDraft,receivedDateTime,internetMessageId,conversationId,hasAttachments,categories";
         let url = match cursor {
             Some(cursor) if cursor.starts_with("https://") => cursor.to_string(),
             Some(cursor) if !cursor.is_empty() => cursor.to_string(),
             _ => format!(
-                "{GRAPH_API_BASE}/mailFolders/{folder_id}/messages/delta?$top=50&$select={select}"
+                "{GRAPH_API_BASE}/mailFolders/{}/messages/delta?$select={select}",
+                encode_graph_id(folder_id)
             ),
         };
 
-        let resp = self.get(&url).await?;
+        let resp = self.get_delta(&url).await?;
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
@@ -634,7 +669,7 @@ impl MailTransport for OutlookProvider {
         } else {
             format!(
                 "{GRAPH_API_BASE}/mailFolders/{}/messages/delta",
-                since.value
+                encode_graph_id(&since.value)
             )
         };
 
@@ -1314,6 +1349,13 @@ fn parse_graph_datetime(s: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_encode_graph_id_encodes_padding_and_slash() {
+        assert_eq!(encode_graph_id("AAMkAD="), "AAMkAD%3D");
+        assert_eq!(encode_graph_id("a/b"), "a%2Fb");
+        assert_eq!(encode_graph_id("Inbox"), "Inbox");
+    }
 
     #[test]
     fn test_well_known_name_to_role_inbox() {

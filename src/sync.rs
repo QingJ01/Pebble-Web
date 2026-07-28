@@ -5,14 +5,19 @@ use std::sync::Arc;
 use pebble_core::ProviderType;
 use pebble_crypto::CryptoService;
 use pebble_mail::{
-    ConnectionSecurity, ImapConfig, ImapMailProvider, SyncConfig, SyncTrigger, SyncWorker,
+    ConnectionSecurity, GmailProvider, GmailSyncWorker, ImapConfig, ImapMailProvider,
+    OutlookProvider, OutlookSyncWorker, StoredMessage, SyncConfig, SyncProgress, SyncTrigger,
+    SyncWorker,
 };
 use pebble_store::Store;
 use tokio::sync::{broadcast, mpsc, watch, Mutex};
 use tokio::task::JoinHandle;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 use crate::credentials::{decrypt_credentials, AccountCredentials, ImapCredentials};
+use crate::oauth::{
+    build_oauth_token_refresher, config_for_provider, read_oauth_tokens, OAuthProviderCredentials,
+};
 
 /// Handle for a running sync worker task.
 pub struct SyncHandle {
@@ -21,13 +26,16 @@ pub struct SyncHandle {
     pub task: JoinHandle<()>,
 }
 
-/// Manages background IMAP sync workers for all configured accounts.
+/// Manages background mail sync workers for all configured accounts.
 pub struct SyncManager {
     handles: Mutex<HashMap<String, SyncHandle>>,
     store: Arc<Store>,
     crypto: Arc<CryptoService>,
     attachments_dir: PathBuf,
     sync_interval_secs: u64,
+    google_oauth: Option<OAuthProviderCredentials>,
+    microsoft_oauth: Option<OAuthProviderCredentials>,
+    oauth_redirect_url: String,
     ws_tx: broadcast::Sender<String>,
 }
 
@@ -37,6 +45,9 @@ impl SyncManager {
         crypto: Arc<CryptoService>,
         attachments_dir: PathBuf,
         sync_interval_secs: u64,
+        google_oauth: Option<OAuthProviderCredentials>,
+        microsoft_oauth: Option<OAuthProviderCredentials>,
+        oauth_redirect_url: String,
         ws_tx: broadcast::Sender<String>,
     ) -> Self {
         Self {
@@ -45,6 +56,9 @@ impl SyncManager {
             crypto,
             attachments_dir,
             sync_interval_secs,
+            google_oauth,
+            microsoft_oauth,
+            oauth_redirect_url,
             ws_tx,
         }
     }
@@ -60,14 +74,6 @@ impl SyncManager {
         };
 
         for account in accounts {
-            if account.provider != ProviderType::Imap {
-                warn!(
-                    "Skipping sync for non-IMAP account {} (provider: {:?})",
-                    account.id, account.provider
-                );
-                continue;
-            }
-
             if let Err(e) = self.start_account_sync(&account.id).await {
                 error!("Failed to start sync for account {}: {e}", account.id);
             }
@@ -78,13 +84,120 @@ impl SyncManager {
     pub async fn start_account_sync(&self, account_id: &str) -> Result<(), String> {
         let mut handles = self.handles.lock().await;
 
-        // If already running, stop the existing worker first.
         if let Some(handle) = handles.remove(account_id) {
             let _ = handle.stop_tx.send(true);
             handle.task.abort();
         }
 
-        // Get credentials from sync_state.
+        let account = self
+            .store
+            .get_account(account_id)
+            .map_err(|e| format!("Failed to get account: {e}"))?
+            .ok_or_else(|| format!("Account not found: {account_id}"))?;
+
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let (trigger_tx, trigger_rx) = mpsc::unbounded_channel();
+        let sync_config = SyncConfig {
+            poll_interval_secs: self.sync_interval_secs,
+            ..SyncConfig::default()
+        };
+
+        let account_id_owned = account_id.to_string();
+        let ws_tx = self.ws_tx.clone();
+        let (progress_tx, progress_rx) = mpsc::unbounded_channel::<SyncProgress>();
+        let (message_tx, message_rx) = mpsc::unbounded_channel::<StoredMessage>();
+        spawn_sync_ws_bridges(
+            ws_tx.clone(),
+            account_id_owned.clone(),
+            progress_rx,
+            message_rx,
+        );
+
+        let task = match account.provider {
+            ProviderType::Imap => {
+                let provider = self.build_imap_provider(account_id)?;
+                let worker = SyncWorker::new(
+                    account_id.to_string(),
+                    provider,
+                    self.store.clone(),
+                    stop_rx,
+                    self.attachments_dir.clone(),
+                )
+                .with_progress_tx(progress_tx)
+                .with_message_tx(message_tx);
+                tokio::spawn(async move {
+                    emit_sync_started(&ws_tx, &account_id_owned);
+                    info!("IMAP sync worker started for account {}", account_id_owned);
+                    worker.run(sync_config, Some(trigger_rx)).await;
+                    emit_sync_complete(&ws_tx, &account_id_owned);
+                    info!("IMAP sync worker stopped for account {}", account_id_owned);
+                })
+            }
+            ProviderType::Gmail => {
+                let (provider, refresher, expires_at) =
+                    self.build_gmail_provider(account_id).await?;
+                let worker = GmailSyncWorker::new(
+                    account_id.to_string(),
+                    provider,
+                    self.store.clone(),
+                    stop_rx,
+                    self.attachments_dir.clone(),
+                )
+                .with_token_refresher(refresher, expires_at)
+                .with_progress_tx(progress_tx)
+                .with_message_tx(message_tx);
+                tokio::spawn(async move {
+                    emit_sync_started(&ws_tx, &account_id_owned);
+                    info!("Gmail sync worker started for account {}", account_id_owned);
+                    worker.run(sync_config, Some(trigger_rx)).await;
+                    emit_sync_complete(&ws_tx, &account_id_owned);
+                    info!("Gmail sync worker stopped for account {}", account_id_owned);
+                })
+            }
+            ProviderType::Outlook => {
+                let (provider, refresher, expires_at) =
+                    self.build_outlook_provider(account_id).await?;
+                let worker = OutlookSyncWorker::new(
+                    account_id.to_string(),
+                    provider,
+                    self.store.clone(),
+                    self.attachments_dir.clone(),
+                )
+                .with_token_refresher(refresher, expires_at)
+                .with_progress_tx(progress_tx)
+                .with_message_tx(message_tx);
+                tokio::spawn(async move {
+                    emit_sync_started(&ws_tx, &account_id_owned);
+                    info!(
+                        "Outlook sync worker started for account {}",
+                        account_id_owned
+                    );
+                    worker
+                        .run(sync_config, stop_rx, Some(trigger_rx))
+                        .await;
+                    emit_sync_complete(&ws_tx, &account_id_owned);
+                    info!(
+                        "Outlook sync worker stopped for account {}",
+                        account_id_owned
+                    );
+                })
+            }
+        };
+
+        handles.insert(
+            account_id.to_string(),
+            SyncHandle {
+                stop_tx,
+                trigger_tx,
+                task,
+            },
+        );
+
+        info!("Started sync for account {}", account_id);
+        Ok(())
+    }
+
+    fn build_imap_provider(&self, account_id: &str) -> Result<Arc<ImapMailProvider>, String> {
         let sync_state_json = self
             .store
             .get_account_sync_state(account_id)
@@ -105,58 +218,79 @@ impl SyncManager {
             AccountCredentials::Imap { ref imap, .. } => imap.clone(),
         };
 
-        let imap_config = build_imap_config(&imap_creds);
-        let provider = Arc::new(ImapMailProvider::new(imap_config));
+        Ok(Arc::new(ImapMailProvider::new(build_imap_config(
+            &imap_creds,
+        ))))
+    }
 
-        let (stop_tx, stop_rx) = watch::channel(false);
-        let (trigger_tx, trigger_rx) = mpsc::unbounded_channel();
-
-        let worker = SyncWorker::new(
-            account_id.to_string(),
-            provider,
+    async fn build_gmail_provider(
+        &self,
+        account_id: &str,
+    ) -> Result<
+        (
+            Arc<GmailProvider>,
+            pebble_mail::gmail_sync::TokenRefresher,
+            Option<i64>,
+        ),
+        String,
+    > {
+        let stored = read_oauth_tokens(&self.crypto, &self.store, account_id)?;
+        let oauth_config = config_for_provider(
+            "gmail",
+            self.google_oauth.as_ref(),
+            self.microsoft_oauth.as_ref(),
+            self.oauth_redirect_url.clone(),
+        )?;
+        let provider = Arc::new(
+            GmailProvider::new_with_proxy(stored.access_token.clone(), None)
+                .map_err(|e| format!("Failed to create Gmail provider: {e}"))?,
+        );
+        let refresher = build_oauth_token_refresher(
+            oauth_config,
+            stored.refresh_token.clone(),
+            stored.access_token.clone(),
+            self.crypto.clone(),
             self.store.clone(),
-            stop_rx,
-            self.attachments_dir.clone(),
-        );
-
-        let sync_config = SyncConfig {
-            poll_interval_secs: self.sync_interval_secs,
-            ..SyncConfig::default()
-        };
-
-        let account_id_owned = account_id.to_string();
-        let ws_tx = self.ws_tx.clone();
-        let task = tokio::spawn(async move {
-            info!("Sync worker started for account {}", account_id_owned);
-            let _ = ws_tx.send(
-                serde_json::json!({
-                    "type": "sync_started",
-                    "account_id": account_id_owned,
-                })
-                .to_string(),
-            );
-            worker.run(sync_config, Some(trigger_rx)).await;
-            let _ = ws_tx.send(
-                serde_json::json!({
-                    "type": "sync_complete",
-                    "account_id": account_id_owned,
-                })
-                .to_string(),
-            );
-            info!("Sync worker stopped for account {}", account_id_owned);
-        });
-
-        handles.insert(
             account_id.to_string(),
-            SyncHandle {
-                stop_tx,
-                trigger_tx,
-                task,
-            },
         );
+        Ok((provider, refresher, stored.expires_at))
+    }
 
-        info!("Started sync for account {}", account_id);
-        Ok(())
+    async fn build_outlook_provider(
+        &self,
+        account_id: &str,
+    ) -> Result<
+        (
+            Arc<OutlookProvider>,
+            pebble_mail::gmail_sync::TokenRefresher,
+            Option<i64>,
+        ),
+        String,
+    > {
+        let stored = read_oauth_tokens(&self.crypto, &self.store, account_id)?;
+        let oauth_config = config_for_provider(
+            "outlook",
+            self.google_oauth.as_ref(),
+            self.microsoft_oauth.as_ref(),
+            self.oauth_redirect_url.clone(),
+        )?;
+        let provider = Arc::new(
+            OutlookProvider::new_with_proxy(
+                stored.access_token.clone(),
+                account_id.to_string(),
+                None,
+            )
+            .map_err(|e| format!("Failed to create Outlook provider: {e}"))?,
+        );
+        let refresher = build_oauth_token_refresher(
+            oauth_config,
+            stored.refresh_token.clone(),
+            stored.access_token.clone(),
+            self.crypto.clone(),
+            self.store.clone(),
+            account_id.to_string(),
+        );
+        Ok((provider, refresher, stored.expires_at))
     }
 
     /// Stop sync for a single account.
@@ -181,16 +315,68 @@ impl SyncManager {
             .send(SyncTrigger::Manual)
             .map_err(|_| "Sync worker channel closed".to_string())?;
 
-        let _ = self.ws_tx.send(
-            serde_json::json!({
-                "type": "sync_started",
-                "account_id": account_id,
-            })
-            .to_string(),
-        );
-
+        emit_sync_started(&self.ws_tx, account_id);
         Ok(())
     }
+}
+
+fn emit_sync_started(ws_tx: &broadcast::Sender<String>, account_id: &str) {
+    let _ = ws_tx.send(
+        serde_json::json!({
+            "type": "sync_started",
+            "account_id": account_id,
+        })
+        .to_string(),
+    );
+}
+
+fn emit_sync_complete(ws_tx: &broadcast::Sender<String>, account_id: &str) {
+    let _ = ws_tx.send(
+        serde_json::json!({
+            "type": "sync_complete",
+            "account_id": account_id,
+        })
+        .to_string(),
+    );
+}
+
+fn emit_new_mail(ws_tx: &broadcast::Sender<String>, account_id: &str, message_id: &str) {
+    let _ = ws_tx.send(
+        serde_json::json!({
+            "type": "new_mail",
+            "account_id": account_id,
+            "message_id": message_id,
+        })
+        .to_string(),
+    );
+}
+
+/// Forward per-poll sync progress / new messages to the frontend WebSocket.
+/// Without this, `sync_complete` only fires when the worker task exits, so the
+/// UI keeps a stale empty folders/messages cache during continuous Outlook sync.
+fn spawn_sync_ws_bridges(
+    ws_tx: broadcast::Sender<String>,
+    account_id: String,
+    mut progress_rx: mpsc::UnboundedReceiver<SyncProgress>,
+    mut message_rx: mpsc::UnboundedReceiver<StoredMessage>,
+) {
+    let progress_ws = ws_tx.clone();
+    let progress_account_id = account_id.clone();
+    tokio::spawn(async move {
+        while let Some(progress) = progress_rx.recv().await {
+            if progress.status == "completed" {
+                emit_sync_complete(&progress_ws, &progress_account_id);
+            }
+        }
+    });
+
+    tokio::spawn(async move {
+        while let Some(stored) = message_rx.recv().await {
+            if stored.notify {
+                emit_new_mail(&ws_tx, &account_id, &stored.message.id);
+            }
+        }
+    });
 }
 
 /// Convert ImapCredentials to ImapConfig for pebble-mail.

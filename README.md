@@ -7,8 +7,9 @@ Pebble Web 是一个可自托管的 Web 邮件客户端，基于桌面端 [Pebbl
 ## 主要功能
 
 - 多账户邮件管理：收件箱、文件夹、会话、星标、归档、回收站
+- 邮件账号：IMAP/SMTP 密码登录，以及 Gmail / Outlook OAuth 2.0（PKCE）授权登录
 - 邮件撰写：富文本、Markdown、HTML、附件、回复、转发、草稿
-- 邮件同步：支持 IMAP/SMTP，后台自动同步，可配置同步间隔
+- 邮件同步：支持 IMAP/SMTP 与 Gmail/Outlook API，后台自动同步，可配置同步间隔
 - 全文搜索：基于 Tantivy，支持常用邮件检索条件
 - 批量操作：归档、删除、标记已读/未读、星标
 - 标签与看板：自定义标签、邮件任务看板、上下文备注
@@ -134,6 +135,28 @@ npm run dev
 | `PEBBLE_STATIC_DIR` | 否 | `./frontend/dist` | 前端静态文件目录 |
 | `PEBBLE_SYNC_INTERVAL` | 否 | `300` | 邮件同步间隔，单位秒 |
 | `PEBBLE_ENCRYPTION_KEY` | 否 | 自动生成 | 32 字节 Hex 编码加密密钥 |
+| `PEBBLE_PUBLIC_URL` | 否 | `http://localhost:8080` | 对外访问根地址，用于拼接 OAuth 回调 URL |
+| `GOOGLE_CLIENT_ID` | 否 | 无 | 配置后启用 Gmail OAuth |
+| `GOOGLE_CLIENT_SECRET` | 否 | 无 | Google Web 客户端通常需要 |
+| `MICROSOFT_CLIENT_ID` | 否 | 无 | 配置后启用 Outlook OAuth |
+| `MICROSOFT_CLIENT_SECRET` | 否 | 无 | 机密客户端需要；公共客户端可留空 |
+
+### OAuth 邮箱登录（Gmail / Outlook）
+
+Web 端支持 OAuth 2.0 Authorization Code + PKCE。流程：
+
+1. 在设置中添加账户，点击「使用 Google / Outlook 账号登录」
+2. 浏览器跳转到服务商授权页
+3. 授权完成后回调 `{PEBBLE_PUBLIC_URL}/api/v1/oauth/callback`
+4. 服务端换取 token、加密保存，并启动 Gmail / Outlook 同步
+
+在 Google Cloud / Microsoft Entra 中登记的 Redirect URI 必须为：
+
+```text
+{PEBBLE_PUBLIC_URL}/api/v1/oauth/callback
+```
+
+未配置对应 `*_CLIENT_ID` 时，前端不会显示该服务商的 OAuth 按钮；仍可使用 IMAP 应用专用密码方式添加账户。
 
 安全建议：
 

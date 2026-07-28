@@ -6,6 +6,16 @@ pub struct PkceState {
     pub csrf_token: CsrfToken,
 }
 
+impl PkceState {
+    /// Reconstruct PKCE state from previously stored secrets (web callback flow).
+    pub fn from_secrets(code_verifier: String, csrf_token: String) -> Self {
+        Self {
+            verifier: PkceCodeVerifier::new(code_verifier),
+            csrf_token: CsrfToken::new(csrf_token),
+        }
+    }
+}
+
 /// Generate a new random PKCE challenge/verifier pair (SHA-256).
 pub fn generate_pkce() -> (PkceCodeChallenge, PkceCodeVerifier) {
     PkceCodeChallenge::new_random_sha256()

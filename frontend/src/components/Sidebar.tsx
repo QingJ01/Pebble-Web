@@ -72,7 +72,7 @@ export default function Sidebar() {
     () => activeAccountId ? [activeAccountId] : accounts.map((account) => account.id),
     [accounts, activeAccountId],
   );
-  const { data: folders = EMPTY_FOLDERS, isFetched: foldersFetched } = useFoldersForAccountsQuery(folderAccountIds);
+  const { data: folders = EMPTY_FOLDERS } = useFoldersForAccountsQuery(folderAccountIds);
   const { data: unreadCounts = {} } = useFolderUnreadCountsForAccounts(folderAccountIds);
   const ROLE_LABELS: Record<string, string> = {
     inbox: t("sidebar.inbox"),
@@ -104,19 +104,12 @@ export default function Sidebar() {
   }, [accounts, activeAccountId, setActiveAccountId]);
 
   // Auto-select inbox folder when folders load.
-  // If the selected account has no folders, try the next account.
   useEffect(() => {
     if (displayedFolders.length > 0 && !activeFolderId) {
       const inbox = displayedFolders.find((f) => f.role === "inbox");
       setActiveFolderId((inbox ?? displayedFolders[0]).id);
-    } else if (!allAccountsMode && foldersFetched && displayedFolders.length === 0 && activeAccountId && accounts.length > 1) {
-      const idx = accounts.findIndex((a) => a.id === activeAccountId);
-      const next = accounts[idx + 1] ?? accounts.find((a) => a.id !== activeAccountId);
-      if (next) {
-        setActiveAccountId(next.id);
-      }
     }
-  }, [displayedFolders, foldersFetched, activeFolderId, setActiveFolderId, accounts, activeAccountId, setActiveAccountId, allAccountsMode]);
+  }, [displayedFolders, activeFolderId, setActiveFolderId]);
 
   async function confirmDiscardDraft() {
     if (isComposeDirty()) {

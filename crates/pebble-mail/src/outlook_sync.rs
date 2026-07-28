@@ -100,27 +100,34 @@ where
     let mut messages = Vec::new();
     let mut deleted_remote_ids = Vec::new();
     let mut cursor = stored_cursor.map(ToOwned::to_owned);
+    let mut page_count = 0u32;
 
     loop {
         let page = fetch_page(folder_id.to_string(), cursor.take()).await?;
+        page_count += 1;
         messages.extend(page.messages);
         deleted_remote_ids.extend(page.deleted_remote_ids);
 
-        if let Some(delta_link) = page.delta_link {
-            return Ok(OutlookDeltaBatch {
-                messages,
-                deleted_remote_ids,
-                delta_link: Some(delta_link),
-            });
-        }
-
+        // Graph may return nextLink (more pages now) or deltaLink (round complete).
+        // Always follow nextLink first when present — even if deltaLink also appears.
         match page.next_link {
-            Some(next_link) if !next_link.is_empty() => cursor = Some(next_link),
+            Some(next_link) if !next_link.is_empty() => {
+                info!(
+                    "Outlook delta folder {folder_id}: page {page_count}, continuing via nextLink ({} messages so far)",
+                    messages.len()
+                );
+                cursor = Some(next_link);
+            }
             _ => {
+                info!(
+                    "Outlook delta folder {folder_id}: finished after {page_count} page(s), {} messages, {} deletions",
+                    messages.len(),
+                    deleted_remote_ids.len()
+                );
                 return Ok(OutlookDeltaBatch {
                     messages,
                     deleted_remote_ids,
-                    delta_link: None,
+                    delta_link: page.delta_link,
                 });
             }
         }
@@ -128,7 +135,9 @@ where
 }
 
 fn outlook_delta_cursor_key(folder_remote_id: &str) -> String {
-    format!("outlook_delta:{folder_remote_id}")
+    // v2: Prefer odata.maxpagesize + nextLink-first paging. Bumping the key
+    // invalidates incomplete cursors saved after a single $top=50 page.
+    format!("outlook_delta_v2:{folder_remote_id}")
 }
 
 fn parse_outlook_delta_cursor(folder_remote_id: &str, state: Option<&str>) -> Option<String> {
@@ -485,9 +494,21 @@ impl OutlookSyncWorker {
                 continue;
             }
 
+            info!(
+                "Outlook sync listing folders for account {}",
+                self.base.account_id
+            );
+
             // List folders and fetch messages per folder
             let folders = match self.provider.list_folders().await {
-                Ok(f) => f,
+                Ok(f) => {
+                    info!(
+                        "Outlook sync listed {} folders for account {}",
+                        f.len(),
+                        self.base.account_id
+                    );
+                    f
+                }
                 Err(e) => {
                     warn!("Outlook folder list failed: {e}");
                     self.base
@@ -532,10 +553,30 @@ impl OutlookSyncWorker {
                 }
             };
 
+            let mut persisted_folders = 0usize;
             for folder in &folders {
-                // Persist folder
-                let _ = self.base.store.insert_folder(folder);
+                match self.base.store.insert_folder(folder) {
+                    Ok(_) => {
+                        persisted_folders += 1;
+                        tracing::debug!(
+                            "Outlook sync persisted folder '{}' (role={:?}) for account {}",
+                            folder.name, folder.role, self.base.account_id
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Outlook sync failed to persist folder '{}' for account {}: {e}",
+                            folder.name, self.base.account_id
+                        );
+                    }
+                }
             }
+            info!(
+                "Outlook sync persisted {}/{} folders for account {}",
+                persisted_folders,
+                folders.len(),
+                self.base.account_id
+            );
 
             // Re-read folders from DB so we use persisted IDs (upsert may keep old IDs)
             let db_folders = self
@@ -546,6 +587,11 @@ impl OutlookSyncWorker {
                 .into_iter()
                 .filter(should_sync_outlook_folder)
                 .collect::<Vec<_>>();
+            info!(
+                "Outlook sync will delta-sync {} DB folders for account {}",
+                db_folders.len(),
+                self.base.account_id
+            );
             let mut sync_failure_count = 0u32;
 
             for folder in &db_folders {
@@ -573,6 +619,15 @@ impl OutlookSyncWorker {
                 .await
                 {
                     Ok(batch) => {
+                        let message_count = batch.messages.len();
+                        let deleted_count = batch.deleted_remote_ids.len();
+                        info!(
+                            "Outlook delta for folder '{}' returned {} messages, {} deletions (account {})",
+                            folder.name,
+                            message_count,
+                            deleted_count,
+                            self.base.account_id
+                        );
                         let mut failure_count = self
                             .persist_folder_messages(folder, batch.messages, notify_new)
                             .await;
@@ -594,6 +649,12 @@ impl OutlookSyncWorker {
                             }
                         }
                         sync_failure_count += failure_count;
+                        if failure_count > 0 {
+                            warn!(
+                                "Outlook delta persist for folder '{}' had {} failures",
+                                folder.name, failure_count
+                            );
+                        }
 
                         if let Some(delta_link) = batch.delta_link {
                             if can_advance_outlook_delta_cursor(failure_count) {
@@ -680,7 +741,7 @@ mod tests {
     fn outlook_delta_cursor_key_is_folder_scoped() {
         assert_eq!(
             outlook_delta_cursor_key("folder-1"),
-            "outlook_delta:folder-1"
+            "outlook_delta_v2:folder-1"
         );
     }
 
@@ -818,6 +879,43 @@ mod tests {
                     Some("https://graph.example/next".to_string())
                 ),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_outlook_delta_pages_prefers_next_link_when_both_present() {
+        let mut pages = VecDeque::from([
+            OutlookDeltaPage {
+                messages: vec![make_message("outlook-1")],
+                deleted_remote_ids: Vec::new(),
+                next_link: Some("https://graph.example/next".to_string()),
+                // Some Graph responses include both; nextLink must win.
+                delta_link: Some("https://graph.example/delta-too-early".to_string()),
+            },
+            OutlookDeltaPage {
+                messages: vec![make_message("outlook-2")],
+                deleted_remote_ids: Vec::new(),
+                next_link: None,
+                delta_link: Some("https://graph.example/delta".to_string()),
+            },
+        ]);
+
+        let batch =
+            collect_outlook_delta_pages("folder-1", None, |_folder_id, _cursor| {
+                let page = pages.pop_front().expect("expected a delta page request");
+                async move { Ok(page) }
+            })
+            .await
+            .unwrap();
+
+        let remote_ids: Vec<_> = batch.messages.into_iter().map(|m| m.remote_id).collect();
+        assert_eq!(
+            remote_ids,
+            vec!["outlook-1".to_string(), "outlook-2".to_string()]
+        );
+        assert_eq!(
+            batch.delta_link.as_deref(),
+            Some("https://graph.example/delta")
         );
     }
 

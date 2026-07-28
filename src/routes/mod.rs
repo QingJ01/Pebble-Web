@@ -10,6 +10,7 @@ pub mod health;
 pub mod kanban;
 pub mod labels;
 pub mod messages;
+pub mod oauth;
 pub mod rules;
 pub mod search;
 pub mod snooze;
@@ -33,7 +34,8 @@ pub fn build_router(state: AppStateRef, static_dir: &str) -> Router {
     let public_routes = Router::new()
         .route("/api/v1/health", get(health::health))
         .route("/api/v1/auth/login", post(auth::login))
-        .route("/api/v1/ws", get(ws::ws_handler));
+        .route("/api/v1/ws", get(ws::ws_handler))
+        .route("/api/v1/oauth/callback", get(oauth::oauth_callback));
 
     let protected_routes = Router::new()
         // Accounts
@@ -51,6 +53,9 @@ pub fn build_router(state: AppStateRef, static_dir: &str) -> Router {
             "/api/v1/test-imap-connection",
             post(accounts::test_imap_connection),
         )
+        // OAuth account linking
+        .route("/api/v1/oauth/providers", get(oauth::list_providers))
+        .route("/api/v1/oauth/start", post(oauth::start_oauth))
         .route(
             "/api/v1/accounts/{account_id}/trusted-senders",
             get(trusted_senders::list_trusted_senders).post(trusted_senders::trust_sender),
@@ -275,6 +280,9 @@ mod tests {
             password_hash: "test-password-hash".to_string(),
             jwt_secret: "test-jwt-secret-with-at-least-32-chars".to_string(),
             sync_interval_secs: 300,
+            public_url: "http://localhost:8080".to_string(),
+            google_oauth: None,
+            microsoft_oauth: None,
         })
         .unwrap();
 
