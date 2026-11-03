@@ -6,7 +6,7 @@ use pebble_store::Store;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{broadcast, Mutex, Notify, OwnedMutexGuard};
 
 pub struct OAuthFlowRecord {
     pub provider: String,
@@ -37,9 +37,22 @@ pub struct AppState {
     pub ws_broadcast: broadcast::Sender<String>,
     pub oauth_flows: Mutex<HashMap<String, OAuthFlowRecord>>,
     pub oauth_refresh_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    pub auto_backup_wake: Notify,
+    secure_settings_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
 impl AppState {
+    pub async fn secure_setting_guard(&self, key: &str) -> OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self.secure_settings_locks.lock().await;
+            locks
+                .entry(key.to_string())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        lock.lock_owned().await
+    }
+
     pub fn init(config: Config) -> Result<Self, String> {
         std::fs::create_dir_all(&config.data_dir)
             .map_err(|e| format!("Failed to create data dir: {e}"))?;
@@ -72,10 +85,26 @@ impl AppState {
         {
             let plaintext = crypto
                 .decrypt_for("secure_user_data.value", "realtime_preference", &ciphertext)
-                .or_else(|_| crypto.decrypt(&ciphertext))
                 .map_err(|error| format!("Failed to decrypt realtime preference: {error}"))?;
             realtime_preference = serde_json::from_slice::<String>(&plaintext)
                 .map_err(|error| format!("Invalid realtime preference: {error}"))?;
+            if CryptoService::ciphertext_needs_migration(&ciphertext) {
+                let encrypted = crypto
+                    .encrypt_for("secure_user_data.value", "realtime_preference", &plaintext)
+                    .map_err(|error| format!("Failed to migrate realtime preference: {error}"))?;
+                if !store
+                    .compare_exchange_secure_user_data(
+                        "realtime_preference",
+                        &ciphertext,
+                        &encrypted,
+                    )
+                    .map_err(|error| {
+                        format!("Failed to persist realtime preference migration: {error}")
+                    })?
+                {
+                    return Err("Realtime preference changed during migration".into());
+                }
+            }
         } else {
             let plaintext = serde_json::to_vec(&realtime_preference)
                 .map_err(|error| format!("Failed to serialize realtime preference: {error}"))?;
@@ -108,6 +137,8 @@ impl AppState {
             ws_broadcast,
             oauth_flows: Mutex::new(HashMap::new()),
             oauth_refresh_locks,
+            auto_backup_wake: Notify::new(),
+            secure_settings_locks: Mutex::new(HashMap::new()),
         })
     }
 }

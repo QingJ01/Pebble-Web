@@ -398,6 +398,7 @@ pub async fn start(
     Extension(session): Extension<AuthSession>,
     Json(options): Json<StartRequest>,
 ) -> Result<Json<StartResponse>, ApiError> {
+    let _email_hint = options.email.as_deref();
     let provider = provider.to_ascii_lowercase();
     if session.expires_at <= now_timestamp() {
         return Err(ApiError::Unauthorized("Authentication expired".into()));

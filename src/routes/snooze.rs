@@ -46,6 +46,13 @@ pub async fn unsnooze_message(
         .store
         .unsnooze_message(&message_id)
         .map_err(|e| ApiError::Internal(format!("Failed to unsnooze message: {e}")))?;
+    let _ = state.ws_broadcast.send(
+        serde_json::json!({
+            "type": "mail:unsnoozed",
+            "payload": { "message_id": message_id }
+        })
+        .to_string(),
+    );
 
     Ok(Json(serde_json::json!({ "ok": true })))
 }

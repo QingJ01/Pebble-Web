@@ -6,7 +6,6 @@ pub struct Config {
     pub data_dir: PathBuf,
     pub password_hash: String,
     pub jwt_secret: String,
-    pub sync_interval_secs: u64,
     pub realtime_preference: String,
 }
 
@@ -44,10 +43,9 @@ impl Config {
         let data_dir =
             PathBuf::from(std::env::var("PEBBLE_DATA_DIR").unwrap_or_else(|_| "/data".to_string()));
 
-        let sync_interval_secs = std::env::var("PEBBLE_SYNC_INTERVAL")
-            .unwrap_or_else(|_| "300".to_string())
-            .parse::<u64>()
-            .map_err(|e| format!("Invalid PEBBLE_SYNC_INTERVAL: {e}"))?;
+        if std::env::var_os("PEBBLE_SYNC_INTERVAL").is_some() {
+            eprintln!("PEBBLE_SYNC_INTERVAL is deprecated and ignored; use PEBBLE_REALTIME_PREFERENCE instead");
+        }
         let realtime_preference =
             std::env::var("PEBBLE_REALTIME_PREFERENCE").unwrap_or_else(|_| "balanced".to_string());
         if !matches!(
@@ -67,7 +65,6 @@ impl Config {
             data_dir,
             password_hash,
             jwt_secret,
-            sync_interval_secs,
             realtime_preference,
         })
     }

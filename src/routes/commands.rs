@@ -56,7 +56,8 @@ struct StartSyncArgs {
 struct UpdateSyncRangeArgs {
     account_id: String,
     days: Option<u32>,
-    poll_interval_secs: Option<u64>,
+    #[serde(rename = "pollIntervalSecs")]
+    _poll_interval_secs: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -194,12 +195,35 @@ fn secure_user_json<T: for<'de> Deserialize<'de> + Serialize>(
     else {
         return Ok(default);
     };
+    let needs_migration = pebble_crypto::CryptoService::ciphertext_needs_migration(&ciphertext);
     let plaintext = match state
         .crypto
         .decrypt_for("secure_user_data.value", key, &ciphertext)
     {
-        Ok(plaintext) => plaintext,
+        Ok(plaintext) => {
+            if needs_migration {
+                let encrypted = state
+                    .crypto
+                    .encrypt_for("secure_user_data.value", key, &plaintext)
+                    .map_err(|error| {
+                        ApiError::Internal(format!("Failed to migrate {key}: {error}"))
+                    })?;
+                if !state
+                    .store
+                    .compare_exchange_secure_user_data(key, &ciphertext, &encrypted)
+                    .map_err(|error| {
+                        ApiError::Internal(format!("Failed to persist migrated {key}: {error}"))
+                    })?
+                {
+                    return secure_user_json(state, key, default);
+                }
+            }
+            plaintext
+        }
         Err(_) => {
+            if !needs_migration {
+                return Err(ApiError::Internal(format!("Failed to decrypt {key}")));
+            }
             let _: T = serde_json::from_slice(&ciphertext)
                 .map_err(|error| ApiError::Internal(format!("Invalid legacy {key}: {error}")))?;
             let encrypted = state
@@ -409,16 +433,39 @@ fn read_encrypted_json<T: for<'de> Deserialize<'de>>(
     else {
         return Ok(None);
     };
+    let needs_migration = pebble_crypto::CryptoService::ciphertext_needs_migration(&value);
     let plaintext = match state
         .crypto
         .decrypt_for("secure_user_data.value", key, &value)
     {
-        Ok(plaintext) => plaintext,
+        Ok(plaintext) => {
+            if needs_migration {
+                let encrypted = state
+                    .crypto
+                    .encrypt_for("secure_user_data.value", key, &plaintext)
+                    .map_err(|error| {
+                        ApiError::Internal(format!("Failed to migrate {key}: {error}"))
+                    })?;
+                if !state
+                    .store
+                    .compare_exchange_secure_user_data(key, &value, &encrypted)
+                    .map_err(|error| {
+                        ApiError::Internal(format!("Failed to persist migrated {key}: {error}"))
+                    })?
+                {
+                    return read_encrypted_json(state, key);
+                }
+            }
+            plaintext
+        }
         Err(_) => {
-            let plaintext = state
-                .crypto
-                .decrypt(&value)
-                .map_err(|error| ApiError::Internal(format!("Failed to decrypt {key}: {error}")))?;
+            if !needs_migration {
+                return Err(ApiError::Internal(format!("Failed to decrypt {key}")));
+            }
+            let plaintext = match state.crypto.decrypt(&value) {
+                Ok(plaintext) => plaintext,
+                Err(_) => value.clone(),
+            };
             let _: T = serde_json::from_slice(&plaintext)
                 .map_err(|error| ApiError::Internal(format!("Invalid legacy {key}: {error}")))?;
             let encrypted = state
@@ -464,6 +511,11 @@ pub async fn invoke(
     Path(command): Path<String>,
     Json(args): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
+    if let Some(value) =
+        crate::routes::portable_commands::invoke(&state, &command, args.clone()).await?
+    {
+        return Ok(Json(value));
+    }
     match command.as_str() {
         "health_check" => Ok(Json(json!("ok"))),
         "get_server_info" => Ok(Json(json!({ "version": env!("CARGO_PKG_VERSION") }))),
@@ -901,6 +953,7 @@ pub async fn invoke(
             })?;
             let interval = crate::config::realtime_poll_interval(&args.mode)
                 .ok_or_else(|| ApiError::BadRequest("Invalid realtime preference".into()))?;
+            let _setting_guard = state.secure_setting_guard("realtime_preference").await;
             write_encrypted_json(&state, "realtime_preference", &args.mode)?;
             state
                 .sync_manager
@@ -926,6 +979,25 @@ pub async fn invoke(
                 });
             Ok(Json(json!(status)))
         }
+        "save_auto_backup_config" => {
+            #[derive(Deserialize)]
+            struct Args {
+                config: crate::auto_backup::AutoBackupConfig,
+            }
+            let args: Args = parse_args(args)?;
+            let _setting_guard = state.secure_setting_guard("auto_backup_config").await;
+            crate::auto_backup::save_config(&state, args.config).map_err(ApiError::BadRequest)?;
+            Ok(Json(Value::Null))
+        }
+        "load_auto_backup_config" => {
+            let config = crate::auto_backup::load_config(&state).map_err(ApiError::Internal)?;
+            Ok(Json(json!(config)))
+        }
+        "delete_auto_backup_config" => {
+            let _setting_guard = state.secure_setting_guard("auto_backup_config").await;
+            crate::auto_backup::delete_config(&state).map_err(ApiError::Internal)?;
+            Ok(Json(Value::Null))
+        }
         "get_email_signature" => {
             let args: SignatureArgs = parse_args(args)?;
             let signature = secure_user_json(
@@ -938,10 +1010,16 @@ pub async fn invoke(
         "set_email_signature" | "migrate_email_signature_if_absent" => {
             let args: SignatureArgs = parse_args(args)?;
             let key = format!("signature:{}", args.account_id);
+            let _setting_guard = state.secure_setting_guard(&key).await;
             let signature = args.signature.unwrap_or_default();
             if command == "migrate_email_signature_if_absent" {
-                let current: String = secure_user_json(&state, &key, String::new())?;
-                if !current.is_empty() {
+                let exists = state
+                    .store
+                    .get_secure_user_data(&key)
+                    .map_err(|error| ApiError::Internal(format!("Failed to read {key}: {error}")))?
+                    .is_some();
+                if exists {
+                    let current: String = secure_user_json(&state, &key, String::new())?;
                     return Ok(Json(json!(current)));
                 }
             }
@@ -957,6 +1035,7 @@ pub async fn invoke(
             Ok(Json(json!(templates)))
         }
         "save_email_template" => {
+            let _setting_guard = state.secure_setting_guard("email_templates").await;
             let args: TemplateSaveArgs = parse_args(args)?;
             let mut templates: Vec<Value> =
                 secure_user_json(&state, "email_templates", Vec::new())?;
@@ -980,11 +1059,16 @@ pub async fn invoke(
                 "body": template.body,
                 "createdAt": template.created_at.unwrap_or_else(pebble_core::now_timestamp),
             });
-            templates.push(saved.clone());
+            if let Some(index) = templates.iter().position(|item| item["id"] == saved["id"]) {
+                templates[index] = saved.clone();
+            } else {
+                templates.push(saved.clone());
+            }
             set_secure_user_json(&state, "email_templates", &templates)?;
             Ok(Json(saved))
         }
         "delete_email_template" => {
+            let _setting_guard = state.secure_setting_guard("email_templates").await;
             let args: TemplateIdArgs = parse_args(args)?;
             let mut templates: Vec<Value> =
                 secure_user_json(&state, "email_templates", Vec::new())?;

@@ -26,21 +26,26 @@ pub async fn send_email(
     Json(body): Json<ComposeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // Validate attachment paths are within attachments_dir
-    if let Some(ref paths) = body.attachment_paths {
-        let allowed_dir = state
-            .attachments_dir
-            .canonicalize()
-            .unwrap_or_else(|_| state.attachments_dir.clone());
-        for path in paths {
-            let p = std::path::Path::new(path);
-            let canonical = p
-                .canonicalize()
-                .map_err(|_| ApiError::BadRequest(format!("Attachment not found: {path}")))?;
-            if !canonical.starts_with(&allowed_dir) {
-                return Err(ApiError::BadRequest(
-                    "Attachment path outside allowed directory".to_string(),
-                ));
-            }
+    let attachment_paths = body
+        .attachment_paths
+        .unwrap_or_default()
+        .iter()
+        .map(|path| {
+            crate::routes::safe_files::resolve_attachment_path(&state.attachments_dir, path)
+                .map(|path| path.to_string_lossy().to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut total_size = 0u64;
+    for path in &attachment_paths {
+        let size = tokio::fs::metadata(path)
+            .await
+            .map_err(|error| ApiError::BadRequest(format!("Attachment unavailable: {error}")))?
+            .len();
+        total_size = total_size.saturating_add(size);
+        if size > 25 * 1024 * 1024 || total_size > 25 * 1024 * 1024 {
+            return Err(ApiError::BadRequest(
+                "Attachments exceed the 25 MiB total size limit".into(),
+            ));
         }
     }
 
@@ -127,8 +132,6 @@ pub async fn send_email(
 
     let cc = body.cc.unwrap_or_default();
     let bcc = body.bcc.unwrap_or_default();
-    let attachment_paths = body.attachment_paths.unwrap_or_default();
-
     sender
         .send(
             &from,
@@ -168,16 +171,18 @@ pub async fn stage_attachment(
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(&body.data)
         .map_err(|e| ApiError::BadRequest(format!("Invalid base64 data: {e}")))?;
+    if bytes.is_empty() || bytes.len() > 25 * 1024 * 1024 {
+        return Err(ApiError::BadRequest(
+            "Attachment must be between 1 byte and 25 MiB".into(),
+        ));
+    }
 
     let staging_dir = state.attachments_dir.join("staging");
     tokio::fs::create_dir_all(&staging_dir)
         .await
         .map_err(|e| ApiError::Internal(format!("Failed to create staging dir: {e}")))?;
 
-    let safe_filename = body
-        .filename
-        .replace(['/', '\\', ':'], "_")
-        .replace("..", "_");
+    let safe_filename = crate::routes::safe_files::safe_filename(&body.filename)?;
     let unique_name = format!("{}_{}", new_id(), safe_filename);
     let file_path = staging_dir.join(&unique_name);
 

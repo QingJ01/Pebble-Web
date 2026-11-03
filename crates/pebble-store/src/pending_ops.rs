@@ -7,7 +7,8 @@ pub const MAX_PENDING_MAIL_OP_ATTEMPTS: i64 = 8;
 const BASE_RETRY_DELAY_SECS: i64 = 60;
 const MAX_RETRY_DELAY_SECS: i64 = 60 * 60;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PendingMailOpStatus {
     Pending,
     InProgress,
@@ -45,12 +46,13 @@ fn pending_mail_retry_delay_secs(attempts: i64) -> i64 {
         .min(MAX_RETRY_DELAY_SECS)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct PendingMailOp {
     pub id: String,
     pub account_id: String,
     pub message_id: String,
     pub op_type: String,
+    #[serde(skip_serializing)]
     pub payload_json: String,
     pub status: PendingMailOpStatus,
     pub attempts: i64,
@@ -60,7 +62,7 @@ pub struct PendingMailOp {
     pub next_retry_at: Option<i64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct PendingMailOpsSummary {
     pub pending_count: i64,
     pub in_progress_count: i64,

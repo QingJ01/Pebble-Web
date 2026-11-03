@@ -1,23 +1,27 @@
-# Backend parity status
+# Backend compatibility status
 
-This migration uses the settled desktop/Web audit and implementation contract. This matrix records the current implementation state, not runtime acceptance. Desktop-only OS integration is intentionally not a server feature.
+This page describes the current Web backend contract, not a claim of desktop feature parity. Desktop-only OS integration remains intentionally unavailable to the browser.
 
-| Domain | Current status | Remaining backend work |
-| --- | --- | --- |
-| Sync and providers | Partial | Imported portable IMAP/Gmail/Outlook/POP3 engines and compatible store APIs. The Web `SyncManager` still dispatches only IMAP; provider token refresh, POP3 dispatch, per-cycle WS events, and rules-trigger integration remain incomplete. |
-| Accounts and identity | Partial | Added account label/provider display fields, sync-range state, OAuth start/status/callback protocol, and encrypted OAuth token persistence. Account REST creation/update, OAuth reauthorization, refresh coordination, proxy/TLS settings, identity repair, and provider worker startup remain incomplete. |
-| Contacts | Partial | Portable contact and vCard store services are present. Command bridge and HTTP/provider synchronization wiring remain incomplete. |
-| Display and privacy | Partial | Portable privacy crate is present. Web command adapters and server-side privacy behavior remain incomplete. |
-| Compose and drafts | Partial | Portable sender and store functionality is present. Web API command coverage, durable attachment/draft orchestration, provider-specific send, and ambiguous-send recovery remain incomplete. |
-| Settings and services | Partial | Encrypted command-backed signatures/templates, realtime preference, server info, and backup-status response shape are present. Scheduler-backed backups, rules execution, due-snooze service, diagnostics, translation/proxy settings, and full command coverage remain incomplete. |
+## Web-specific contracts
 
-The authenticated attachment download route and existing REST authentication remain in place. Native tray, keychain, window management, autostart, and OS notification APIs are not exposed through the browser command bridge.
+- Typed commands are authenticated `POST /api/v1/commands/{command}` requests. Unknown commands remain errors.
+- OAuth starts at `POST /api/v1/oauth/{provider}/start`, reports status at `GET /api/v1/oauth/{provider}/status/{flow_id}`, and exposes configured provider availability at `GET /api/v1/oauth/providers`. Configure fixed provider callback URLs under the public Web origin; callbacks do not trust the request `Host` header.
+- `get_server_info` returns the Web package version. `get_realtime_preference` and `set_realtime_preference` use `realtime`, `balanced`, `battery`, and `manual`; the saved server preference controls polling. `PEBBLE_SYNC_INTERVAL` is deprecated, ignored, and warned about at startup.
+- `get_auto_backup_status` returns persisted scheduler status with Unix-second timestamps. Automatic backup configuration and status are encrypted in application data. Passphrase-encrypted secret exports are not supported yet and fail explicitly.
+- Compose attachment staging returns an opaque app-owned token. Attachments are limited to 25 MiB total, filenames are sanitized, and access resolves inside the app attachment directory. The authenticated `/api/v1/attachments/{attachment_id}/download` route remains the browser download mechanism; `get_attachment_path` returns that relative route, never a host path.
+- Sync events use `mail:sync-progress`, `mail:sync-complete`, `mail:error`, `mail:realtime-status`, `mail:new`, and `mail:unsnoozed`, wrapped as `{type,payload}`.
 
-## OAuth configuration
+## Current limitations
 
-OAuth is disabled unless the server has provider client credentials and `PEBBLE_PUBLIC_BASE_URL`. Configure a fixed HTTPS public origin (localhost HTTP is accepted for development), then register:
+The command names below are present in the frontend contract but are not yet implemented by the Web command bridge: `update_message_flags`, `archive_message`, `delete_message`, `restore_message`, `move_to_folder`, `empty_trash`, `batch_archive`, `batch_delete`, `batch_mark_read`, and `batch_star`. Existing REST routes do not substitute for these commands' required durable, provider-aware pending-operation behavior.
+
+Other remaining gaps include provider-aware remote mutation and retry processing for pending mail operations, execution of rules on newly stored messages, identity-verified provider compose/send with durable Outbox/Sent handling, encrypted secret-passphrase backup/restore semantics, and full background task/service lifecycle and behavioral tests. The remote-CSS privacy-rendering behavior is an explicit hold and is unchanged.
+
+## OAuth environment
+
+OAuth is disabled unless provider credentials and `PEBBLE_PUBLIC_BASE_URL` are configured. Use a fixed HTTPS public origin (localhost HTTP is accepted for development), and register:
 
 - `https://<public-origin>/api/v1/oauth/gmail/callback`
 - `https://<public-origin>/api/v1/oauth/outlook/callback`
 
-Set `PEBBLE_GOOGLE_CLIENT_ID`, `PEBBLE_GOOGLE_CLIENT_SECRET`, `PEBBLE_MICROSOFT_CLIENT_ID`, and `PEBBLE_MICROSOFT_CLIENT_SECRET` in the server environment. Provider availability reports configuration only; it does not establish that consent or live mailbox access has been tested.
+Set `PEBBLE_GOOGLE_CLIENT_ID`, `PEBBLE_GOOGLE_CLIENT_SECRET`, `PEBBLE_MICROSOFT_CLIENT_ID`, and `PEBBLE_MICROSOFT_CLIENT_SECRET` on the server. Availability indicates configuration only, not verified live-mail access.

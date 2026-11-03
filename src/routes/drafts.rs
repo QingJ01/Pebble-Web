@@ -34,22 +34,105 @@ fn address_list(values: Vec<String>) -> Vec<EmailAddress> {
         .collect()
 }
 
-fn attachment_for_path(message_id: &str, path: &str) -> Attachment {
-    let filename = std::path::Path::new(path)
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("attachment")
-        .to_string();
-    Attachment {
-        id: new_id(),
-        message_id: message_id.to_string(),
-        filename,
-        mime_type: "application/octet-stream".to_string(),
-        size: std::fs::metadata(path).map(|m| m.len() as i64).unwrap_or(0),
-        local_path: Some(path.to_string()),
-        content_id: None,
-        is_inline: false,
+async fn copy_attachments_to_draft(
+    root: &std::path::Path,
+    draft_id: &str,
+    paths: &[String],
+) -> Result<Vec<Attachment>, ApiError> {
+    if draft_id.len() != 36
+        || !draft_id
+            .chars()
+            .all(|ch| ch.is_ascii_hexdigit() || ch == '-')
+    {
+        return Err(ApiError::BadRequest("Invalid draft identifier".into()));
     }
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|_| ApiError::BadRequest("Attachment storage is unavailable".into()))?;
+    let drafts_root = canonical_root.join("drafts");
+    tokio::fs::create_dir_all(&drafts_root)
+        .await
+        .map_err(|error| {
+            ApiError::Internal(format!(
+                "Failed to create draft attachment storage: {error}"
+            ))
+        })?;
+    let canonical_drafts_root = drafts_root
+        .canonicalize()
+        .map_err(|error| ApiError::Internal(format!("Failed to resolve draft storage: {error}")))?;
+    if !canonical_drafts_root.starts_with(&canonical_root) {
+        return Err(ApiError::BadRequest(
+            "Draft storage outside attachment storage".into(),
+        ));
+    }
+    let draft_dir = canonical_drafts_root.join(draft_id);
+    tokio::fs::create_dir_all(&draft_dir)
+        .await
+        .map_err(|error| {
+            ApiError::Internal(format!(
+                "Failed to create draft attachment directory: {error}"
+            ))
+        })?;
+    let canonical_draft_dir = draft_dir.canonicalize().map_err(|error| {
+        ApiError::Internal(format!("Failed to resolve draft directory: {error}"))
+    })?;
+    if !canonical_draft_dir.starts_with(&canonical_root) {
+        return Err(ApiError::BadRequest(
+            "Draft directory outside attachment storage".into(),
+        ));
+    }
+
+    let mut attachments: Vec<Attachment> = Vec::with_capacity(paths.len());
+    let copy_result: Result<(), ApiError> = async {
+        let mut total_size = 0u64;
+        for supplied in paths {
+            let source = crate::routes::safe_files::resolve_attachment_path(root, supplied)?;
+            let source_metadata = tokio::fs::metadata(&source).await.map_err(|error| {
+                ApiError::BadRequest(format!("Attachment unavailable: {error}"))
+            })?;
+            total_size = total_size.saturating_add(source_metadata.len());
+            if source_metadata.len() > 25 * 1024 * 1024 || total_size > 25 * 1024 * 1024 {
+                return Err(ApiError::BadRequest(
+                    "Attachments exceed the 25 MiB total size limit".into(),
+                ));
+            }
+            let source_name = source
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("attachment");
+            let filename = crate::routes::safe_files::safe_filename(source_name)?;
+            let destination = canonical_draft_dir.join(format!("{}_{}", new_id(), filename));
+            tokio::fs::copy(&source, &destination)
+                .await
+                .map_err(|error| {
+                    ApiError::Internal(format!("Failed to copy draft attachment: {error}"))
+                })?;
+            let metadata = tokio::fs::metadata(&destination).await.map_err(|error| {
+                ApiError::Internal(format!("Failed to inspect draft attachment: {error}"))
+            })?;
+            attachments.push(Attachment {
+                id: new_id(),
+                message_id: draft_id.to_string(),
+                filename,
+                mime_type: "application/octet-stream".to_string(),
+                size: metadata.len() as i64,
+                local_path: Some(destination.to_string_lossy().to_string()),
+                content_id: None,
+                is_inline: false,
+            });
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(error) = copy_result {
+        for attachment in &attachments {
+            if let Some(path) = &attachment.local_path {
+                let _ = tokio::fs::remove_file(path).await;
+            }
+        }
+        return Err(error);
+    }
+    Ok(attachments)
 }
 
 pub async fn save_draft(
@@ -61,6 +144,33 @@ pub async fn save_draft(
     let draft_id = body.existing_draft_id.clone().unwrap_or_else(new_id);
     let now = now_timestamp();
     let attachment_paths = body.attachment_paths.unwrap_or_default();
+
+    let account = state
+        .store
+        .get_account(&body.account_id)
+        .map_err(|error| ApiError::Internal(format!("Failed to load draft account: {error}")))?
+        .ok_or_else(|| ApiError::BadRequest("Account not found".into()))?;
+    let _ = account;
+    if body.existing_draft_id.is_some() {
+        let existing = state
+            .store
+            .get_message(&draft_id)
+            .map_err(|error| ApiError::Internal(format!("Failed to load existing draft: {error}")))?
+            .ok_or_else(|| ApiError::BadRequest("Draft not found".into()))?;
+        if !existing.is_draft || existing.account_id != body.account_id {
+            return Err(ApiError::BadRequest(
+                "Draft does not belong to this account".into(),
+            ));
+        }
+    }
+    let old_attachments = state
+        .store
+        .list_attachments_by_message(&draft_id)
+        .map_err(|error| {
+            ApiError::Internal(format!("Failed to load old draft attachments: {error}"))
+        })?;
+    let attachments =
+        copy_attachments_to_draft(&state.attachments_dir, &draft_id, &attachment_paths).await?;
 
     let folder_id = store
         .with_write_async(move |conn| {
@@ -125,15 +235,32 @@ pub async fn save_draft(
         created_at: now,
         updated_at: now,
     };
-    let attachments: Vec<Attachment> = attachment_paths
-        .iter()
-        .map(|path| attachment_for_path(&draft_id, path))
-        .collect();
+    if let Err(error) =
+        state
+            .store
+            .replace_message_with_attachments(&message, &[folder_id], &attachments)
+    {
+        for attachment in &attachments {
+            if let Some(path) = &attachment.local_path {
+                let _ = tokio::fs::remove_file(path).await;
+            }
+        }
+        return Err(ApiError::Internal(format!("Failed to save draft: {error}")));
+    }
 
-    state
-        .store
-        .replace_message_with_attachments(&message, &[folder_id], &attachments)
-        .map_err(|e| ApiError::Internal(format!("Failed to save draft: {e}")))?;
+    for attachment in old_attachments {
+        if let Some(path) = attachment.local_path {
+            let referenced = state
+                .store
+                .is_attachment_local_path_referenced(&path)
+                .map_err(|error| {
+                    ApiError::Internal(format!("Failed to check attachment references: {error}"))
+                })?;
+            if !referenced {
+                let _ = tokio::fs::remove_file(path).await;
+            }
+        }
+    }
 
     Ok(Json(serde_json::json!({ "id": draft_id })))
 }
@@ -142,6 +269,22 @@ pub async fn delete_draft(
     State(state): State<AppStateRef>,
     Path((account_id, draft_id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let message = state
+        .store
+        .get_message(&draft_id)
+        .map_err(|error| ApiError::Internal(format!("Failed to read draft: {error}")))?
+        .ok_or_else(|| ApiError::BadRequest("Draft not found".into()))?;
+    if !message.is_draft || message.account_id != account_id {
+        return Err(ApiError::BadRequest(
+            "Draft does not belong to this account".into(),
+        ));
+    }
+    let attachments = state
+        .store
+        .list_attachments_by_message(&draft_id)
+        .map_err(|error| {
+            ApiError::Internal(format!("Failed to load draft attachments: {error}"))
+        })?;
     state
         .store
         .with_write_async(move |conn| {
@@ -153,6 +296,20 @@ pub async fn delete_draft(
         })
         .await
         .map_err(|e| ApiError::Internal(format!("Failed to delete draft: {e}")))?;
+
+    for attachment in attachments {
+        if let Some(path) = attachment.local_path {
+            let referenced = state
+                .store
+                .is_attachment_local_path_referenced(&path)
+                .map_err(|error| {
+                    ApiError::Internal(format!("Failed to check attachment references: {error}"))
+                })?;
+            if !referenced {
+                let _ = tokio::fs::remove_file(path).await;
+            }
+        }
+    }
 
     Ok(Json(serde_json::json!({ "ok": true })))
 }

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -111,13 +111,12 @@ fn spawn_event_forwarders(
                 let payload = serde_json::json!({
                     "account_id": message_account,
                     "message_id": stored.message.id,
+                    "folder_ids": stored.folder_ids,
+                    "thread_id": stored.message.thread_id,
+                    "received_at": stored.message.date,
+                    "subject": stored.message.subject,
+                    "from": stored.message.from_address,
                 });
-                let _ = message_ws.send(
-                    serde_json::json!({
-                        "type": "new_mail", "payload": payload
-                    })
-                    .to_string(),
-                );
                 let _ = message_ws.send(
                     serde_json::json!({
                         "type": "mail:new", "payload": payload
@@ -134,7 +133,13 @@ fn spawn_event_forwarders(
         while let Some(error) = error_rx.recv().await {
             let _ = error_ws.send(
                 serde_json::json!({
-                    "type": "sync_error", "account_id": error_account, "payload": error
+                    "type": "mail:error",
+                    "payload": {
+                        "account_id": error_account,
+                        "error_type": error.error_type,
+                        "message": error.message,
+                        "timestamp": error.timestamp
+                    }
                 })
                 .to_string(),
             );
@@ -146,22 +151,25 @@ fn spawn_event_forwarders(
     tokio::spawn(async move {
         while let Some(progress) = progress_rx.recv().await {
             let value = serde_json::to_value(progress).unwrap_or(serde_json::Value::Null);
+            let mut payload = value.clone();
+            if let Some(object) = payload.as_object_mut() {
+                object.insert(
+                    "account_id".to_string(),
+                    serde_json::json!(progress_account),
+                );
+            }
             let _ = progress_ws.send(
                 serde_json::json!({
-                    "type": "sync_progress", "account_id": progress_account, "payload": value
+                    "type": "mail:sync-progress",
+                    "payload": payload
                 })
                 .to_string(),
             );
             if value["status"] == "completed" {
                 let _ = progress_ws.send(
                     serde_json::json!({
-                        "type": "sync_complete", "account_id": progress_account
-                    })
-                    .to_string(),
-                );
-                let _ = progress_ws.send(
-                    serde_json::json!({
-                        "type": "mail:folder-changed", "payload": { "account_id": progress_account }
+                        "type": "mail:sync-complete",
+                        "payload": { "account_id": progress_account }
                     })
                     .to_string(),
                 );
@@ -173,12 +181,17 @@ fn spawn_event_forwarders(
     tokio::spawn(async move {
         while let Some(status) = status_rx.recv().await {
             let value = match status {
-                SyncRuntimeStatus::ImapIdleAvailable => "imap_idle_available",
-                SyncRuntimeStatus::ImapPollingFallback => "imap_polling_fallback",
+                SyncRuntimeStatus::ImapIdleAvailable => "realtime",
+                SyncRuntimeStatus::ImapPollingFallback => "polling",
             };
             let _ = ws_tx.send(
                 serde_json::json!({
-                    "type": "sync_status", "account_id": status_account, "payload": value
+                    "type": "mail:realtime-status",
+                    "payload": {
+                        "account_id": status_account,
+                        "mode": value,
+                        "provider": "imap"
+                    }
                 })
                 .to_string(),
             );
@@ -189,6 +202,8 @@ fn spawn_event_forwarders(
 /// Manages provider-aware background sync workers for all configured accounts.
 pub struct SyncManager {
     handles: Mutex<HashMap<String, SyncHandle>>,
+    lifecycle_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    manual_suspended_accounts: Mutex<HashSet<String>>,
     store: Arc<Store>,
     crypto: Arc<CryptoService>,
     search: Arc<TantivySearch>,
@@ -210,6 +225,8 @@ impl SyncManager {
     ) -> Self {
         Self {
             handles: Mutex::new(HashMap::new()),
+            lifecycle_locks: Mutex::new(HashMap::new()),
+            manual_suspended_accounts: Mutex::new(HashSet::new()),
             store,
             crypto,
             search,
@@ -222,6 +239,19 @@ impl SyncManager {
 
     /// Start sync workers for all configured accounts.
     pub async fn start_all(&self) {
+        if *self.sync_interval_secs.lock().await == 0 {
+            info!("Manual sync preference is active; background sync startup is disabled");
+            match self.store.list_accounts() {
+                Ok(accounts) => {
+                    self.manual_suspended_accounts
+                        .lock()
+                        .await
+                        .extend(accounts.into_iter().map(|account| account.id));
+                }
+                Err(error) => error!("Failed to list accounts for manual sync startup: {error}"),
+            }
+            return;
+        }
         let accounts = match self.store.list_accounts() {
             Ok(accounts) => accounts,
             Err(e) => {
@@ -239,9 +269,19 @@ impl SyncManager {
 
     /// Start sync for a single account by ID.
     pub async fn start_account_sync(&self, account_id: &str) -> Result<(), String> {
-        let mut handles = self.handles.lock().await;
-
-        if let Some(handle) = handles.remove(account_id) {
+        let lifecycle = self.account_lifecycle_lock(account_id).await;
+        let _lifecycle_guard = lifecycle.lock().await;
+        let existing = {
+            let mut handles = self.handles.lock().await;
+            if handles
+                .get(account_id)
+                .is_some_and(|handle| !handle.task.is_finished())
+            {
+                return Ok(());
+            }
+            handles.remove(account_id)
+        };
+        if let Some(handle) = existing {
             stop_handle(handle).await;
         }
 
@@ -420,7 +460,7 @@ impl SyncManager {
             self.ws_tx.clone(),
         );
 
-        handles.insert(
+        self.handles.lock().await.insert(
             account_id.to_string(),
             SyncHandle {
                 stop_tx,
@@ -435,8 +475,14 @@ impl SyncManager {
 
     /// Stop sync for a single account.
     pub async fn stop_account_sync(&self, account_id: &str) {
-        let mut handles = self.handles.lock().await;
-        if let Some(handle) = handles.remove(account_id) {
+        self.manual_suspended_accounts
+            .lock()
+            .await
+            .remove(account_id);
+        let lifecycle = self.account_lifecycle_lock(account_id).await;
+        let _lifecycle_guard = lifecycle.lock().await;
+        let handle = self.handles.lock().await.remove(account_id);
+        if let Some(handle) = handle {
             info!("Stopping sync for account {}", account_id);
             stop_handle(handle).await;
         }
@@ -444,23 +490,32 @@ impl SyncManager {
 
     /// Trigger a manual sync for a specific account.
     pub async fn trigger_sync(&self, account_id: &str) -> Result<(), String> {
-        let mut handles = self.handles.lock().await;
-        if handles
-            .get(account_id)
-            .is_some_and(|handle| handle.task.is_finished())
-        {
-            if let Some(handle) = handles.remove(account_id) {
-                stop_handle(handle).await;
+        let finished = {
+            let mut handles = self.handles.lock().await;
+            if handles
+                .get(account_id)
+                .is_some_and(|handle| handle.task.is_finished())
+            {
+                handles.remove(account_id)
+            } else {
+                None
             }
+        };
+        if let Some(handle) = finished {
+            stop_handle(handle).await;
         }
-        if let Some(handle) = handles.get(account_id) {
-            handle
-                .trigger_tx
+        let trigger = self
+            .handles
+            .lock()
+            .await
+            .get(account_id)
+            .map(|handle| handle.trigger_tx.clone());
+        if let Some(trigger) = trigger {
+            trigger
                 .send(SyncTrigger::Manual)
                 .map_err(|_| "Sync worker channel closed".to_string())?;
             return Ok(());
         }
-        drop(handles);
         self.start_account_sync(account_id).await
     }
 
@@ -481,6 +536,7 @@ impl SyncManager {
             .cloned()
             .collect::<Vec<_>>();
         for account_id in account_ids {
+            self.stop_account_sync(&account_id).await;
             self.start_account_sync(&account_id).await?;
         }
         Ok(())
@@ -488,17 +544,54 @@ impl SyncManager {
 
     pub async fn set_realtime_poll_interval(&self, interval_secs: u64) -> Result<(), String> {
         *self.sync_interval_secs.lock().await = interval_secs;
-        let account_ids = self
+        let mut account_ids = self
             .handles
             .lock()
             .await
             .keys()
             .cloned()
             .collect::<Vec<_>>();
+        if interval_secs == 0 {
+            for account_id in &account_ids {
+                self.stop_account_sync(account_id).await;
+            }
+            self.manual_suspended_accounts
+                .lock()
+                .await
+                .extend(account_ids);
+            return Ok(());
+        }
+        let previously_suspended =
+            std::mem::take(&mut *self.manual_suspended_accounts.lock().await);
+        account_ids.extend(previously_suspended);
+        account_ids.sort();
+        account_ids.dedup();
         for account_id in account_ids {
+            self.stop_account_sync(&account_id).await;
             self.start_account_sync(&account_id).await?;
         }
         Ok(())
+    }
+
+    pub async fn stop_all(&self) {
+        let handles = {
+            let mut handles = self.handles.lock().await;
+            handles
+                .drain()
+                .map(|(_, handle)| handle)
+                .collect::<Vec<_>>()
+        };
+        for handle in handles {
+            stop_handle(handle).await;
+        }
+    }
+
+    async fn account_lifecycle_lock(&self, account_id: &str) -> Arc<Mutex<()>> {
+        let mut locks = self.lifecycle_locks.lock().await;
+        locks
+            .entry(account_id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 }
 
