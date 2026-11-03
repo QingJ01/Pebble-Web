@@ -1,0 +1,11 @@
+[package]
+name = "pebble-privacy"
+version = "0.1.5"
+edition = "2021"
+
+[dependencies]
+pebble-core = { path = "../pebble-core" }
+thiserror = { workspace = true }
+ammonia = { workspace = true }
+lol_html = { workspace = true }
+htmlescape = "0.3"

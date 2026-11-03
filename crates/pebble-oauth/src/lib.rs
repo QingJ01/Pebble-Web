@@ -49,6 +49,7 @@ pub enum OAuthError {
 pub struct OAuthManager {
     config: OAuthConfig,
     network: OAuthNetworkConfig,
+    redirect_url: Option<String>,
 }
 
 /// Parsed and validated URL components, ready to build an oauth2 client.
@@ -97,11 +98,28 @@ impl OAuthManager {
         Self {
             config,
             network: OAuthNetworkConfig::default(),
+            redirect_url: None,
         }
     }
 
     pub fn new_with_network(config: OAuthConfig, network: OAuthNetworkConfig) -> Self {
-        Self { config, network }
+        Self {
+            config,
+            network,
+            redirect_url: None,
+        }
+    }
+
+    pub fn new_web(
+        config: OAuthConfig,
+        network: OAuthNetworkConfig,
+        redirect_url: String,
+    ) -> Self {
+        Self {
+            config,
+            network,
+            redirect_url: Some(redirect_url),
+        }
     }
 
     /// Parse and validate the URLs from the config.
@@ -110,10 +128,9 @@ impl OAuthManager {
             .map_err(|e| OAuthError::Config(format!("Invalid auth URL: {}", e)))?;
         let token_url = TokenUrl::new(self.config.token_url.clone())
             .map_err(|e| OAuthError::Config(format!("Invalid token URL: {}", e)))?;
-        let redirect_url = RedirectUrl::new(format!(
-            "http://127.0.0.1:{}/callback",
-            self.config.redirect_port
-        ))
+        let redirect_url = RedirectUrl::new(self.redirect_url.clone().unwrap_or_else(|| {
+            format!("http://127.0.0.1:{}/callback", self.config.redirect_port)
+        }))
         .map_err(|e| OAuthError::Config(format!("Invalid redirect URL: {}", e)))?;
         Ok(ParsedUrls {
             auth_url,
@@ -221,7 +238,7 @@ impl OAuthManager {
 }
 
 pub fn build_http_client(network: &OAuthNetworkConfig) -> Result<reqwest::Client, OAuthError> {
-    let mut builder = reqwest::ClientBuilder::new();
+    let mut builder = reqwest::ClientBuilder::new().no_proxy();
     if let Some(proxy) = &network.proxy {
         let uri = proxy.socks5h_uri().map_err(OAuthError::Config)?;
         let reqwest_proxy = reqwest::Proxy::all(&uri)
@@ -364,8 +381,12 @@ mod tests {
             let request_head = String::from_utf8_lossy(&request);
             let content_length = request_head
                 .lines()
-                .find_map(|line| line.strip_prefix("content-length: "))
-                .and_then(|value| value.parse::<usize>().ok())
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
                 .unwrap_or(0);
             let header_end = request
                 .windows(4)
@@ -420,7 +441,13 @@ mod tests {
             !request.contains("client_secret"),
             "public client token exchange must not send an empty client_secret"
         );
-        assert!(request.contains("client_id=public-client-id"));
-        assert!(request.contains("code_verifier=verifier"));
+        assert!(
+            request.contains("client_id=public-client-id"),
+            "public client token exchange request omitted client_id: {request}"
+        );
+        assert!(
+            request.contains("code_verifier=verifier"),
+            "public client token exchange request omitted PKCE verifier: {request}"
+        );
     }
 }

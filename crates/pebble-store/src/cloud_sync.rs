@@ -1,8 +1,9 @@
 use pebble_core::{PebbleError, Result};
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::Store;
+use crate::{contacts::list_all_contacts_for_backup_with_conn, Store};
 
 /// Maximum accepted size for a settings backup download.
 /// Settings backups (accounts metadata, rules, kanban cards, translate config)
@@ -11,9 +12,36 @@ use crate::Store;
 pub const MAX_BACKUP_SIZE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Highest backup schema version this build understands.
-pub const BACKUP_SCHEMA_VERSION: u32 = 1;
+pub const BACKUP_SCHEMA_VERSION: u32 = 3;
 pub const SETTINGS_BACKUP_FILENAME: &str = "pebble-settings-backup.json";
-pub const KANBAN_CONTEXT_NOTES_KEY: &str = "kanban_context_notes";
+
+fn validate_backup_schema(backup: &SettingsBackup) -> Result<()> {
+    if backup.version == 0 || backup.version > BACKUP_SCHEMA_VERSION {
+        return Err(PebbleError::Validation(format!(
+            "Unsupported backup version {} (this build supports up to {})",
+            backup.version, BACKUP_SCHEMA_VERSION
+        )));
+    }
+    if backup.version >= 2 && backup.contacts.is_none() {
+        return Err(PebbleError::Validation(
+            "Backup version 2 is missing the required contacts field".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+pub fn serialize_backup(backup: &SettingsBackup) -> Result<Vec<u8>> {
+    let json = serde_json::to_vec_pretty(backup)
+        .map_err(|e| PebbleError::Internal(format!("Failed to serialize settings: {e}")))?;
+    if json.len() > MAX_BACKUP_SIZE_BYTES {
+        return Err(PebbleError::Validation(format!(
+            "Backup file is too large ({} bytes, max {})",
+            json.len(),
+            MAX_BACKUP_SIZE_BYTES
+        )));
+    }
+    Ok(json)
+}
 
 fn validate_backup_payload_shape(data: &[u8]) -> Result<()> {
     let data = data.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(data);
@@ -41,6 +69,7 @@ fn validate_backup_payload_shape(data: &[u8]) -> Result<()> {
 fn provider_slug(provider: &pebble_core::ProviderType) -> &'static str {
     match provider {
         pebble_core::ProviderType::Imap => "imap",
+        pebble_core::ProviderType::Pop3 => "pop3",
         pebble_core::ProviderType::Gmail => "gmail",
         pebble_core::ProviderType::Outlook => "outlook",
     }
@@ -55,7 +84,11 @@ pub struct BackupPreview {
     pub rule_count: usize,
     pub kanban_card_count: usize,
     pub kanban_note_count: usize,
+    pub contact_count: usize,
     pub has_translate_config: bool,
+    pub has_encrypted_secrets: bool,
+    pub secret_account_count: usize,
+    pub has_translate_secret: bool,
     pub size_bytes: usize,
 }
 
@@ -73,12 +106,7 @@ pub fn preview_backup(data: &[u8]) -> Result<BackupPreview> {
     let backup: SettingsBackup = serde_json::from_slice(data).map_err(|e| {
         PebbleError::Validation(format!("Backup file is not a valid settings backup: {e}"))
     })?;
-    if backup.version == 0 || backup.version > BACKUP_SCHEMA_VERSION {
-        return Err(PebbleError::Validation(format!(
-            "Unsupported backup version {} (this build supports up to {})",
-            backup.version, BACKUP_SCHEMA_VERSION
-        )));
-    }
+    validate_backup_schema(&backup)?;
     Ok(BackupPreview {
         version: backup.version,
         exported_at: backup.exported_at,
@@ -86,10 +114,22 @@ pub fn preview_backup(data: &[u8]) -> Result<BackupPreview> {
         rule_count: backup.rules.len(),
         kanban_card_count: backup.kanban_cards.len(),
         kanban_note_count: backup.kanban_context_notes.len(),
+        contact_count: backup.contacts.as_ref().map(Vec::len).unwrap_or(0),
         has_translate_config: backup
             .translate_config
             .as_ref()
             .map(|tc| !tc.config.is_empty())
+            .unwrap_or(false),
+        has_encrypted_secrets: backup.encrypted_secrets.is_some(),
+        secret_account_count: backup
+            .secret_summary
+            .as_ref()
+            .map(|summary| summary.account_auth_count)
+            .unwrap_or(0),
+        has_translate_secret: backup
+            .secret_summary
+            .as_ref()
+            .map(|summary| summary.has_translate_config)
             .unwrap_or(false),
         size_bytes: data.len(),
     })
@@ -105,18 +145,52 @@ pub struct SettingsBackup {
     pub kanban_cards: Vec<pebble_core::KanbanCard>,
     #[serde(default)]
     pub kanban_context_notes: HashMap<String, String>,
+    #[serde(default)]
+    pub contacts: Option<Vec<pebble_core::Contact>>,
     pub translate_config: Option<pebble_core::TranslateConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_summary: Option<BackupSecretSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encrypted_secrets: Option<serde_json::Value>,
 }
 
 /// Account data without passwords or auth secrets.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountBackup {
+    #[serde(default)]
+    pub account_label: Option<String>,
     pub id: String,
     pub email: String,
     pub display_name: String,
     #[serde(default)]
     pub color: Option<String>,
     pub provider: pebble_core::ProviderType,
+}
+
+#[derive(Debug, Clone)]
+pub struct RestoredAuthData {
+    pub account_id: String,
+    pub provider: String,
+    pub encrypted: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RestoredSecureUserData {
+    pub key: String,
+    pub encrypted: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RestoredPrivateData {
+    pub auth_data: Vec<RestoredAuthData>,
+    pub secure_user_data: Vec<RestoredSecureUserData>,
+    pub translate_config: Option<pebble_core::TranslateConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupSecretSummary {
+    pub account_auth_count: usize,
+    pub has_translate_config: bool,
 }
 
 pub struct WebDavClient {
@@ -135,6 +209,7 @@ impl WebDavClient {
             ));
         }
         let client = reqwest::Client::builder()
+            .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| PebbleError::Internal(format!("Failed to create HTTP client: {e}")))?;
@@ -248,12 +323,13 @@ impl WebDavClient {
 }
 
 impl Store {
-    /// Export settings (accounts without passwords, rules, kanban cards, translate config) as JSON bytes.
+    /// Export settings (accounts without passwords, rules, kanban cards, contacts, translate config) as JSON bytes.
     pub fn export_settings(&self) -> Result<Vec<u8>> {
         let accounts = self.list_accounts()?;
         let account_backups: Vec<AccountBackup> = accounts
             .into_iter()
             .map(|a| AccountBackup {
+                account_label: a.account_label,
                 id: a.id,
                 email: a.email,
                 display_name: a.display_name,
@@ -264,15 +340,12 @@ impl Store {
 
         let rules = self.list_rules()?;
         let kanban_cards = self.list_kanban_cards(None)?;
-        let kanban_context_notes = self
-            .get_secure_user_data(KANBAN_CONTEXT_NOTES_KEY)?
-            .map(|bytes| {
-                serde_json::from_slice(&bytes).map_err(|e| {
-                    PebbleError::Storage(format!("Invalid kanban context notes JSON: {e}"))
-                })
-            })
-            .transpose()?
-            .unwrap_or_default();
+        let contacts = self.with_read(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let contacts = list_all_contacts_for_backup_with_conn(&tx)?;
+            tx.commit()?;
+            Ok(contacts)
+        })?;
         // Redact translate config — never export API keys or encrypted secrets
         let translate_config = self.get_translate_config()?.map(|mut tc| {
             tc.config = String::new();
@@ -280,18 +353,19 @@ impl Store {
         });
 
         let backup = SettingsBackup {
-            version: 1,
+            version: BACKUP_SCHEMA_VERSION,
             exported_at: pebble_core::now_timestamp(),
             accounts: account_backups,
             rules,
             kanban_cards,
-            kanban_context_notes,
+            kanban_context_notes: HashMap::new(),
+            contacts: Some(contacts),
             translate_config,
+            secret_summary: None,
+            encrypted_secrets: None,
         };
 
-        let json = serde_json::to_vec_pretty(&backup)
-            .map_err(|e| PebbleError::Internal(format!("Failed to serialize settings: {e}")))?;
-        Ok(json)
+        serialize_backup(&backup)
     }
 
     /// Import settings from JSON bytes, upserting into the store.
@@ -310,12 +384,7 @@ impl Store {
         validate_backup_payload_shape(data)?;
         let backup: SettingsBackup = serde_json::from_slice(data)
             .map_err(|e| PebbleError::Validation(format!("Failed to deserialize settings: {e}")))?;
-        if backup.version == 0 || backup.version > BACKUP_SCHEMA_VERSION {
-            return Err(PebbleError::Validation(format!(
-                "Unsupported backup version {} (this build supports up to {})",
-                backup.version, BACKUP_SCHEMA_VERSION
-            )));
-        }
+        validate_backup_schema(&backup)?;
 
         self.with_write(|conn| {
             let tx = conn.unchecked_transaction()
@@ -324,6 +393,7 @@ impl Store {
             // Merge account metadata: insert restored accounts, update existing
             // account display fields without touching auth_data.
             for ab in &backup.accounts {
+                let restored_label = crate::accounts::normalize_account_label(ab.account_label.as_deref())?;
                 let exists: bool = tx
                     .query_row(
                         "SELECT EXISTS(SELECT 1 FROM accounts WHERE id = ?1)",
@@ -361,13 +431,13 @@ impl Store {
                     );
                     let sync_state_json = sync_state.to_json()?;
                     tx.execute(
-                        "INSERT INTO accounts (id, email, display_name, color, provider, sync_state, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                        rusqlite::params![&ab.id, &ab.email, &ab.display_name, restored_color, provider_slug(&ab.provider), sync_state_json, now, now],
+                        "INSERT INTO accounts (id, email, display_name, color, provider, sync_state, created_at, updated_at, account_label) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                        rusqlite::params![&ab.id, &ab.email, &ab.display_name, restored_color, provider_slug(&ab.provider), sync_state_json, now, now, &restored_label],
                     ).map_err(|e| PebbleError::Storage(e.to_string()))?;
                 } else {
                     tx.execute(
-                        "UPDATE accounts SET email = ?1, display_name = ?2, color = ?3, updated_at = ?4 WHERE id = ?5",
-                        rusqlite::params![&ab.email, &ab.display_name, restored_color, pebble_core::now_timestamp(), &ab.id],
+                        "UPDATE accounts SET email = CASE WHEN provider IN ('gmail', 'outlook') THEN email ELSE ?1 END, display_name = ?2, color = ?3, updated_at = ?4, account_label = ?6 WHERE id = ?5",
+                        rusqlite::params![&ab.email, &ab.display_name, restored_color, pebble_core::now_timestamp(), &ab.id, &restored_label],
                     )
                     .map_err(|e| PebbleError::Storage(e.to_string()))?;
                 }
@@ -390,22 +460,13 @@ impl Store {
                 Self::upsert_kanban_card_with_conn(&tx, card)?;
             }
 
-            let notes_json = serde_json::to_vec(&backup.kanban_context_notes).map_err(|e| {
-                PebbleError::Storage(format!("Failed to serialize kanban context notes: {e}"))
-            })?;
-            tx.execute(
-                "INSERT INTO secure_user_data (key, value, updated_at)
-                 VALUES (?1, ?2, ?3)
-                 ON CONFLICT(key) DO UPDATE SET
-                     value = excluded.value,
-                     updated_at = excluded.updated_at",
-                rusqlite::params![
-                    KANBAN_CONTEXT_NOTES_KEY,
-                    notes_json,
-                    pebble_core::now_timestamp()
-                ],
-            )
-            .map_err(|e| PebbleError::Storage(e.to_string()))?;
+            // Contacts were added in schema v2. A v1 restore must preserve
+            // local contacts because the older file could not contain them.
+            if backup.version >= 2 {
+                if let Some(contacts) = &backup.contacts {
+                    crate::contacts::replace_contacts_with_conn(&tx, contacts)?;
+                }
+            }
 
             // Upsert translate config — skip if config field is empty (redacted export)
             if let Some(tc) = &backup.translate_config {
@@ -419,11 +480,297 @@ impl Store {
             Ok(())
         })
     }
+
+    /// Import settings and already-encrypted private data in one transaction.
+    pub fn import_settings_with_private_data(
+        &self,
+        data: &[u8],
+        private_data: RestoredPrivateData,
+    ) -> Result<()> {
+        if data.len() > MAX_BACKUP_SIZE_BYTES {
+            return Err(PebbleError::Validation(format!(
+                "Backup file is too large ({} bytes, max {})",
+                data.len(),
+                MAX_BACKUP_SIZE_BYTES
+            )));
+        }
+        validate_backup_payload_shape(data)?;
+        let backup: SettingsBackup = serde_json::from_slice(data)
+            .map_err(|e| PebbleError::Validation(format!("Failed to deserialize settings: {e}")))?;
+        validate_backup_schema(&backup)?;
+
+        self.with_write(|conn| {
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(|e| PebbleError::Storage(format!("Failed to begin transaction: {e}")))?;
+
+            for ab in &backup.accounts {
+                let restored_label = crate::accounts::normalize_account_label(ab.account_label.as_deref())?;
+                let exists: bool = tx
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM accounts WHERE id = ?1)",
+                        rusqlite::params![&ab.id],
+                        |row| row.get(0),
+                    )
+                    .map_err(|e| PebbleError::Storage(e.to_string()))?;
+                let existing_color: Option<String> = if exists {
+                    tx.query_row(
+                        "SELECT color FROM accounts WHERE id = ?1",
+                        rusqlite::params![&ab.id],
+                        |row| row.get(0),
+                    )
+                    .map_err(|e| PebbleError::Storage(e.to_string()))?
+                } else {
+                    None
+                };
+                let restored_color = ab.color.as_deref().or(existing_color.as_deref());
+                if !exists {
+                    let now = pebble_core::now_timestamp();
+                    let mut sync_state = crate::accounts::SyncState {
+                        provider: Some(provider_slug(&ab.provider).to_string()),
+                        ..Default::default()
+                    };
+                    sync_state
+                        .extra
+                        .insert("needs_reauth".into(), serde_json::Value::Bool(true));
+                    sync_state.extra.insert(
+                        "restore_is_partial".into(),
+                        serde_json::Value::Bool(true),
+                    );
+                    sync_state.extra.insert(
+                        "restored_from_backup_at".into(),
+                        serde_json::Value::Number(now.into()),
+                    );
+                    let sync_state_json = sync_state.to_json()?;
+                    tx.execute(
+                        "INSERT INTO accounts (id, email, display_name, color, provider, sync_state, created_at, updated_at, account_label) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                        rusqlite::params![&ab.id, &ab.email, &ab.display_name, restored_color, provider_slug(&ab.provider), sync_state_json, now, now, &restored_label],
+                    ).map_err(|e| PebbleError::Storage(e.to_string()))?;
+                } else {
+                    tx.execute(
+                        "UPDATE accounts SET email = CASE WHEN provider IN ('gmail', 'outlook') THEN email ELSE ?1 END, display_name = ?2, color = ?3, updated_at = ?4, account_label = ?6 WHERE id = ?5",
+                        rusqlite::params![&ab.email, &ab.display_name, restored_color, pebble_core::now_timestamp(), &ab.id, &restored_label],
+                    )
+                    .map_err(|e| PebbleError::Storage(e.to_string()))?;
+                }
+            }
+
+            tx.execute("DELETE FROM rules", [])
+                .map_err(|e| PebbleError::Storage(e.to_string()))?;
+            for rule in &backup.rules {
+                tx.execute(
+                    "INSERT INTO rules (id, name, priority, conditions, actions, is_enabled, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    rusqlite::params![&rule.id, &rule.name, rule.priority, &rule.conditions, &rule.actions, rule.is_enabled, rule.created_at, rule.updated_at],
+                ).map_err(|e| PebbleError::Storage(e.to_string()))?;
+            }
+
+            tx.execute("DELETE FROM kanban_cards", [])
+                .map_err(|e| PebbleError::Storage(e.to_string()))?;
+            for card in &backup.kanban_cards {
+                Self::upsert_kanban_card_with_conn(&tx, card)?;
+            }
+
+            if backup.version >= 2 {
+                if let Some(contacts) = &backup.contacts {
+                    crate::contacts::replace_contacts_with_conn(&tx, contacts)?;
+                }
+            }
+
+            if let Some(tc) = &backup.translate_config {
+                if !tc.config.is_empty() {
+                    Self::save_translate_config_with_conn(&tx, tc)?;
+                }
+            }
+
+            for item in &private_data.secure_user_data {
+                if item.key.trim().is_empty() {
+                    return Err(PebbleError::Validation(
+                        "Restored secure user data key cannot be empty".to_string(),
+                    ));
+                }
+                if let Some(encrypted) = &item.encrypted {
+                    tx.execute(
+                        "INSERT INTO secure_user_data (key, value, updated_at)
+                         VALUES (?1, ?2, ?3)
+                         ON CONFLICT(key) DO UPDATE SET
+                             value = excluded.value,
+                             updated_at = excluded.updated_at",
+                        rusqlite::params![&item.key, encrypted, pebble_core::now_timestamp()],
+                    )
+                    .map_err(|e| PebbleError::Storage(e.to_string()))?;
+                } else {
+                    tx.execute(
+                        "DELETE FROM secure_user_data WHERE key = ?1",
+                        rusqlite::params![&item.key],
+                    )
+                    .map_err(|e| PebbleError::Storage(e.to_string()))?;
+                }
+            }
+
+            for auth in &private_data.auth_data {
+                let (provider, has_auth, bound_subject, has_mailbox_data): (String, bool, Option<String>, bool) = tx.query_row(
+                    "SELECT provider, auth_data IS NOT NULL, oauth_subject,
+                        EXISTS(SELECT 1 FROM messages WHERE account_id = accounts.id)
+                        OR EXISTS(SELECT 1 FROM folders WHERE account_id = accounts.id)
+                        OR COALESCE(json_extract(sync_state, '$.last_sync_cursor'), '') != ''
+                     FROM accounts WHERE id = ?1",
+                    [&auth.account_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))).optional()?.ok_or_else(|| PebbleError::Validation(format!("Backup secret references missing account: {}", auth.account_id)))?;
+                if provider != auth.provider {
+                    return Err(PebbleError::Validation("Backup authorization does not match the account provider".into()));
+                }
+                // Never replace a connected/bound OAuth mailbox with credentials from a backup.
+                // New, unbound accounts can still restore their authorization normally.
+                if matches!(provider.as_str(), "gmail" | "outlook") && (has_auth || bound_subject.is_some() || has_mailbox_data) {
+                    continue;
+                }
+                let now = pebble_core::now_timestamp();
+                let rows_affected = tx
+                    .execute(
+                        "UPDATE accounts SET auth_data = ?1, updated_at = ?2 WHERE id = ?3",
+                        rusqlite::params![&auth.encrypted, now, &auth.account_id],
+                    )
+                    .map_err(|e| PebbleError::Storage(e.to_string()))?;
+                if rows_affected == 0 {
+                    return Err(PebbleError::Validation(format!(
+                        "Backup secret references missing account: {}",
+                        auth.account_id
+                    )));
+                }
+
+                let current: Option<String> = tx
+                    .query_row(
+                        "SELECT sync_state FROM accounts WHERE id = ?1",
+                        rusqlite::params![&auth.account_id],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                    .optional()?
+                    .flatten();
+                let mut sync_state =
+                    crate::accounts::SyncState::from_json_opt(current.as_deref())?;
+                sync_state.provider = Some(auth.provider.clone());
+                sync_state.extra.remove("needs_reauth");
+                sync_state.extra.remove("restore_is_partial");
+                let sync_state_json = sync_state.to_json()?;
+                tx.execute(
+                    "UPDATE accounts SET sync_state = ?1, updated_at = ?2 WHERE id = ?3",
+                    rusqlite::params![
+                        sync_state_json,
+                        pebble_core::now_timestamp(),
+                        &auth.account_id
+                    ],
+                )
+                .map_err(|e| PebbleError::Storage(e.to_string()))?;
+            }
+
+            if let Some(config) = &private_data.translate_config {
+                Self::save_translate_config_with_conn(&tx, config)?;
+            }
+
+            tx.commit()
+                .map_err(|e| PebbleError::Storage(format!("Failed to commit: {e}")))?;
+            Ok(())
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::Mutex;
+
+    static PROXY_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    const PROXY_ENV_KEYS: [&str; 8] = [
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "NO_PROXY",
+        "no_proxy",
+    ];
+
+    struct ProxyEnvironmentGuard(Vec<(&'static str, Option<OsString>)>);
+
+    impl ProxyEnvironmentGuard {
+        fn install(proxy_url: &str) -> Self {
+            let previous = PROXY_ENV_KEYS
+                .into_iter()
+                .map(|key| (key, std::env::var_os(key)))
+                .collect();
+            for key in PROXY_ENV_KEYS {
+                if key.eq_ignore_ascii_case("ALL_PROXY") {
+                    std::env::set_var(key, proxy_url);
+                } else {
+                    std::env::remove_var(key);
+                }
+            }
+            Self(previous)
+        }
+    }
+
+    impl Drop for ProxyEnvironmentGuard {
+        fn drop(&mut self) {
+            for (key, value) in self.0.drain(..) {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    fn start_http_origin() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(
+                    b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+        });
+        format!("http://{address}/health")
+    }
+
+    fn unused_http_proxy_url() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn webdav_client_ignores_all_proxy() {
+        let origin_url = start_http_origin();
+        let webdav = {
+            let _lock = PROXY_ENV_LOCK.lock().unwrap();
+            let _proxy_environment = ProxyEnvironmentGuard::install(&unused_http_proxy_url());
+            WebDavClient::new(
+                "https://example.com/webdav".to_string(),
+                "user".to_string(),
+                "password".to_string(),
+            )
+            .unwrap()
+        };
+
+        let response = webdav
+            .client
+            .get(origin_url)
+            .timeout(std::time::Duration::from_secs(2))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+    }
     use pebble_core::*;
 
     #[test]
@@ -433,6 +780,8 @@ mod tests {
 
         // Create test account
         let account = Account {
+            account_label: None,
+            provider_display_name: None,
             id: new_id(),
             email: "test@example.com".to_string(),
             display_name: "Test User".to_string(),
@@ -467,15 +816,42 @@ mod tests {
         };
         store.save_translate_config(&tc).unwrap();
 
+        store
+            .save_contact(&ContactInput {
+                id: None,
+                display_name: "Alice Example".to_string(),
+                notes: "Met at RustConf".to_string(),
+                is_favorite: true,
+                emails: vec![
+                    ContactEmailInput {
+                        id: None,
+                        address: "alice@example.com".to_string(),
+                        label: ContactEmailLabel::Work,
+                        is_primary: true,
+                    },
+                    ContactEmailInput {
+                        id: None,
+                        address: "alice@home.example".to_string(),
+                        label: ContactEmailLabel::Personal,
+                        is_primary: false,
+                    },
+                ],
+            })
+            .unwrap();
+
         // Export
         let data = store.export_settings().unwrap();
         let backup: SettingsBackup = serde_json::from_slice(&data).unwrap();
-        assert_eq!(backup.version, 1);
+        assert_eq!(backup.version, BACKUP_SCHEMA_VERSION);
         assert_eq!(backup.accounts.len(), 1);
         assert_eq!(backup.accounts[0].email, "test@example.com");
         assert_eq!(backup.accounts[0].color.as_deref(), Some("#22c55e"));
         assert_eq!(backup.rules.len(), 1);
         assert_eq!(backup.rules[0].name, "Auto-archive");
+        let backed_up_contacts = backup.contacts.as_ref().unwrap();
+        assert_eq!(backed_up_contacts.len(), 1);
+        assert_eq!(backed_up_contacts[0].emails.len(), 2);
+        assert!(backed_up_contacts[0].is_favorite);
         assert!(backup.translate_config.is_some());
         // Config field should be redacted (empty) in export
         assert_eq!(backup.translate_config.as_ref().unwrap().config, "");
@@ -493,6 +869,21 @@ mod tests {
         let rules = store2.list_rules().unwrap();
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].name, "Auto-archive");
+
+        let contacts = store2.list_contacts(None, false, 200, 0).unwrap();
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(contacts[0].display_name, "Alice Example");
+        assert_eq!(contacts[0].notes, "Met at RustConf");
+        assert_eq!(contacts[0].emails.len(), 2);
+        assert!(contacts[0].is_favorite);
+        assert_eq!(
+            contacts[0]
+                .emails
+                .iter()
+                .find(|email| email.is_primary)
+                .map(|email| email.address.as_str()),
+            Some("alice@example.com")
+        );
 
         // Translate config should NOT be imported when config is redacted
         let tc_loaded = store2.get_translate_config().unwrap();
@@ -520,11 +911,186 @@ mod tests {
     }
 
     #[test]
+    fn preview_backup_reports_encrypted_secret_summary() {
+        let backup = serde_json::json!({
+            "version": 1,
+            "exported_at": now_timestamp(),
+            "accounts": [],
+            "rules": [],
+            "kanban_cards": [],
+            "kanban_context_notes": {},
+            "translate_config": null,
+            "secret_summary": {
+                "account_auth_count": 2,
+                "has_translate_config": true
+            },
+            "encrypted_secrets": {
+                "algorithm": "aes-256-gcm",
+                "kdf": "pbkdf2-hmac-sha256",
+                "iterations": 210000,
+                "salt_hex": "00112233445566778899aabbccddeeff",
+                "ciphertext_hex": "00"
+            }
+        });
+
+        let preview = preview_backup(&serde_json::to_vec(&backup).unwrap()).unwrap();
+
+        assert!(preview.has_encrypted_secrets);
+        assert_eq!(preview.secret_account_count, 2);
+        assert!(preview.has_translate_secret);
+    }
+
+    #[test]
+    fn version_one_backup_has_no_contacts_and_preserves_local_contacts() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .save_contact(&ContactInput {
+                id: None,
+                display_name: "Local contact".to_string(),
+                notes: String::new(),
+                is_favorite: false,
+                emails: vec![ContactEmailInput {
+                    id: None,
+                    address: "local@example.com".to_string(),
+                    label: ContactEmailLabel::Other,
+                    is_primary: true,
+                }],
+            })
+            .unwrap();
+        let backup = serde_json::json!({
+            "version": 1,
+            "exported_at": now_timestamp(),
+            "accounts": [],
+            "rules": [],
+            "kanban_cards": [],
+            "kanban_context_notes": {},
+            "translate_config": null
+        });
+        let data = serde_json::to_vec(&backup).unwrap();
+
+        let preview = preview_backup(&data).unwrap();
+        assert_eq!(preview.contact_count, 0);
+        store.import_settings(&data).unwrap();
+
+        let contacts = store.list_contacts(None, false, 200, 0).unwrap();
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(contacts[0].display_name, "Local contact");
+    }
+
+    #[test]
+    fn version_two_backup_requires_contacts_field() {
+        let backup = serde_json::json!({
+            "version": 2,
+            "exported_at": now_timestamp(),
+            "accounts": [],
+            "rules": [],
+            "kanban_cards": [],
+            "kanban_context_notes": {},
+            "translate_config": null
+        });
+        let data = serde_json::to_vec(&backup).unwrap();
+
+        let error = preview_backup(&data).unwrap_err().to_string();
+
+        assert!(error.contains("contacts"));
+        assert!(error.contains("version 2"));
+    }
+
+    #[test]
+    fn export_rejects_backup_that_cannot_be_restored_due_to_size() {
+        let store = Store::open_in_memory().unwrap();
+        let notes = "x".repeat(2000);
+        store
+            .with_write(|conn| {
+                let tx = conn.unchecked_transaction()?;
+                for index in 0..8_500 {
+                    let contact_id = format!("contact-{index}");
+                    let email_id = format!("email-{index}");
+                    let address = format!("user{index}@example.com");
+                    tx.execute(
+                        "INSERT INTO contacts
+                            (id, display_name, notes, is_favorite, created_at, updated_at)
+                         VALUES (?1, ?2, ?3, 0, 1, 1)",
+                        rusqlite::params![contact_id, address, notes],
+                    )?;
+                    tx.execute(
+                        "INSERT INTO contact_emails
+                            (id, contact_id, address, normalized_address, label, is_primary, created_at)
+                         VALUES (?1, ?2, ?3, ?3, 'other', 1, 1)",
+                        rusqlite::params![email_id, contact_id, address],
+                    )?;
+                }
+                tx.commit()?;
+                Ok(())
+            })
+            .unwrap();
+
+        let error = store.export_settings().unwrap_err().to_string();
+
+        assert!(error.contains("too large"));
+        assert!(error.contains(&MAX_BACKUP_SIZE_BYTES.to_string()));
+    }
+
+    #[test]
+    fn version_two_contact_restore_rolls_back_on_duplicate_email() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .save_contact(&ContactInput {
+                id: None,
+                display_name: "Keep me".to_string(),
+                notes: String::new(),
+                is_favorite: false,
+                emails: vec![ContactEmailInput {
+                    id: None,
+                    address: "keep@example.com".to_string(),
+                    label: ContactEmailLabel::Other,
+                    is_primary: true,
+                }],
+            })
+            .unwrap();
+        let contact = |id: &str, email_id: &str| {
+            serde_json::json!({
+                "id": id,
+                "display_name": id,
+                "notes": "",
+                "is_favorite": false,
+                "emails": [{
+                    "id": email_id,
+                    "address": "duplicate@example.com",
+                    "label": "other",
+                    "is_primary": true
+                }],
+                "created_at": 1,
+                "updated_at": 1
+            })
+        };
+        let backup = serde_json::json!({
+            "version": 2,
+            "exported_at": now_timestamp(),
+            "accounts": [],
+            "rules": [],
+            "kanban_cards": [],
+            "kanban_context_notes": {},
+            "contacts": [contact("first", "first-email"), contact("second", "second-email")],
+            "translate_config": null
+        });
+
+        assert!(store
+            .import_settings(&serde_json::to_vec(&backup).unwrap())
+            .is_err());
+        let contacts = store.list_contacts(None, false, 200, 0).unwrap();
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(contacts[0].display_name, "Keep me");
+    }
+
+    #[test]
     fn test_import_does_not_duplicate_existing_accounts() {
         let store = Store::open_in_memory().unwrap();
         let now = now_timestamp();
 
         let account = Account {
+            account_label: None,
+            provider_display_name: None,
             id: "fixed-id".to_string(),
             email: "test@example.com".to_string(),
             display_name: "Test".to_string(),
@@ -544,75 +1110,13 @@ mod tests {
     }
 
     #[test]
-    fn test_export_import_round_trips_kanban_context_notes() {
-        let store = Store::open_in_memory().unwrap();
-        let now = now_timestamp();
-        let mut notes = HashMap::new();
-        notes.insert("message-1".to_string(), "follow up".to_string());
-        store
-            .set_secure_user_data(
-                KANBAN_CONTEXT_NOTES_KEY,
-                &serde_json::to_vec(&notes).unwrap(),
-            )
-            .unwrap();
-
-        let data = store.export_settings().unwrap();
-        let backup: SettingsBackup = serde_json::from_slice(&data).unwrap();
-        assert_eq!(
-            backup
-                .kanban_context_notes
-                .get("message-1")
-                .map(String::as_str),
-            Some("follow up")
-        );
-
-        let store2 = Store::open_in_memory().unwrap();
-        let stale_notes = HashMap::from([("old-message".to_string(), "old".to_string())]);
-        store2
-            .set_secure_user_data(
-                KANBAN_CONTEXT_NOTES_KEY,
-                &serde_json::to_vec(&stale_notes).unwrap(),
-            )
-            .unwrap();
-        store2.import_settings(&data).unwrap();
-
-        let restored: HashMap<String, String> = serde_json::from_slice(
-            &store2
-                .get_secure_user_data(KANBAN_CONTEXT_NOTES_KEY)
-                .unwrap()
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(restored, notes);
-
-        let empty_backup = SettingsBackup {
-            version: 1,
-            exported_at: now,
-            accounts: vec![],
-            rules: vec![],
-            kanban_cards: vec![],
-            kanban_context_notes: HashMap::new(),
-            translate_config: None,
-        };
-        store2
-            .import_settings(&serde_json::to_vec(&empty_backup).unwrap())
-            .unwrap();
-        let restored_empty: HashMap<String, String> = serde_json::from_slice(
-            &store2
-                .get_secure_user_data(KANBAN_CONTEXT_NOTES_KEY)
-                .unwrap()
-                .unwrap(),
-        )
-        .unwrap();
-        assert!(restored_empty.is_empty());
-    }
-
-    #[test]
     fn test_import_legacy_backup_preserves_existing_account_color() {
         let store = Store::open_in_memory().unwrap();
         let now = now_timestamp();
 
         let account = Account {
+            account_label: None,
+            provider_display_name: None,
             id: "fixed-id".to_string(),
             email: "test@example.com".to_string(),
             display_name: "Test".to_string(),
@@ -681,7 +1185,10 @@ mod tests {
             }],
             kanban_cards: vec![],
             kanban_context_notes: HashMap::new(),
+            contacts: None,
             translate_config: None,
+            secret_summary: None,
+            encrypted_secrets: None,
         };
         let data = serde_json::to_vec(&backup).unwrap();
         store.import_settings(&data).unwrap();
@@ -692,11 +1199,74 @@ mod tests {
     }
 
     #[test]
+    fn import_settings_with_private_data_rolls_back_when_private_data_is_invalid() {
+        let store = Store::open_in_memory().unwrap();
+        let now = now_timestamp();
+
+        let old_rule = Rule {
+            id: new_id(),
+            name: "Old Rule".to_string(),
+            priority: 1,
+            conditions: "{}".to_string(),
+            actions: "[]".to_string(),
+            is_enabled: true,
+            created_at: now,
+            updated_at: now,
+        };
+        store.insert_rule(&old_rule).unwrap();
+
+        let backup = SettingsBackup {
+            version: 1,
+            exported_at: now,
+            accounts: vec![],
+            rules: vec![Rule {
+                id: new_id(),
+                name: "New Rule".to_string(),
+                priority: 5,
+                conditions: "{}".to_string(),
+                actions: "[]".to_string(),
+                is_enabled: false,
+                created_at: now,
+                updated_at: now,
+            }],
+            kanban_cards: vec![],
+            kanban_context_notes: HashMap::new(),
+            contacts: None,
+            translate_config: None,
+            secret_summary: None,
+            encrypted_secrets: None,
+        };
+        let data = serde_json::to_vec(&backup).unwrap();
+
+        let err = store
+            .import_settings_with_private_data(
+                &data,
+                RestoredPrivateData {
+                    auth_data: vec![RestoredAuthData {
+                        account_id: "missing-account".to_string(),
+                        provider: "imap".to_string(),
+                        encrypted: b"encrypted-auth".to_vec(),
+                    }],
+                    ..RestoredPrivateData::default()
+                },
+            )
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("missing-account"));
+        let rules = store.list_rules().unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].name, "Old Rule");
+    }
+
+    #[test]
     fn test_import_replaces_kanban_cards() {
         let store = Store::open_in_memory().unwrap();
         let now = now_timestamp();
 
         let account = Account {
+            account_label: None,
+            provider_display_name: None,
             id: new_id(),
             email: "test@example.com".to_string(),
             display_name: "Test User".to_string(),
@@ -776,7 +1346,10 @@ mod tests {
                 updated_at: now,
             }],
             kanban_context_notes: HashMap::new(),
+            contacts: None,
             translate_config: None,
+            secret_summary: None,
+            encrypted_secrets: None,
         };
 
         store
@@ -798,6 +1371,7 @@ mod tests {
             version: 1,
             exported_at: now,
             accounts: vec![AccountBackup {
+                account_label: None,
                 id: "gmail-account".to_string(),
                 email: "gmail@example.com".to_string(),
                 display_name: "Gmail User".to_string(),
@@ -807,7 +1381,10 @@ mod tests {
             rules: vec![],
             kanban_cards: vec![],
             kanban_context_notes: HashMap::new(),
+            contacts: None,
             translate_config: None,
+            secret_summary: None,
+            encrypted_secrets: None,
         };
 
         let data = serde_json::to_vec(&backup).unwrap();

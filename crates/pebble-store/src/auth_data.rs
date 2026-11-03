@@ -35,6 +35,29 @@ impl Store {
         })
     }
 
+    /// Replace encrypted auth data only if it still matches the value that was read.
+    pub fn compare_exchange_auth_data(
+        &self,
+        account_id: &str,
+        expected: &[u8],
+        replacement: &[u8],
+    ) -> Result<bool> {
+        self.with_write(|conn| {
+            let rows_affected = conn.execute(
+                "UPDATE accounts
+                 SET auth_data = ?1, updated_at = ?2
+                 WHERE id = ?3 AND auth_data = ?4",
+                params![
+                    replacement,
+                    pebble_core::now_timestamp(),
+                    account_id,
+                    expected
+                ],
+            )?;
+            Ok(rows_affected == 1)
+        })
+    }
+
     /// Clear auth data for an account.
     pub fn clear_auth_data(&self, account_id: &str) -> Result<()> {
         self.with_write(|conn| {
@@ -54,6 +77,8 @@ mod tests {
 
     fn test_account() -> Account {
         Account {
+            account_label: None,
+            provider_display_name: None,
             id: new_id(),
             email: "test@example.com".to_string(),
             display_name: "Test".to_string(),
@@ -98,5 +123,24 @@ mod tests {
 
         let fetched = store.get_auth_data(&account.id).unwrap();
         assert!(fetched.is_none());
+    }
+
+    #[test]
+    fn compare_exchange_auth_data_does_not_overwrite_a_newer_value() {
+        let store = crate::Store::open_in_memory().unwrap();
+        let account = test_account();
+        store.insert_account(&account).unwrap();
+        store.set_auth_data(&account.id, b"legacy").unwrap();
+
+        assert!(store
+            .compare_exchange_auth_data(&account.id, b"legacy", b"migrated")
+            .unwrap());
+        assert!(!store
+            .compare_exchange_auth_data(&account.id, b"legacy", b"stale replacement")
+            .unwrap());
+        assert_eq!(
+            store.get_auth_data(&account.id).unwrap().as_deref(),
+            Some(&b"migrated"[..])
+        );
     }
 }

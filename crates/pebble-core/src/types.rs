@@ -3,6 +3,12 @@ use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Account {
+    /// A local label, never used in outbound mail headers.
+    #[serde(default)]
+    pub account_label: Option<String>,
+    /// Last verified provider-managed name (Outlook).
+    #[serde(default)]
+    pub provider_display_name: Option<String>,
     pub id: String,
     pub email: String,
     pub display_name: String,
@@ -12,10 +18,36 @@ pub struct Account {
     pub updated_at: i64,
 }
 
+impl Account {
+    /// Local account labels must never participate in the outgoing identity.
+    pub fn sender_identity(&self) -> EmailAddress {
+        let name = if self.provider == ProviderType::Outlook {
+            self.provider_display_name.as_deref()
+        } else {
+            Some(self.display_name.as_str())
+        };
+        EmailAddress {
+            name: name
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned),
+            address: self.email.trim().to_owned(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OAuthMailboxIdentity {
+    pub subject: String,
+    pub email: String,
+    pub display_name: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum ProviderType {
     Imap,
+    Pop3,
     Gmail,
     Outlook,
 }
@@ -273,6 +305,76 @@ pub struct KnownContact {
     pub address: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ContactEmailLabel {
+    Work,
+    Personal,
+    Other,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContactEmail {
+    pub id: String,
+    pub address: String,
+    pub label: ContactEmailLabel,
+    pub is_primary: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Contact {
+    pub id: String,
+    pub display_name: String,
+    pub notes: String,
+    pub is_favorite: bool,
+    pub emails: Vec<ContactEmail>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContactEmailInput {
+    pub id: Option<String>,
+    pub address: String,
+    pub label: ContactEmailLabel,
+    pub is_primary: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContactInput {
+    pub id: Option<String>,
+    pub display_name: String,
+    pub notes: String,
+    pub is_favorite: bool,
+    pub emails: Vec<ContactEmailInput>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ContactSuggestionSource {
+    Saved,
+    Recent,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContactSuggestion {
+    pub contact_id: Option<String>,
+    pub name: Option<String>,
+    pub address: String,
+    pub source: ContactSuggestionSource,
+    pub is_favorite: bool,
+    pub last_interaction_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct VcardImportResult {
+    pub created: usize,
+    pub merged: usize,
+    pub skipped: usize,
+    pub invalid: usize,
+    pub errors: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Category {
     pub id: String,
@@ -282,6 +384,8 @@ pub struct Category {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DraftMessage {
+    #[serde(default)]
+    pub from: Option<EmailAddress>,
     pub id: Option<String>,
     pub to: Vec<EmailAddress>,
     pub cc: Vec<EmailAddress>,
@@ -320,4 +424,19 @@ pub fn now_timestamp() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
+}
+
+pub fn utc_date_from_unix_seconds(timestamp: i64) -> (i64, u32, u32) {
+    let days = timestamp.div_euclid(86_400) + 719_468;
+    let era = if days >= 0 { days } else { days - 146_096 }.div_euclid(146_097);
+    let day_of_era = days - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    (year, month as u32, day as u32)
 }

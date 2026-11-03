@@ -27,7 +27,7 @@ pub struct SyncManager {
     store: Arc<Store>,
     crypto: Arc<CryptoService>,
     attachments_dir: PathBuf,
-    sync_interval_secs: u64,
+    sync_interval_secs: Mutex<u64>,
     ws_tx: broadcast::Sender<String>,
 }
 
@@ -44,7 +44,7 @@ impl SyncManager {
             store,
             crypto,
             attachments_dir,
-            sync_interval_secs,
+            sync_interval_secs: Mutex::new(sync_interval_secs),
             ws_tx,
         }
     }
@@ -119,8 +119,9 @@ impl SyncManager {
             self.attachments_dir.clone(),
         );
 
+        let poll_interval_secs = *self.sync_interval_secs.lock().await;
         let sync_config = SyncConfig {
-            poll_interval_secs: self.sync_interval_secs,
+            poll_interval_secs,
             ..SyncConfig::default()
         };
 
@@ -189,6 +190,15 @@ impl SyncManager {
             .to_string(),
         );
 
+        Ok(())
+    }
+
+    pub async fn set_realtime_poll_interval(&self, interval_secs: u64) -> Result<(), String> {
+        *self.sync_interval_secs.lock().await = interval_secs;
+        let account_ids = self.handles.lock().await.keys().cloned().collect::<Vec<_>>();
+        for account_id in account_ids {
+            self.start_account_sync(&account_id).await?;
+        }
         Ok(())
     }
 }

@@ -5,6 +5,8 @@ members = [
     "crates/pebble-store",
     "crates/pebble-mail",
     "crates/pebble-search",
+    "crates/pebble-rules",
+    "crates/pebble-privacy",
     "crates/pebble-translate",
     "crates/pebble-crypto",
     "crates/pebble-oauth",
@@ -30,8 +32,12 @@ lol_html = "1"
 lettre = { version = "0.11", default-features = false, features = ["tokio1-rustls-tls", "smtp-transport", "builder"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "socks"] }
 tokio-socks = "0.5"
+native-tls = "0.2"
+tokio-native-tls = "0.3"
 aes-gcm = "0.10"
 rand = "0.8"
+hex = "0.4"
+ring = "0.17.14"
 semver = "1"
 axum = "0.8"
 tower = "0.5"
@@ -64,6 +70,8 @@ rusqlite = { workspace = true }
 pebble-core = { path = "crates/pebble-core" }
 pebble-store = { path = "crates/pebble-store" }
 pebble-search = { path = "crates/pebble-search" }
+pebble-rules = { path = "crates/pebble-rules" }
+pebble-privacy = { path = "crates/pebble-privacy" }
 pebble-crypto = { path = "crates/pebble-crypto" }
 pebble-mail = { path = "crates/pebble-mail" }
 pebble-translate = { path = "crates/pebble-translate" }

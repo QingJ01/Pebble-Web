@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Serialize)]
 pub struct AccountResponse {
+    pub account_label: Option<String>,
+    pub provider_display_name: Option<String>,
     pub id: String,
     pub email: String,
     pub display_name: String,
@@ -23,10 +25,13 @@ impl From<Account> for AccountResponse {
     fn from(a: Account) -> Self {
         let provider = match a.provider {
             ProviderType::Imap => "imap",
+            ProviderType::Pop3 => "pop3",
             ProviderType::Gmail => "gmail",
             ProviderType::Outlook => "outlook",
         };
         Self {
+            account_label: a.account_label,
+            provider_display_name: a.provider_display_name,
             id: a.id,
             email: a.email,
             display_name: a.display_name,
@@ -83,7 +88,7 @@ pub async fn list_accounts(
     let accounts = store
         .with_read_async(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, email, display_name, color, provider, created_at, updated_at
+                "SELECT id, email, display_name, color, provider, created_at, updated_at, account_label, provider_display_name
                  FROM accounts ORDER BY created_at ASC",
             )?;
             let rows = stmt.query_map([], |row| {
@@ -91,9 +96,12 @@ pub async fn list_accounts(
                 let provider = match provider_str.as_str() {
                     "gmail" => ProviderType::Gmail,
                     "outlook" => ProviderType::Outlook,
+                    "pop3" => ProviderType::Pop3,
                     _ => ProviderType::Imap,
                 };
                 Ok(Account {
+                    account_label: row.get(7)?,
+                    provider_display_name: row.get(8)?,
                     id: row.get(0)?,
                     email: row.get(1)?,
                     display_name: row.get(2)?,
@@ -127,6 +135,8 @@ pub async fn create_account(
 
     let now = now_timestamp();
     let account = Account {
+        account_label: None,
+        provider_display_name: None,
         id: new_id(),
         email,
         display_name,
@@ -323,16 +333,16 @@ pub async fn update_account(
                 let encrypted = encrypt_credentials(&crypto, &creds)
                     .map_err(|e| ApiError::Internal(format!("Encrypt failed: {e}")))?;
 
+                let mut updated_sync_state = sync_state;
+                updated_sync_state["credentials"] = serde_json::Value::String(encrypted);
+                let serialized_sync_state = updated_sync_state.to_string();
                 let store3 = state.store.clone();
                 let aid3 = account_id.clone();
                 store3
                     .with_write_async(move |conn| {
                         conn.execute(
                             "UPDATE accounts SET sync_state = ?1 WHERE id = ?2",
-                            rusqlite::params![
-                                serde_json::json!({ "credentials": encrypted }).to_string(),
-                                aid3,
-                            ],
+                            rusqlite::params![serialized_sync_state, aid3],
                         )?;
                         Ok(())
                     })
@@ -358,16 +368,19 @@ pub async fn update_account(
     let account = store_final
         .with_read_async(move |conn| {
             let row = conn.query_row(
-                "SELECT id, email, display_name, color, provider, created_at, updated_at FROM accounts WHERE id = ?1",
+                "SELECT id, email, display_name, color, provider, created_at, updated_at, account_label, provider_display_name FROM accounts WHERE id = ?1",
                 rusqlite::params![aid_final],
                 |row| {
                     let provider_str: String = row.get(4)?;
                     let provider = match provider_str.as_str() {
                         "gmail" => ProviderType::Gmail,
                         "outlook" => ProviderType::Outlook,
+                        "pop3" => ProviderType::Pop3,
                         _ => ProviderType::Imap,
                     };
                     Ok(Account {
+                        account_label: row.get(7)?,
+                        provider_display_name: row.get(8)?,
                         id: row.get(0)?,
                         email: row.get(1)?,
                         display_name: row.get(2)?,

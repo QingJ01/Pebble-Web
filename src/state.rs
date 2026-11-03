@@ -3,9 +3,25 @@ use crate::sync::SyncManager;
 use pebble_crypto::CryptoService;
 use pebble_search::TantivySearch;
 use pebble_store::Store;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Mutex};
+
+pub struct OAuthFlowRecord {
+    pub provider: String,
+    pub state: String,
+    pub verifier: String,
+    pub expires_at: i64,
+    pub account_label: Option<String>,
+    pub display_name_hint: Option<String>,
+    pub sync_range_days: Option<u32>,
+    pub proxy: Option<pebble_core::HttpProxyConfig>,
+    pub consumed: bool,
+    pub status: String,
+    pub account: Option<pebble_core::Account>,
+    pub error: Option<String>,
+}
 
 pub type AppStateRef = Arc<AppState>;
 
@@ -17,6 +33,7 @@ pub struct AppState {
     pub attachments_dir: PathBuf,
     pub sync_manager: Arc<SyncManager>,
     pub ws_broadcast: broadcast::Sender<String>,
+    pub oauth_flows: Mutex<HashMap<String, OAuthFlowRecord>>,
 }
 
 impl AppState {
@@ -59,6 +76,7 @@ impl AppState {
             attachments_dir,
             sync_manager,
             ws_broadcast,
+            oauth_flows: Mutex::new(HashMap::new()),
         })
     }
 }

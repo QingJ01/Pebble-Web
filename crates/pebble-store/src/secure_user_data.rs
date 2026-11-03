@@ -29,6 +29,23 @@ impl Store {
         })
     }
 
+    pub fn compare_exchange_secure_user_data(
+        &self,
+        key: &str,
+        expected: &[u8],
+        replacement: &[u8],
+    ) -> Result<bool> {
+        self.with_write(|conn| {
+            let rows_affected = conn.execute(
+                "UPDATE secure_user_data
+                 SET value = ?1, updated_at = ?2
+                 WHERE key = ?3 AND value = ?4",
+                params![replacement, pebble_core::now_timestamp(), key, expected],
+            )?;
+            Ok(rows_affected == 1)
+        })
+    }
+
     pub fn delete_secure_user_data(&self, key: &str) -> Result<()> {
         self.with_write(|conn| {
             conn.execute("DELETE FROM secure_user_data WHERE key = ?1", params![key])?;
@@ -55,5 +72,22 @@ mod tests {
         );
         store.delete_secure_user_data("templates").unwrap();
         assert!(store.get_secure_user_data("templates").unwrap().is_none());
+    }
+
+    #[test]
+    fn compare_exchange_secure_user_data_does_not_overwrite_a_newer_value() {
+        let store = Store::open_in_memory().unwrap();
+        store.set_secure_user_data("templates", b"legacy").unwrap();
+
+        assert!(store
+            .compare_exchange_secure_user_data("templates", b"legacy", b"migrated")
+            .unwrap());
+        assert!(!store
+            .compare_exchange_secure_user_data("templates", b"legacy", b"stale replacement")
+            .unwrap());
+        assert_eq!(
+            store.get_secure_user_data("templates").unwrap().as_deref(),
+            Some(&b"migrated"[..])
+        );
     }
 }
