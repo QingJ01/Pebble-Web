@@ -1,3 +1,4 @@
+import { senderIdentityLabel } from "@/lib/accountIdentity";
 import { useState, useEffect, useRef } from "react";
 import { EditorContent } from "@tiptap/react";
 import {
@@ -12,32 +13,33 @@ import { useComposeStore } from "@/stores/compose.store";
 import { useAccountsQuery } from "@/hooks/queries";
 import { useSendEmailMutation } from "@/hooks/mutations";
 import ContactAutocomplete from "@/components/ContactAutocomplete";
+import ConfirmDialog from "@/components/ConfirmDialog";
 import { listTemplates, saveTemplate, deleteTemplate } from "@/lib/templates";
 import type { EmailTemplate } from "@/lib/templates";
 import { useComposeRecipients } from "@/hooks/useComposeRecipients";
 import { useComposeDraft, loadDraftFromStorage, clearDraftStorage } from "@/hooks/useComposeDraft";
-import { deleteDraft, stageComposeAttachment } from "@/lib/api";
+import { cleanupStagedComposeAttachment, deleteDraft, stageComposeAttachment } from "@/lib/api";
 import { appendReplyQuoteHtml, useComposeEditor } from "@/hooks/useComposeEditor";
 import { useConfirmStore } from "@/stores/confirm.store";
 import { useToastStore } from "@/stores/toast.store";
-import { ShadowDomEmail } from "@/components/ShadowDomEmail";
 import type { Account } from "@/lib/ipc-types";
 import type { ComposeAttachment } from "./compose-draft";
 import { ModeButton, EditorToolbar, MarkdownToolbar, composeStyles } from "./ComposeToolbar";
+import { subjectAfterAddingAttachments } from "./attachment-subject";
 import { isValidEmailAddress, mergePendingRecipient } from "./recipient-utils";
 
 export default function ComposeView() {
   const composeMode = useComposeStore((s) => s.composeMode);
-  const { data: accounts = [], isLoading } = useAccountsQuery();
+  const { data: accounts = [], isLoading, isSuccess } = useAccountsQuery();
 
   if (composeMode === "new" && isLoading) {
     return <div style={{ height: "100%" }} />;
   }
 
-  return <ComposeViewInner accounts={accounts} />;
+  return <ComposeViewInner accounts={accounts} accountsLoaded={isSuccess} />;
 }
 
-function ComposeViewInner({ accounts }: { accounts: Account[] }) {
+function ComposeViewInner({ accounts, accountsLoaded }: { accounts: Account[]; accountsLoaded: boolean }) {
   const { t } = useTranslation();
   const composeMode = useComposeStore((s) => s.composeMode);
   const composeReplyTo = useComposeStore((s) => s.composeReplyTo);
@@ -47,10 +49,16 @@ function ComposeViewInner({ accounts }: { accounts: Account[] }) {
   const confirmCloseCompose = useComposeStore((s) => s.confirmCloseCompose);
   const cancelCloseCompose = useComposeStore((s) => s.cancelCloseCompose);
   const activeAccountId = useMailStore((s) => s.activeAccountId);
+  const discardInProgressRef = useRef(false);
+  const [isDiscarding, setIsDiscarding] = useState(false);
+  const sendInProgressRef = useRef(false);
+  const [sendInProgress, setSendInProgress] = useState(false);
 
   const isReply = composeMode === "reply" || composeMode === "reply-all";
   const restoredDraft = useRef(
-    composeMode === "new" ? loadDraftFromStorage(accounts.map((account) => account.id)) : null,
+    composeMode === "new"
+      ? loadDraftFromStorage(accountsLoaded ? accounts.map((account) => account.id) : undefined)
+      : null,
   );
 
   // ─── Recipients ──────────────────────────────────────────────────────────────
@@ -76,8 +84,9 @@ function ComposeViewInner({ accounts }: { accounts: Account[] }) {
     if (composeMode === "forward") return `Fwd: ${composeReplyTo.subject.replace(/^(Re:\s*|Fwd:\s*)+/i, "")}`;
     return "";
   });
+  const subjectRef = useRef(subject);
+  subjectRef.current = subject;
   const [sendError, setSendError] = useState<string | null>(null);
-  const sendingRef = useRef(false);
   const sendMutation = useSendEmailMutation();
 
   // ─── Editor ──────────────────────────────────────────────────────────────────
@@ -103,16 +112,25 @@ function ComposeViewInner({ accounts }: { accounts: Account[] }) {
   const [attachments, setAttachments] = useState<ComposeAttachment[]>(() =>
     restoredDraft.current?.attachments ?? [],
   );
+  const attachmentsRef = useRef(attachments);
+  const stagedAttachmentPathsRef = useRef(new Set(
+    restoredDraft.current?.attachments.map((attachment) => attachment.path) ?? [],
+  ));
+  const stagedCleanupPromisesRef = useRef(new Map<string, Promise<void>>());
+  const pendingAttachmentStagingRef = useRef(new Set<Promise<void>>());
+  const acceptsStagedAttachmentsRef = useRef(true);
+  const [pendingAttachmentStagingCount, setPendingAttachmentStagingCount] = useState(0);
   const [isDragging, setIsDragging] = useState(false);
 
   const [editorReady, setEditorReady] = useState(false);
   useEffect(() => {
     if (editor && !editorReady) setEditorReady(true);
   }, [editor, editorReady]);
-  const { draftIdRef, draftIdsByAccountRef } = useComposeDraft({
+  const { cancelPendingDraftSaves } = useComposeDraft({
     to, cc, bcc, subject, rawSource, richTextHtml, editorMode, composeMode, fromAccountId,
     attachments,
     editorReady,
+    migrateLegacyDraft: Boolean(restoredDraft.current),
   });
 
   // ─── Templates ───────────────────────────────────────────────────────────────
@@ -133,31 +151,136 @@ function ComposeViewInner({ accounts }: { accounts: Account[] }) {
     }
   }
 
-  const stagingRef = useRef(false);
-  const MAX_ATTACHMENT_SIZE = 25 * 1024 * 1024; // 25 MB
+  function commitStagedAttachments(staged: ComposeAttachment[]) {
+    if (staged.length === 0) return;
+
+    const currentAttachments = attachmentsRef.current;
+    const nextAttachments = [...currentAttachments, ...staged];
+    attachmentsRef.current = nextAttachments;
+    setSubject((currentSubject) => {
+      const nextSubject = subjectAfterAddingAttachments(
+        currentSubject,
+        currentAttachments.length,
+        staged.map((attachment) => attachment.name),
+      );
+      subjectRef.current = nextSubject;
+      return nextSubject;
+    });
+    setAttachments(nextAttachments);
+  }
+
+  function removeAttachment(attachmentToRemove: ComposeAttachment) {
+    const nextAttachments = attachmentsRef.current.filter(
+      (attachment) => attachment !== attachmentToRemove,
+    );
+    attachmentsRef.current = nextAttachments;
+    setAttachments(nextAttachments);
+    void cleanupStagedAttachment(attachmentToRemove.path).catch((err) => {
+      console.warn("Failed to remove staged compose attachment:", err);
+    });
+  }
+
+  function cleanupStagedAttachment(path: string): Promise<void> {
+    if (!stagedAttachmentPathsRef.current.has(path)) return Promise.resolve();
+    const existingCleanup = stagedCleanupPromisesRef.current.get(path);
+    if (existingCleanup) return existingCleanup;
+    const cleanup = cleanupStagedComposeAttachment(path)
+      .then(() => {
+        stagedAttachmentPathsRef.current.delete(path);
+      })
+      .finally(() => {
+        stagedCleanupPromisesRef.current.delete(path);
+      });
+    stagedCleanupPromisesRef.current.set(path, cleanup);
+    return cleanup;
+  }
+
+  async function cleanupAllStagedAttachments() {
+    const cleanupResults = await Promise.allSettled(
+      Array.from(stagedAttachmentPathsRef.current, cleanupStagedAttachment),
+    );
+    for (const result of cleanupResults) {
+      if (result.status === "rejected") {
+        console.warn("Failed to remove staged compose attachment:", result.reason);
+      }
+    }
+  }
+
+  async function waitForPendingAttachmentStaging() {
+    while (pendingAttachmentStagingRef.current.size > 0) {
+      await Promise.allSettled(Array.from(pendingAttachmentStagingRef.current));
+    }
+  }
+
+  useEffect(() => {
+    acceptsStagedAttachmentsRef.current = true;
+    return () => {
+      acceptsStagedAttachmentsRef.current = false;
+    };
+  }, []);
+
+  async function cleanupSavedDrafts(context: "send" | "discard") {
+    const draftIdsToDelete = await cancelPendingDraftSaves();
+    const deletionResults = await Promise.allSettled(
+      Object.entries(draftIdsToDelete).map(([draftAccountId, draftId]) =>
+        deleteDraft(draftAccountId, draftId),
+      ),
+    );
+    if (deletionResults.some((result) => result.status === "rejected")) {
+      for (const result of deletionResults) {
+        if (result.status === "rejected") {
+          console.warn(`Failed to delete draft after ${context}:`, result.reason);
+        }
+      }
+      useToastStore.getState().addToast({
+        type: "error",
+        message: context === "send"
+          ? t(
+              "compose.draftCleanupFailed",
+              "Sent, but failed to remove the saved draft. You can delete it from Drafts.",
+            )
+          : t(
+              "compose.discardDraftCleanupFailed",
+              "Discarded, but failed to remove the saved draft. You can delete it from Drafts.",
+            ),
+      });
+    }
+  }
 
   async function stageAttachmentFiles(files: FileList | File[]) {
-    if (stagingRef.current) return;
-    stagingRef.current = true;
-    try {
+    const staging = (async () => {
       const staged: ComposeAttachment[] = [];
-      for (const file of Array.from(files)) {
-        if (file.size > MAX_ATTACHMENT_SIZE) {
-          useToastStore.getState().addToast({
-            message: t("compose.attachmentTooLarge", { name: file.name, limit: "25 MB" }),
-            type: "error",
-          });
-          continue;
+      try {
+        for (const file of Array.from(files)) {
+          const bytes = Array.from(new Uint8Array(await file.arrayBuffer()));
+          if (!acceptsStagedAttachmentsRef.current) return;
+          const path = await stageComposeAttachment(file.name, bytes);
+          stagedAttachmentPathsRef.current.add(path);
+          if (!acceptsStagedAttachmentsRef.current) {
+            await cleanupStagedAttachment(path);
+            return;
+          }
+          staged.push({ name: file.name, path, size: file.size });
         }
-        const bytes = Array.from(new Uint8Array(await file.arrayBuffer()));
-        const path = await stageComposeAttachment(file.name, bytes);
-        staged.push({ name: file.name, path, size: file.size });
+      } finally {
+        if (acceptsStagedAttachmentsRef.current) {
+          commitStagedAttachments(staged);
+        } else {
+          await Promise.allSettled(staged.map((attachment) =>
+            cleanupStagedAttachment(attachment.path)));
+        }
       }
-      if (staged.length > 0) {
-        setAttachments((prev) => [...prev, ...staged]);
-      }
+    })();
+
+    pendingAttachmentStagingRef.current.add(staging);
+    setPendingAttachmentStagingCount(pendingAttachmentStagingRef.current.size);
+    try {
+      await staging;
     } finally {
-      stagingRef.current = false;
+      pendingAttachmentStagingRef.current.delete(staging);
+      if (acceptsStagedAttachmentsRef.current) {
+        setPendingAttachmentStagingCount(pendingAttachmentStagingRef.current.size);
+      }
     }
   }
 
@@ -177,17 +300,20 @@ function ComposeViewInner({ accounts }: { accounts: Account[] }) {
   }, [sendError]);
 
   async function handleSend() {
-    if (sendingRef.current) return;
-    sendingRef.current = true;
-
+    if (sendInProgressRef.current || discardInProgressRef.current) return;
     const finalTo = mergePendingRecipient(to, toInputValue).filter(Boolean);
     const finalCc = mergePendingRecipient(cc, ccInputValue).filter(Boolean);
     const finalBcc = mergePendingRecipient(bcc, bccInputValue).filter(Boolean);
 
-    if (!fromAccountId || finalTo.length === 0) {
-      sendingRef.current = false;
-      return;
+    if (!fromAccountId || finalTo.length === 0) return;
+
+    sendInProgressRef.current = true;
+    setSendInProgress(true);
+    if (pendingAttachmentStagingRef.current.size > 0) {
+      await waitForPendingAttachmentStaging();
     }
+    if (!acceptsStagedAttachmentsRef.current) return;
+    const finalSubject = subjectRef.current;
 
     setTo(finalTo);
     setCc(finalCc);
@@ -196,14 +322,15 @@ function ComposeViewInner({ accounts }: { accounts: Account[] }) {
     if (isValidEmailAddress(ccInputValue)) setCcInputValue("");
     if (isValidEmailAddress(bccInputValue)) setBccInputValue("");
 
-    if (!subject.trim()) {
+    if (!finalSubject.trim()) {
       const confirmed = await useConfirmStore.getState().confirm({
         title: t("compose.noSubjectTitle", "No subject"),
         message: t("compose.noSubjectConfirm", "Send without a subject?"),
         confirmLabel: t("common.send", "Send"),
       });
       if (!confirmed) {
-        sendingRef.current = false;
+        sendInProgressRef.current = false;
+        setSendInProgress(false);
         return;
       }
     }
@@ -218,8 +345,9 @@ function ComposeViewInner({ accounts }: { accounts: Account[] }) {
       bodyText = editor.getText();
     } else if (editorMode === "html") {
       bodyHtml = rawSource;
-      const parsed = new DOMParser().parseFromString(rawSource, "text/html");
-      bodyText = parsed.body.textContent || "";
+      const tmp = document.createElement("div");
+      tmp.innerHTML = rawSource;
+      bodyText = tmp.textContent || tmp.innerText || "";
     } else {
       if (editor) {
         editor.commands.setContent(rawSource);
@@ -240,45 +368,52 @@ function ComposeViewInner({ accounts }: { accounts: Account[] }) {
         to: finalTo,
         cc: finalCc,
         bcc: finalBcc,
-        subject,
+        subject: finalSubject,
         bodyText,
         bodyHtml: outgoingBodyHtml || undefined,
         inReplyTo: inReplyTo || undefined,
-        attachmentPaths: attachments.length > 0 ? attachments.map((a) => a.path) : undefined,
+        attachmentPaths: attachmentsRef.current.length > 0
+          ? attachmentsRef.current.map((attachment) => attachment.path)
+          : undefined,
       },
       {
-        onSettled: () => {
-          sendingRef.current = false;
-        },
         onSuccess: () => {
-          const draftIdsToDelete = { ...draftIdsByAccountRef.current };
-          if (draftIdRef.current && fromAccountId) {
-            draftIdsToDelete[fromAccountId] = draftIdRef.current;
-          }
-          for (const [draftAccountId, draftId] of Object.entries(draftIdsToDelete)) {
-            deleteDraft(draftAccountId, draftId).catch((err) => {
-              console.warn("Failed to delete draft after send:", err);
-              useToastStore.getState().addToast({
-                type: "error",
-                message: t(
-                  "compose.draftCleanupFailed",
-                  "Sent, but failed to remove the saved draft. You can delete it from Drafts.",
-                ),
-              });
-            });
-          }
-          draftIdsByAccountRef.current = {};
-          draftIdRef.current = null;
-          clearDraftStorage();
-          useComposeStore.getState().setComposeDirty(false);
-          closeCompose();
+          void (async () => {
+            try {
+              await cleanupSavedDrafts("send");
+              await cleanupAllStagedAttachments();
+            } finally {
+              clearDraftStorage();
+              useComposeStore.getState().setComposeDirty(false);
+              closeCompose();
+            }
+          })();
         },
         onError: (e) => {
+          sendInProgressRef.current = false;
+          setSendInProgress(false);
           const msg = e instanceof Error ? e.message : String(e);
           setSendError(msg || t("compose.sendError", "Failed to send"));
         },
       },
     );
+  }
+
+  async function handleDiscard() {
+    if (discardInProgressRef.current || sendInProgressRef.current) return;
+    discardInProgressRef.current = true;
+    setIsDiscarding(true);
+    if (pendingAttachmentStagingRef.current.size > 0) {
+      await waitForPendingAttachmentStaging();
+    }
+    if (!acceptsStagedAttachmentsRef.current) return;
+    await cleanupSavedDrafts("discard");
+    await cleanupAllStagedAttachments();
+    clearDraftStorage();
+    useComposeStore.getState().setComposeDirty(false);
+    discardInProgressRef.current = false;
+    setIsDiscarding(false);
+    confirmCloseCompose();
   }
 
   const title =
@@ -290,10 +425,23 @@ function ComposeViewInner({ accounts }: { accounts: Account[] }) {
           ? t("compose.forward", "Forward")
           : t("compose.newMessage", "New Message");
   const hasToRecipient = to.some(Boolean) || isValidEmailAddress(toInputValue);
-  const sendDisabled = sendMutation.isPending || !fromAccountId || !hasToRecipient;
+  const sendDisabled = sendInProgress
+    || sendMutation.isPending
+    || pendingAttachmentStagingCount > 0
+    || !fromAccountId
+    || !hasToRecipient;
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
+    <div
+      aria-busy={sendInProgress}
+      inert={sendInProgress}
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        height: "100%",
+        pointerEvents: sendInProgress ? "none" : undefined,
+      }}
+    >
       {/* Header */}
       <div
         style={{
@@ -323,7 +471,7 @@ function ComposeViewInner({ accounts }: { accounts: Account[] }) {
           style={{
             display: "flex", alignItems: "center", gap: "6px",
             padding: "7px 20px",
-            backgroundColor: sendMutation.isPending ? "var(--color-text-secondary)" : "var(--color-accent, #2563eb)",
+            backgroundColor: sendInProgress || sendMutation.isPending ? "var(--color-text-secondary)" : "var(--color-accent, #2563eb)",
             color: "#fff", border: "none", borderRadius: "6px",
             cursor: sendDisabled ? "default" : "pointer",
             opacity: hasToRecipient ? 1 : 0.5,
@@ -331,7 +479,7 @@ function ComposeViewInner({ accounts }: { accounts: Account[] }) {
           }}
         >
           <Send size={14} />
-          {sendMutation.isPending ? t("compose.sending", "Sending...") : t("compose.send", "Send")}
+          {sendInProgress || sendMutation.isPending ? t("compose.sending", "Sending...") : t("compose.send", "Send")}
         </button>
       </div>
 
@@ -361,7 +509,7 @@ function ComposeViewInner({ accounts }: { accounts: Account[] }) {
       <div className="scroll-region compose-scroll" style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0, overflow: "auto" }}>
         <div className="compose-form-shell">
           {/* From */}
-          {accounts.length > 1 && (
+          {accounts.length > 0 && (
             <div style={composeStyles.fieldRow}>
               <label htmlFor="compose-from-account" style={composeStyles.fieldLabel}>
                 {t("compose.from", "From")}
@@ -379,11 +527,17 @@ function ComposeViewInner({ accounts }: { accounts: Account[] }) {
               >
                 {accounts.map((acc) => (
                   <option key={acc.id} value={acc.id}>
-                    {acc.display_name ? `${acc.display_name} <${acc.email}>` : acc.email}
+                    {senderIdentityLabel(acc)}{acc.account_label?.trim() ? ` · ${acc.account_label.trim()}` : ""}
                   </option>
                 ))}
               </select>
             </div>
+          )}
+
+          {accounts.find((acc) => acc.id === fromAccountId)?.provider === "outlook" && (
+            <p style={{ margin: "0 0 8px", fontSize: "12px", color: "var(--color-text-secondary)" }}>
+              {t("accountSetup.providerManagedName", "The sender name is managed by your email provider.")}
+            </p>
           )}
 
           {/* To */}
@@ -454,7 +608,10 @@ function ComposeViewInner({ accounts }: { accounts: Account[] }) {
               <input
                 id="compose-subject"
                 name="subject"
-                type="text" value={subject} onChange={(e) => setSubject(e.target.value)}
+                type="text" value={subject} onChange={(e) => {
+                  subjectRef.current = e.target.value;
+                  setSubject(e.target.value);
+                }}
                 placeholder=""
                 autoComplete="off"
                 style={{ flex: 1, padding: "8px 0", border: "none", backgroundColor: "transparent", fontSize: "13px", color: "var(--color-text-primary)" }}
@@ -486,7 +643,9 @@ function ComposeViewInner({ accounts }: { accounts: Account[] }) {
                     if (!files) return;
                     void stageAttachmentFiles(files).catch((err) => {
                       console.warn("Failed to stage attachment:", err);
-                      setSendError(t("compose.attachmentStageError", "Failed to attach file"));
+                      if (acceptsStagedAttachmentsRef.current) {
+                        setSendError(t("compose.attachmentStageError", "Failed to attach file"));
+                      }
                     });
                     e.target.value = "";
                   }}
@@ -532,6 +691,7 @@ function ComposeViewInner({ accounts }: { accounts: Account[] }) {
                         >
                           {templates.map((tpl) => {
                             const applyTemplate = () => {
+                              subjectRef.current = tpl.subject;
                               setSubject(tpl.subject);
                               setRawSource(tpl.body);
                               if (editor) editor.commands.setContent(tpl.body);
@@ -637,7 +797,7 @@ function ComposeViewInner({ accounts }: { accounts: Account[] }) {
                   </span>
                   <button
                     type="button"
-                    onClick={() => setAttachments((prev) => prev.filter((_, j) => j !== i))}
+                    onClick={() => removeAttachment(att)}
                     aria-label={t("compose.removeAttachment", "Remove attachment {{name}}", { name: att.name })}
                     title={t("compose.removeAttachment", "Remove attachment {{name}}", { name: att.name })}
                     style={{ border: "none", background: "none", cursor: "pointer", padding: "0 2px", color: "var(--color-text-secondary)" }}
@@ -710,7 +870,9 @@ function ComposeViewInner({ accounts }: { accounts: Account[] }) {
                 await stageAttachmentFiles(files);
               } catch (err) {
                 console.warn("Failed to stage dropped attachment:", err);
-                setSendError(t("compose.attachmentStageError", "Failed to attach file"));
+                if (acceptsStagedAttachmentsRef.current) {
+                  setSendError(t("compose.attachmentStageError", "Failed to attach file"));
+                }
               }
             }}
             onPaste={async (e) => {
@@ -729,7 +891,9 @@ function ComposeViewInner({ accounts }: { accounts: Account[] }) {
                 await stageAttachmentFiles(imageFiles);
               } catch (err) {
                 console.warn("Failed to stage pasted image:", err);
-                setSendError(t("compose.attachmentStageError", "Failed to attach file"));
+                if (acceptsStagedAttachmentsRef.current) {
+                  setSendError(t("compose.attachmentStageError", "Failed to attach file"));
+                }
               }
             }}
           >
@@ -783,9 +947,9 @@ function ComposeViewInner({ accounts }: { accounts: Account[] }) {
                     : t("compose.showQuotedReply", "Show quoted message")}
                 </button>
                 {showQuotedReply && (
-                  <ShadowDomEmail
-                    html={quotedReplyHtml}
+                  <div
                     className="scroll-region compose-quoted-reply-content"
+                    dangerouslySetInnerHTML={{ __html: quotedReplyHtml }}
                   />
                 )}
               </div>
@@ -802,63 +966,20 @@ function ComposeViewInner({ accounts }: { accounts: Account[] }) {
 
       {/* Compose leave confirmation dialog */}
       {showComposeLeaveConfirm && (
-        <div
-          style={{
-            position: "fixed", inset: 0, zIndex: 9999,
-            display: "flex", alignItems: "center", justifyContent: "center",
-            backgroundColor: "rgba(0,0,0,0.4)",
+        <ConfirmDialog
+          title={t("compose.leaveTitle", "Discard draft?")}
+          message={t("compose.leaveMessage", "You have unsaved changes. Are you sure you want to leave?")}
+          cancelLabel={t("compose.leaveCancel", "Keep editing")}
+          confirmLabel={t("compose.leaveConfirm", "Discard")}
+          busyConfirmLabel={t("compose.discarding", "Discarding...")}
+          destructive
+          busy={isDiscarding}
+          confirmDisabled={pendingAttachmentStagingCount > 0}
+          onCancel={() => {
+            if (!discardInProgressRef.current) cancelCloseCompose();
           }}
-          onClick={cancelCloseCompose}
-        >
-          <div
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="compose-leave-title"
-            style={{
-              width: "380px",
-              backgroundColor: "var(--color-sidebar-bg)",
-              color: "var(--color-text-primary)",
-              border: "1px solid var(--color-border)",
-              borderRadius: "8px",
-              padding: "24px",
-              boxShadow: "0 20px 60px rgba(0,0,0,0.3)",
-              display: "flex",
-              flexDirection: "column" as const,
-              gap: "16px",
-            }}
-            onClick={(e) => e.stopPropagation()}
-            onKeyDown={(e) => { if (e.key === "Escape") cancelCloseCompose(); }}
-          >
-            <h3 id="compose-leave-title" style={{ margin: 0, fontSize: "15px", fontWeight: 600 }}>
-              {t("compose.leaveTitle", "Discard draft?")}
-            </h3>
-            <p style={{ margin: 0, fontSize: "13px", color: "var(--color-text-secondary)", lineHeight: 1.5 }}>
-              {t("compose.leaveMessage", "You have unsaved changes. Are you sure you want to leave?")}
-            </p>
-            <div style={{ display: "flex", justifyContent: "flex-end", gap: "8px" }}>
-              <button
-                onClick={cancelCloseCompose}
-                style={{
-                  padding: "7px 16px", borderRadius: "6px", fontSize: "13px",
-                  border: "1px solid var(--color-border)", cursor: "pointer",
-                  backgroundColor: "transparent", color: "var(--color-text-primary)",
-                }}
-              >
-                {t("compose.leaveCancel", "Keep editing")}
-              </button>
-              <button
-                onClick={confirmCloseCompose}
-                style={{
-                  padding: "7px 16px", borderRadius: "6px", fontSize: "13px", fontWeight: 600,
-                  border: "none", cursor: "pointer",
-                  backgroundColor: "#ef4444", color: "#fff",
-                }}
-              >
-                {t("compose.leaveConfirm", "Discard")}
-              </button>
-            </div>
-          </div>
-        </div>
+          onConfirm={() => { void handleDiscard(); }}
+        />
       )}
     </div>
   );

@@ -1,4 +1,7 @@
-import api from "../api-client";
+import { invoke } from "@/lib/web-commands";
+import http from "@/api-client";
+import { completeWebOAuth } from "./web-oauth";
+import { showBrowserTestNotification } from "./browser-notifications";
 
 // Re-export all IPC types so existing `import { Foo } from "@/lib/api"` keeps working.
 export type {
@@ -11,9 +14,17 @@ export type {
   Attachment,
   BackupPreview,
   ConnectionSecurity,
+  Contact,
+  ContactEmail,
+  ContactEmailInput,
+  ContactEmailLabel,
+  ContactInput,
+  ContactSuggestion,
+  ContactSuggestionSource,
   EmailAddress,
   Folder,
   HttpProxyConfig,
+  ImapSyncFolderSettings,
   ImportedBackgroundImage,
   KanbanCard,
   KanbanColumnType,
@@ -33,6 +44,7 @@ export type {
   TranslateConfig,
   TranslateResult,
   TrustedSender,
+  VcardImportResult,
 } from "./ipc-types";
 
 import type {
@@ -45,15 +57,18 @@ import type {
   Attachment,
   BackupPreview,
   ConnectionSecurity,
+  Contact,
+  ContactInput,
+  ContactSuggestion,
   Folder,
   HttpProxyConfig,
+  ImapSyncFolderSettings,
   KanbanCard,
   KanbanColumnType,
   KnownContact,
   Label,
   Message,
   MessageSummary,
-  NotificationStatus,
   PendingMailOp,
   PendingMailOpsSummary,
   PrivacyMode,
@@ -65,124 +80,164 @@ import type {
   TranslateConfig,
   TranslateResult,
   TrustedSender,
+  VcardImportResult,
 } from "./ipc-types";
 
 // ─── Account API ─────────────────────────────────────────────────────────────
 
 export async function healthCheck(): Promise<string> {
-  const res = await api.get<string>("/health");
-  return res.data;
+  return invoke<string>("health_check");
 }
 
-export async function readAppLog(_maxBytes: number): Promise<AppLogSnapshot> {
-  // Not implemented in web backend
-  return { path: "", content: "", truncated: false };
+export async function readAppLog(maxBytes: number): Promise<AppLogSnapshot> {
+  return invoke<AppLogSnapshot>("read_app_log", { maxBytes });
 }
 
 export async function getGlobalProxy(): Promise<HttpProxyConfig | null> {
-  console.warn("[api] getGlobalProxy not implemented in web");
-  return null;
+  return invoke<HttpProxyConfig | null>("get_global_proxy");
 }
 
-export async function getAccountProxy(_accountId: string): Promise<HttpProxyConfig | null> {
-  console.warn("[api] getAccountProxy not implemented in web");
-  return null;
+export async function getAccountProxy(accountId: string): Promise<HttpProxyConfig | null> {
+  return invoke<HttpProxyConfig | null>("get_account_proxy", { accountId });
 }
 
-export async function getAccountProxySetting(_accountId: string): Promise<AccountProxySetting> {
-  console.warn("[api] getAccountProxySetting not implemented in web");
-  return { mode: "global" as AccountProxyMode, proxy: null };
+export async function getAccountProxySetting(accountId: string): Promise<AccountProxySetting> {
+  return invoke<AccountProxySetting>("get_account_proxy_setting", { accountId });
 }
 
 export async function updateAccountProxy(
-  _accountId: string,
-  _proxyHost?: string,
-  _proxyPort?: number,
+  accountId: string,
+  proxyHost?: string,
+  proxyPort?: number,
 ): Promise<void> {
-  console.warn("[api] updateAccountProxy not implemented in web");
+  return invoke<void>("update_account_proxy", { accountId, proxyHost, proxyPort });
 }
 
 export async function updateAccountProxySetting(
-  _accountId: string,
-  _mode: AccountProxyMode,
-  _proxyHost?: string,
-  _proxyPort?: number,
+  accountId: string,
+  mode: AccountProxyMode,
+  proxyHost?: string,
+  proxyPort?: number,
 ): Promise<void> {
-  console.warn("[api] updateAccountProxySetting not implemented in web");
+  return invoke<void>("update_account_proxy_setting", { accountId, mode, proxyHost, proxyPort });
 }
 
 export async function updateGlobalProxy(
-  _proxyHost?: string,
-  _proxyPort?: number,
+  proxyHost?: string,
+  proxyPort?: number,
 ): Promise<void> {
-  console.warn("[api] updateGlobalProxy not implemented in web");
+  return invoke<void>("update_global_proxy", { proxyHost, proxyPort });
 }
 
 export async function completeOAuthFlow(
-  _provider: string,
-  _email: string,
-  _displayName: string,
-  _proxyHost?: string,
-  _proxyPort?: number,
+  provider: string,
+  email: string,
+  displayName: string,
+  proxyHost?: string,
+  proxyPort?: number,
+  accountLabel?: string,
+  syncRangeDays?: number | null,
 ): Promise<Account> {
-  throw new Error("OAuth flow is not supported in the web version");
+  return completeWebOAuth(provider, { email, displayName, proxyHost, proxyPort, accountLabel, syncRangeDays });
 }
 
-export async function getOAuthAccountProxy(_accountId: string): Promise<HttpProxyConfig | null> {
-  console.warn("[api] getOAuthAccountProxy not implemented in web");
-  return null;
+export async function getAccountSyncRange(accountId: string): Promise<number | null> {
+  return invoke<number | null>("get_account_sync_range", { accountId });
 }
 
-export async function getOAuthAccountProxySetting(_accountId: string): Promise<AccountProxySetting> {
-  console.warn("[api] getOAuthAccountProxySetting not implemented in web");
-  return { mode: "global" as AccountProxyMode, proxy: null };
+export async function updateAccountSyncRange(accountId: string, days: number | null, pollIntervalSecs: number): Promise<void> {
+  return invoke<void>("update_account_sync_range", { accountId, days, pollIntervalSecs });
+}
+
+export async function getOAuthAccountProxy(accountId: string): Promise<HttpProxyConfig | null> {
+  return invoke<HttpProxyConfig | null>("get_oauth_account_proxy", { accountId });
+}
+
+export async function getOAuthAccountProxySetting(accountId: string): Promise<AccountProxySetting> {
+  return invoke<AccountProxySetting>("get_oauth_account_proxy_setting", { accountId });
 }
 
 export async function updateOAuthAccountProxy(
-  _accountId: string,
-  _proxyHost?: string,
-  _proxyPort?: number,
+  accountId: string,
+  proxyHost?: string,
+  proxyPort?: number,
 ): Promise<void> {
-  console.warn("[api] updateOAuthAccountProxy not implemented in web");
+  return invoke<void>("update_oauth_account_proxy", { accountId, proxyHost, proxyPort });
 }
 
 export async function updateOAuthAccountProxySetting(
-  _accountId: string,
-  _mode: AccountProxyMode,
-  _proxyHost?: string,
-  _proxyPort?: number,
+  accountId: string,
+  mode: AccountProxyMode,
+  proxyHost?: string,
+  proxyPort?: number,
 ): Promise<void> {
-  console.warn("[api] updateOAuthAccountProxySetting not implemented in web");
+  return invoke<void>("update_oauth_account_proxy_setting", { accountId, mode, proxyHost, proxyPort });
 }
 
 export async function addAccount(request: AddAccountRequest): Promise<Account> {
-  const res = await api.post<Account>("/accounts", request);
-  return res.data;
+  return invoke<Account>("add_account", { request });
 }
 
 export async function testAccountConnection(accountId: string): Promise<string> {
-  const res = await api.post<{ ok: boolean; report: string }>(`/accounts/${accountId}/test-connection`);
-  return res.data.report;
+  return invoke<string>("test_account_connection", { accountId });
 }
 
 export async function testImapConnection(
   imapHost: string,
   imapPort: number,
   imapSecurity: ConnectionSecurity,
-  _proxyHost?: string,
-  _proxyPort?: number,
+  acceptInvalidCerts?: boolean,
+  proxyHost?: string,
+  proxyPort?: number,
   username?: string,
   password?: string,
+  email?: string,
+  allowPlaintext?: boolean,
 ): Promise<string> {
-  const res = await api.post<{ ok: boolean; report: string }>("/test-imap-connection", {
-    imapHost, imapPort, imapSecurity, username, password,
+  return invoke<string>("test_imap_connection", {
+    request: {
+      imap_host: imapHost,
+      imap_port: imapPort,
+      imap_security: imapSecurity,
+      accept_invalid_certs: acceptInvalidCerts,
+      proxy_host: proxyHost,
+      proxy_port: proxyPort,
+      username,
+      password,
+      email,
+      allow_plaintext: allowPlaintext,
+    },
   });
-  return res.data.report;
+}
+
+export async function testPop3Connection(
+  pop3Host: string,
+  pop3Port: number,
+  pop3Security: ConnectionSecurity,
+  acceptInvalidCerts?: boolean,
+  proxyHost?: string,
+  proxyPort?: number,
+  username?: string,
+  password?: string,
+  allowPlaintext?: boolean,
+): Promise<string> {
+  return invoke<string>("test_pop3_connection", {
+    request: {
+      pop3_host: pop3Host,
+      pop3_port: pop3Port,
+      pop3_security: pop3Security,
+      accept_invalid_certs: acceptInvalidCerts,
+      proxy_host: proxyHost,
+      proxy_port: proxyPort,
+      username,
+      password,
+      allow_plaintext: allowPlaintext,
+    },
+  });
 }
 
 export async function listAccounts(): Promise<Account[]> {
-  const res = await api.get<Account[]>("/accounts");
-  return res.data;
+  return invoke<Account[]>("list_accounts");
 }
 
 export async function updateAccount(
@@ -196,33 +251,41 @@ export async function updateAccount(
   smtpPort?: number,
   imapSecurity?: ConnectionSecurity,
   smtpSecurity?: ConnectionSecurity,
-  _proxyHost?: string,
-  _proxyPort?: number,
+  acceptInvalidCerts?: boolean,
+  proxyHost?: string,
+  proxyPort?: number,
   accountColor?: string,
+  accountLabel?: string,
 ): Promise<void> {
-  await api.put(`/accounts/${accountId}`, {
-    email,
-    displayName,
-    color: accountColor,
-    password: password || undefined,
-    imapHost,
-    imapPort,
-    smtpHost,
-    smtpPort,
-    imapSecurity,
-    smtpSecurity,
+  return invoke<void>("update_account", {
+    accountId, email, displayName, password,
+    imapHost, imapPort, smtpHost, smtpPort, imapSecurity, smtpSecurity,
+    acceptInvalidCerts, proxyHost, proxyPort, accountColor, accountLabel,
   });
 }
 
 export async function deleteAccount(accountId: string): Promise<void> {
-  await api.delete(`/accounts/${accountId}`);
+  return invoke<void>("delete_account", { accountId });
 }
 
 // ─── Folder API ──────────────────────────────────────────────────────────────
 
 export async function listFolders(accountId: string): Promise<Folder[]> {
-  const res = await api.get<Folder[]>(`/accounts/${accountId}/folders`);
-  return res.data;
+  return invoke<Folder[]>("list_folders", { accountId });
+}
+
+export async function getImapSyncFolders(accountId: string): Promise<ImapSyncFolderSettings> {
+  return invoke<ImapSyncFolderSettings>("get_imap_sync_folders", { accountId });
+}
+
+export async function updateImapSyncFolders(
+  accountId: string,
+  selectedRemoteIds: string[],
+): Promise<ImapSyncFolderSettings> {
+  return invoke<ImapSyncFolderSettings>("update_imap_sync_folders", {
+    accountId,
+    selectedRemoteIds,
+  });
 }
 
 // ─── Message API ─────────────────────────────────────────────────────────────
@@ -231,12 +294,9 @@ export async function listMessages(
   folderId: string,
   limit: number,
   offset: number,
-  _folderIds?: string[],
+  folderIds?: string[],
 ): Promise<MessageSummary[]> {
-  const res = await api.get<MessageSummary[]>(`/folders/${folderId}/messages`, {
-    params: { limit, offset },
-  });
-  return res.data;
+  return invoke<MessageSummary[]>("list_messages", { folderId, folderIds, limit, offset });
 }
 
 export async function listStarredMessages(
@@ -244,36 +304,31 @@ export async function listStarredMessages(
   limit: number,
   offset: number,
 ): Promise<MessageSummary[]> {
-  const res = await api.get<MessageSummary[]>(`/accounts/${accountId}/starred`, {
-    params: { limit, offset },
-  });
-  return res.data;
+  return invoke<MessageSummary[]>("list_starred_messages", { accountId, limit, offset });
 }
 
 export async function getMessage(messageId: string): Promise<Message | null> {
-  const res = await api.get<Message | null>(`/messages/${messageId}`);
-  return res.data;
+  return invoke<Message | null>("get_message", { messageId });
 }
 
+/** Batch-fetch multiple messages in a single IPC call. */
 export async function getMessagesBatch(messageIds: string[]): Promise<Message[]> {
-  const res = await api.post<Message[]>("/messages/batch", { messageIds });
-  return res.data;
+  return invoke<Message[]>("get_messages_batch", { messageIds });
 }
 
 export async function getRenderedHtml(
   messageId: string,
   privacyMode: PrivacyMode,
 ): Promise<RenderedHtml> {
-  const res = await api.post<RenderedHtml>(`/messages/${messageId}/render`, { privacyMode });
-  return res.data;
+  return invoke<RenderedHtml>("get_rendered_html", { messageId, privacyMode });
 }
 
+/** Single IPC call that returns both Message and RenderedHtml. */
 export async function getMessageWithHtml(
   messageId: string,
   privacyMode: PrivacyMode,
 ): Promise<[Message, RenderedHtml] | null> {
-  const res = await api.post<[Message, RenderedHtml] | null>(`/messages/${messageId}/with-html`, { privacyMode });
-  return res.data;
+  return invoke<[Message, RenderedHtml] | null>("get_message_with_html", { messageId, privacyMode });
 }
 
 export async function updateMessageFlags(
@@ -281,9 +336,13 @@ export async function updateMessageFlags(
   isRead?: boolean,
   isStarred?: boolean,
 ): Promise<void> {
-  await api.put(`/messages/${messageId}/flags`, { isRead, isStarred });
+  return invoke<void>("update_message_flags", { messageId, isRead, isStarred });
 }
 
+// Rapid-toggle guard: archive_message is toggle-based (archive ⇄ unarchive),
+// so a double-click would flip the state back. This Set coalesces concurrent
+// calls per-message; it is NOT idempotency — a second click *after* the first
+// resolves is intentionally allowed to unarchive.
 const archivingIds = new Set<string>();
 
 export async function archiveMessage(messageId: string): Promise<string> {
@@ -292,68 +351,65 @@ export async function archiveMessage(messageId: string): Promise<string> {
   }
   archivingIds.add(messageId);
   try {
-    const res = await api.post<string>(`/messages/${messageId}/archive`);
-    return res.data;
+    return await invoke<string>("archive_message", { messageId });
   } finally {
     archivingIds.delete(messageId);
   }
 }
 
 export async function deleteMessage(messageId: string): Promise<void> {
-  await api.delete(`/messages/${messageId}`);
+  return invoke<void>("delete_message", { messageId });
 }
 
 export async function restoreMessage(messageId: string): Promise<void> {
-  await api.post(`/messages/${messageId}/restore`);
+  return invoke<void>("restore_message", { messageId });
 }
 
 export async function moveToFolder(messageId: string, targetFolderId: string): Promise<void> {
-  await api.post(`/messages/${messageId}/move`, { folderId: targetFolderId });
+  return invoke<void>("move_to_folder", { messageId, targetFolderId });
 }
 
 export async function emptyTrash(accountId: string): Promise<number> {
-  const res = await api.post<number>(`/accounts/${accountId}/empty-trash`);
-  return res.data;
+  return invoke<number>("empty_trash", { accountId });
 }
 
 export async function getPendingMailOpsSummary(
   accountId: string | null,
 ): Promise<PendingMailOpsSummary> {
-  const res = await api.get<PendingMailOpsSummary>("/pending-ops/summary", {
-    params: { accountId },
-  });
-  return res.data;
+  return invoke<PendingMailOpsSummary>("get_pending_mail_ops_summary", { accountId });
 }
 
 export async function listPendingMailOps(
   accountId: string | null,
   limit = 100,
 ): Promise<PendingMailOp[]> {
-  const res = await api.get<PendingMailOp[]>("/pending-ops", {
-    params: { accountId, limit },
-  });
-  return res.data;
+  return invoke<PendingMailOp[]>("list_pending_mail_ops", { accountId, limit });
+}
+
+
+
+export async function dismissFailedPendingMailOps(
+  accountId: string | null,
+): Promise<number> {
+  return invoke<number>("dismiss_failed_pending_mail_ops", { accountId });
 }
 
 // ─── Trusted Senders API ────────────────────────────────────────────────────
 
 export async function listTrustedSenders(accountId: string): Promise<TrustedSender[]> {
-  const res = await api.get<TrustedSender[]>(`/accounts/${accountId}/trusted-senders`);
-  return res.data;
+  return invoke<TrustedSender[]>("list_trusted_senders", { accountId });
 }
 
 export async function removeTrustedSender(accountId: string, email: string): Promise<void> {
-  await api.delete(`/accounts/${accountId}/trusted-senders/${encodeURIComponent(email)}`);
+  return invoke<void>("remove_trusted_sender", { accountId, email });
 }
 
 export async function trustSender(accountId: string, email: string, trustType: "images" | "all"): Promise<void> {
-  await api.post(`/accounts/${accountId}/trusted-senders`, { email, trustType });
+  return invoke<void>("trust_sender", { accountId, email, trustType });
 }
 
 export async function isTrustedSender(accountId: string, email: string): Promise<boolean> {
-  const normalized = email.trim().toLowerCase();
-  const senders = await listTrustedSenders(accountId);
-  return senders.some((sender) => sender.email.toLowerCase() === normalized);
+  return invoke<boolean>("is_trusted_sender", { accountId, email });
 }
 
 // ─── Search API ──────────────────────────────────────────────────────────────
@@ -362,174 +418,130 @@ export async function searchMessages(
   query: string,
   limit?: number,
 ): Promise<SearchHit[]> {
-  const res = await api.post<SearchHit[]>("/search", { query, limit });
-  return res.data;
+  return invoke<SearchHit[]>("search_messages", { query, limit });
 }
 
 export async function advancedSearch(
   query: AdvancedSearchQuery,
   limit?: number,
 ): Promise<SearchHit[]> {
-  const res = await api.post<SearchHit[]>("/search", {
-    query: query.text,
-    from: query.from,
-    to: query.to,
-    subject: query.subject,
-    dateFrom: query.dateFrom,
-    dateTo: query.dateTo,
-    hasAttachment: query.hasAttachment,
-    folderId: query.folderId,
-    limit,
-  });
-  return res.data;
+  return invoke<SearchHit[]>("advanced_search", { query, limit });
 }
 
 // ─── Sync API ────────────────────────────────────────────────────────────────
 
-export async function startSync(accountId: string, _pollIntervalSecs?: number): Promise<string> {
-  await api.post("/sync/trigger", { accountId });
-  return "ok";
+export async function startSync(accountId: string, pollIntervalSecs?: number): Promise<string> {
+  return invoke<string>("start_sync", { accountId, pollIntervalSecs: pollIntervalSecs ?? null });
 }
 
 export async function triggerSync(accountId: string, reason: string): Promise<void> {
-  await api.post("/sync/trigger", { accountId, reason });
+  return invoke<void>("trigger_sync", { accountId, reason });
 }
 
 export type RealtimePreference = "realtime" | "balanced" | "battery" | "manual";
 
-export async function setRealtimePreference(_mode: RealtimePreference): Promise<void> {
-  // No-op in web — realtime preference is a desktop feature
+export async function setRealtimePreference(mode: RealtimePreference): Promise<void> {
+  return invoke<void>("set_realtime_preference", { mode });
 }
 
-export async function setNotificationsEnabled(_enabled: boolean): Promise<void> {
-  // No-op in web — desktop notifications not supported
-}
 
-export async function getNotificationStatus(): Promise<NotificationStatus> {
-  return { enabled: false, attention_active: false, platform: "web", app_id: null };
-}
+
 
 export async function showTestNotification(): Promise<void> {
-  // No-op in web
+  return showBrowserTestNotification();
 }
 
-export async function clearNotificationAttention(): Promise<void> {
-  // No-op in web
-}
 
-export async function setTrayMenuLabels(_showLabel: string, _hideLabel: string, _quitLabel: string): Promise<void> {
-  // No-op in web — no system tray
-}
 
-export async function stopSync(_accountId: string): Promise<void> {
-  // No-op in web
+export async function stopSync(accountId: string): Promise<void> {
+  return invoke<void>("stop_sync", { accountId });
 }
 
 // ─── Attachment API ──────────────────────────────────────────────────────────
 
 export async function listAttachments(messageId: string): Promise<Attachment[]> {
-  const res = await api.get<Attachment[]>(`/messages/${messageId}/attachments`);
-  return res.data;
+  return invoke<Attachment[]>("list_attachments", { messageId });
 }
 
-export async function getAttachmentPath(_attachmentId: string): Promise<string | null> {
-  return null;
+export async function getAttachmentPath(attachmentId: string): Promise<string | null> {
+  return invoke<string | null>("get_attachment_path", { attachmentId });
 }
 
-export async function downloadAttachment(attachmentId: string, saveTo?: string): Promise<string> {
-  const res = await api.get(`/attachments/${attachmentId}/download`, { responseType: "blob" });
-  const blob = new Blob([res.data]);
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = saveTo || attachmentId;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  window.setTimeout(() => URL.revokeObjectURL(url), 0);
-  return saveTo || attachmentId;
+export async function downloadAttachment(attachmentId: string, saveTo: string): Promise<string> {
+  const { data } = await http.get<Blob>(`/attachments/${encodeURIComponent(attachmentId)}/download`, { responseType: "blob" });
+  const url = URL.createObjectURL(data);
+  const link = document.createElement("a");
+  const filename = saveTo.replace(/[\\/\u0000-\u001f\u007f]/g, "_") || "attachment";
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 30_000);
+  return filename;
 }
 
 // ─── Kanban API ──────────────────────────────────────────────────────────────
 
 export async function moveToKanban(messageId: string, column: KanbanColumnType, position?: number): Promise<void> {
-  await api.post(`/kanban/${messageId}`, { column, position });
+  return invoke<void>("move_to_kanban", { messageId, column, position });
 }
 
 export async function listKanbanCards(column?: KanbanColumnType): Promise<KanbanCard[]> {
-  const res = await api.get<KanbanCard[]>("/kanban", { params: { column } });
-  return res.data;
+  return invoke<KanbanCard[]>("list_kanban_cards", { column });
 }
 
 export async function removeFromKanban(messageId: string): Promise<void> {
-  await api.delete(`/kanban/${messageId}`);
+  return invoke<void>("remove_from_kanban", { messageId });
 }
 
 export async function listKanbanContextNotes(): Promise<Record<string, string>> {
-  const res = await api.get<Record<string, string>>("/kanban/context-notes");
-  return res.data;
+  return invoke<Record<string, string>>("list_kanban_context_notes");
 }
 
 export async function setKanbanContextNote(
   messageId: string,
   note: string,
 ): Promise<Record<string, string>> {
-  const res = await api.put<Record<string, string>>(`/kanban/context-notes/${messageId}`, { note });
-  return res.data;
+  return invoke<Record<string, string>>("set_kanban_context_note", { messageId, note });
 }
 
 export async function mergeKanbanContextNotes(
   notes: Record<string, string>,
 ): Promise<Record<string, string>> {
-  const res = await api.post<Record<string, string>>("/kanban/context-notes", { notes });
-  return res.data;
+  return invoke<Record<string, string>>("merge_kanban_context_notes", { notes });
 }
 
 // ─── Snooze API ──────────────────────────────────────────────────────────────
 
 export async function snoozeMessage(messageId: string, until: number, returnTo: string): Promise<void> {
-  await api.post(`/messages/${messageId}/snooze`, { until, returnTo });
+  return invoke<void>("snooze_message", { messageId, until, returnTo });
 }
 
 export async function unsnoozeMessage(messageId: string): Promise<void> {
-  await api.delete(`/messages/${messageId}/snooze`);
+  return invoke<void>("unsnooze_message", { messageId });
 }
 
 export async function listSnoozed(): Promise<SnoozedMessage[]> {
-  const res = await api.get<SnoozedMessage[]>("/snoozed");
-  return res.data;
+  return invoke<SnoozedMessage[]>("list_snoozed");
 }
 
 // ─── Rules API ───────────────────────────────────────────────────────────────
 
 export async function createRule(name: string, priority: number, conditions: string, actions: string): Promise<Rule> {
-  const res = await api.post<Rule>("/rules", {
-    name,
-    priority,
-    conditions,
-    actions,
-    is_enabled: true,
-  });
-  return res.data;
+  return invoke<Rule>("create_rule", { name, priority, conditions, actions });
 }
 
 export async function listRules(): Promise<Rule[]> {
-  const res = await api.get<Rule[]>("/rules");
-  return res.data;
+  return invoke<Rule[]>("list_rules");
 }
 
 export async function updateRule(rule: Rule): Promise<void> {
-  await api.put(`/rules/${rule.id}`, {
-    name: rule.name,
-    priority: rule.priority,
-    conditions: rule.conditions,
-    actions: rule.actions,
-    is_enabled: rule.is_enabled,
-  });
+  return invoke<void>("update_rule", { rule });
 }
 
 export async function deleteRule(ruleId: string): Promise<void> {
-  await api.delete(`/rules/${ruleId}`);
+  return invoke<void>("delete_rule", { ruleId });
 }
 
 // ─── Compose API ─────────────────────────────────────────────────────────────
@@ -545,73 +557,53 @@ export async function sendEmail(
   inReplyTo?: string,
   attachmentPaths?: string[],
 ): Promise<void> {
-  await api.post("/compose", {
+  return invoke<void>("send_email", {
     accountId, to, cc, bcc, subject, bodyText, bodyHtml, inReplyTo, attachmentPaths,
   });
 }
 
 export async function stageComposeAttachment(filename: string, bytes: number[]): Promise<string> {
-  const uint8 = new Uint8Array(bytes);
-  // Efficient base64 conversion
-  const chunks: string[] = [];
-  const chunkSize = 0x8000;
-  for (let i = 0; i < uint8.length; i += chunkSize) {
-    chunks.push(String.fromCharCode.apply(null, uint8.subarray(i, i + chunkSize) as unknown as number[]));
-  }
-  const data = btoa(chunks.join(''));
-  const res = await api.post<{ path: string }>("/compose/attachment", { filename, data });
-  return res.data.path;
+  return invoke<string>("stage_compose_attachment", { filename, bytes });
+}
+
+export async function cleanupStagedComposeAttachment(path: string): Promise<void> {
+  return invoke<void>("cleanup_staged_compose_attachment", { path });
 }
 
 // ─── Batch Operations ───────────────────────────────────────────────────────
 
 export async function batchArchive(messageIds: string[]): Promise<number> {
-  const res = await api.post<number>("/messages/batch/archive", { messageIds });
-  return res.data;
+  return invoke<number>("batch_archive", { messageIds });
 }
 
 export async function batchDelete(messageIds: string[]): Promise<number> {
-  const res = await api.post<number>("/messages/batch/delete", { messageIds });
-  return res.data;
+  return invoke<number>("batch_delete", { messageIds });
 }
 
 export async function batchMarkRead(messageIds: string[], isRead: boolean): Promise<number> {
-  const res = await api.post<number>("/messages/batch/mark-read", { messageIds, isRead });
-  return res.data;
+  return invoke<number>("batch_mark_read", { messageIds, isRead });
 }
 
 export async function batchStar(messageIds: string[], starred: boolean): Promise<number> {
-  const res = await api.post<number>("/messages/batch/star", { messageIds, starred });
-  return res.data;
+  return invoke<number>("batch_star", { messageIds, starred });
 }
 
 // ─── Translate API ───────────────────────────────────────────────────────────
 
 export async function translateText(text: string, fromLang: string, toLang: string): Promise<TranslateResult> {
-  const res = await api.post<TranslateResult>("/translate", { text, source_lang: fromLang, target_lang: toLang });
-  return res.data;
+  return invoke<TranslateResult>("translate_text", { text, fromLang, toLang });
 }
 
 export async function getTranslateConfig(): Promise<TranslateConfig | null> {
-  const res = await api.get<{ providerType: string; config: string; isEnabled: boolean } | null>("/translate/config");
-  if (!res.data) return null;
-  return {
-    id: "active",
-    provider_type: res.data.providerType,
-    config: res.data.config,
-    is_enabled: res.data.isEnabled,
-    created_at: 0,
-    updated_at: 0,
-  };
+  return invoke<TranslateConfig | null>("get_translate_config");
 }
 
 export async function saveTranslateConfig(providerType: string, config: string, isEnabled: boolean): Promise<void> {
-  await api.post("/translate/config", { providerType, config, isEnabled });
+  return invoke<void>("save_translate_config", { providerType, config, isEnabled });
 }
 
 export async function testTranslateConnection(config: string): Promise<string> {
-  const res = await api.post<{ ok: boolean; result: string }>("/translate/test", { providerType: "test", config, isEnabled: true });
-  return res.data.result;
+  return invoke<string>("test_translate_connection", { config });
 }
 
 // ─── Thread API ──────────────────────────────────────────────────────────────
@@ -620,73 +612,98 @@ export async function listThreads(
   folderId: string,
   limit: number,
   offset: number,
-  _folderIds?: string[],
+  folderIds?: string[],
 ): Promise<ThreadSummary[]> {
-  const res = await api.get<ThreadSummary[]>(`/folders/${folderId}/threads`, {
-    params: { limit, offset },
-  });
-  return res.data;
+  return invoke<ThreadSummary[]>("list_threads", { folderId, folderIds, limit, offset });
 }
 
 export async function listThreadMessages(threadId: string): Promise<Message[]> {
-  const res = await api.get<Message[]>(`/threads/${threadId}/messages`);
-  return res.data;
+  return invoke<Message[]>("list_thread_messages", { threadId });
 }
 
 // ─── Labels API ──────────────────────────────────────────────────────────────
 
 export async function getMessageLabels(messageId: string): Promise<Label[]> {
-  const res = await api.get<Label[]>(`/messages/${messageId}/labels`);
-  return res.data;
+  return invoke<Label[]>("get_message_labels", { messageId });
 }
 
 export async function getMessageLabelsBatch(messageIds: string[]): Promise<Record<string, Label[]>> {
-  const res = await api.post<Record<string, Label[]>>("/messages/labels/batch", { messageIds });
-  return res.data;
+  return invoke<Record<string, Label[]>>("get_message_labels_batch", { messageIds });
 }
 
 export async function addMessageLabel(messageId: string, labelName: string): Promise<void> {
-  await api.post(`/messages/${messageId}/labels`, { label_name: labelName });
+  return invoke<void>("add_message_label", { messageId, labelName });
 }
 
 export async function removeMessageLabel(messageId: string, labelName: string): Promise<void> {
-  await api.delete(`/messages/${messageId}/labels/${encodeURIComponent(labelName)}`);
+  return invoke<void>("remove_message_label", { messageId, labelName });
 }
 
 export async function listLabels(): Promise<Label[]> {
-  const res = await api.get<Label[]>("/labels");
-  return res.data;
-}
-
-export async function createLabel(name: string, color?: string): Promise<Label> {
-  const res = await api.post<Label>("/labels", { name, color });
-  return res.data;
-}
-
-export async function deleteLabel(id: string): Promise<void> {
-  await api.delete(`/labels/${id}`);
+  return invoke<Label[]>("list_labels");
 }
 
 // ─── Cloud Sync API ─────────────────────────────────────────────────────────
 
 export async function testWebdavConnection(url: string, username: string, password: string): Promise<string> {
-  const res = await api.post<{ result: string }>("/cloud-sync/test", { url, username, password });
-  return res.data.result;
+  return invoke<string>("test_webdav_connection", { url, username, password });
 }
 
-export async function backupToWebdav(url: string, username: string, password: string): Promise<string> {
-  const res = await api.post<{ result: string }>("/cloud-sync/backup", { url, username, password });
-  return res.data.result;
+export async function backupToWebdav(
+  url: string,
+  username: string,
+  password: string,
+  secretPassphrase?: string,
+): Promise<string> {
+  return invoke<string>("backup_to_webdav", { url, username, password, secretPassphrase });
 }
 
 export async function previewWebdavBackup(url: string, username: string, password: string): Promise<BackupPreview> {
-  const res = await api.post<BackupPreview>("/cloud-sync/preview", { url, username, password });
-  return res.data;
+  return invoke<BackupPreview>("preview_webdav_backup", { url, username, password });
 }
 
-export async function restoreFromWebdav(url: string, username: string, password: string): Promise<string> {
-  const res = await api.post<{ result: string }>("/cloud-sync/restore", { url, username, password });
-  return res.data.result;
+export async function exportBackupFile(secretPassphrase?: string): Promise<string> {
+  return invoke<string>("export_backup_file", { secretPassphrase });
+}
+
+export async function previewBackupFile(data: string): Promise<BackupPreview> {
+  return invoke<BackupPreview>("preview_backup_file", { data });
+}
+
+export async function importBackupFile(data: string, secretPassphrase?: string): Promise<string> {
+  return invoke<string>("import_backup_file", { data, secretPassphrase });
+}
+
+export async function restoreFromWebdav(
+  url: string,
+  username: string,
+  password: string,
+  secretPassphrase?: string,
+): Promise<string> {
+  return invoke<string>("restore_from_webdav", { url, username, password, secretPassphrase });
+}
+
+// ─── Auto Backup API ────────────────────────────────────────────────────────
+
+export interface AutoBackupConfig {
+  url: string;
+  username: string;
+  password: string;
+  secret_passphrase: string | null;
+  interval_minutes: number;
+  enabled: boolean;
+}
+
+export async function saveAutoBackupConfig(config: AutoBackupConfig): Promise<void> {
+  return invoke<void>("save_auto_backup_config", { config });
+}
+
+export async function loadAutoBackupConfig(): Promise<AutoBackupConfig | null> {
+  return invoke<AutoBackupConfig | null>("load_auto_backup_config");
+}
+
+export async function deleteAutoBackupConfig(): Promise<void> {
+  return invoke<void>("delete_auto_backup_config");
 }
 
 // ─── Contacts API ────────────────────────────────────────────────────────────
@@ -696,10 +713,58 @@ export async function searchContacts(
   query: string,
   limit?: number,
 ): Promise<KnownContact[]> {
-  const res = await api.get<KnownContact[]>("/contacts", {
-    params: { accountId, query, limit },
-  });
-  return res.data;
+  return invoke<KnownContact[]>("search_contacts", { accountId, query, limit });
+}
+
+export async function listContacts(
+  query?: string,
+  favoriteOnly = false,
+  limit = 50,
+  offset = 0,
+): Promise<Contact[]> {
+  return invoke<Contact[]>("list_contacts", { query, favoriteOnly, limit, offset });
+}
+
+export async function getContactByEmail(address: string): Promise<Contact | null> {
+  return invoke<Contact | null>("get_contact_by_email", { address });
+}
+
+export async function saveContact(input: ContactInput): Promise<Contact> {
+  return invoke<Contact>("save_contact", { input });
+}
+
+export async function deleteContact(
+  contactId: string,
+  suppressAddresses = false,
+): Promise<void> {
+  return invoke<void>("delete_contact", { contactId, suppressAddresses });
+}
+
+export async function setContactFavorite(
+  contactId: string,
+  isFavorite: boolean,
+): Promise<void> {
+  return invoke<void>("set_contact_favorite", { contactId, isFavorite });
+}
+
+export async function searchContactSuggestions(
+  accountId: string,
+  query: string,
+  limit = 20,
+): Promise<ContactSuggestion[]> {
+  return invoke<ContactSuggestion[]>("search_contact_suggestions", { accountId, query, limit });
+}
+
+export async function suppressContactSuggestion(address: string): Promise<void> {
+  return invoke<void>("suppress_contact_suggestion", { address });
+}
+
+export async function importContactsVcard(data: string): Promise<VcardImportResult> {
+  return invoke<VcardImportResult>("import_contacts_vcard", { data });
+}
+
+export async function exportContactsVcard(): Promise<string> {
+  return invoke<string>("export_contacts_vcard");
 }
 
 // ─── Drafts API ──────────────────────────────────────────────────────────────
@@ -716,17 +781,38 @@ export async function saveDraft(args: {
   existingDraftId?: string;
   attachmentPaths?: string[];
 }): Promise<string> {
-  const res = await api.post<{ id: string }>("/drafts", args);
-  return res.data.id;
+  return invoke("save_draft", {
+    accountId: args.accountId,
+    to: args.to,
+    cc: args.cc,
+    bcc: args.bcc,
+    subject: args.subject,
+    bodyText: args.bodyText,
+    bodyHtml: args.bodyHtml ?? null,
+    inReplyTo: args.inReplyTo ?? null,
+    existingDraftId: args.existingDraftId ?? null,
+    attachmentPaths: args.attachmentPaths ?? null,
+  });
 }
 
 export async function deleteDraft(accountId: string, draftId: string): Promise<void> {
-  await api.delete(`/accounts/${accountId}/drafts/${draftId}`);
+  return invoke("delete_draft", { accountId, draftId });
 }
 
 // ─── Folder Counts API ───────────────────────────────────────────────────────
 
 export async function getFolderUnreadCounts(accountId: string): Promise<Record<string, number>> {
-  const res = await api.get<Record<string, number>>(`/accounts/${accountId}/folder-unread-counts`);
-  return res.data;
+  return invoke("get_folder_unread_counts", { accountId });
+}
+
+export interface OAuthIdentityPreview {
+  account_id: string;
+  previous_email: string;
+  identity: { subject: string; email: string; display_name: string | null };
+}
+export function previewOAuthIdentity(accountId: string): Promise<OAuthIdentityPreview> {
+  return invoke("preview_oauth_identity", { accountId });
+}
+export function applyOAuthIdentity(preview: OAuthIdentityPreview): Promise<Account> {
+  return invoke("apply_oauth_identity", { preview });
 }

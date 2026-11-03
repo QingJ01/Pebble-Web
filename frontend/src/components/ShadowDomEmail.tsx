@@ -1,26 +1,10 @@
 import { useRef, useLayoutEffect } from "react";
+import { openMailtoUrl } from "@/app/useMailtoOpen";
 import { sanitizeHtml } from "@/lib/sanitizeHtml";
-import { useComposeStore } from "@/stores/compose.store";
 
 interface ShadowDomEmailProps {
   html: string;
   className?: string;
-}
-
-function openMailtoUrl(url: string) {
-  try {
-    const parsed = new URL(url);
-    const to = parsed.pathname ? parsed.pathname.split(",").filter(Boolean) : [];
-    const cc = parsed.searchParams.get("cc")?.split(",").filter(Boolean) ?? [];
-    const bcc = parsed.searchParams.get("bcc")?.split(",").filter(Boolean) ?? [];
-    const subject = parsed.searchParams.get("subject") ?? undefined;
-    const body = parsed.searchParams.get("body") ?? undefined;
-    useComposeStore.getState().openCompose("new", null, { to, cc, bcc, subject, body });
-  } catch {
-    // Fallback: open compose with the raw mailto address
-    const address = url.replace(/^mailto:/i, "").split("?")[0];
-    useComposeStore.getState().openCompose("new", null, { to: address ? [address] : [] });
-  }
 }
 
 export function ShadowDomEmail({ html, className }: ShadowDomEmailProps) {
@@ -46,20 +30,15 @@ export function ShadowDomEmail({ html, className }: ShadowDomEmailProps) {
           word-break: break-word;
         }
         img { max-width: 100%; height: auto; }
-        a { color: var(--color-accent); }
+        a[href] { color: var(--color-email-link); }
         .pebble-email-content {
           box-sizing: border-box;
+          display: var(--email-content-display);
           max-width: 100%;
           overflow-x: auto;
-          color: inherit;
-          background: transparent;
-        }
-        :host-context([data-theme="dark"]) .pebble-email-content {
-          display: inline-block;
-          max-width: 100%;
-          color-scheme: light;
-          color: #202124;
-          background: #fff;
+          color-scheme: var(--email-content-color-scheme);
+          color: var(--email-content-color);
+          background: var(--email-content-bg);
         }
         pre {
           white-space: pre-wrap;
@@ -127,7 +106,7 @@ export function ShadowDomEmail({ html, className }: ShadowDomEmailProps) {
 
       if (/^mailto:/i.test(href)) {
         event.preventDefault();
-        openMailtoUrl(href);
+        void openMailtoUrl(href);
         return;
       }
 

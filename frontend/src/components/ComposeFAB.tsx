@@ -2,13 +2,15 @@ import { PenLine } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { useUIStore } from "@/stores/ui.store";
 import { useComposeStore } from "@/stores/compose.store";
+import { useMailStore } from "@/stores/mail.store";
 
 export default function ComposeFAB() {
   const { t } = useTranslation();
   const activeView = useUIStore((s) => s.activeView);
   const openCompose = useComposeStore((s) => s.openCompose);
+  const selectedMessageId = useMailStore((s) => s.selectedMessageId);
 
-  if (activeView === "compose") return null;
+  if (activeView === "compose" || selectedMessageId) return null;
 
   return (
     <button

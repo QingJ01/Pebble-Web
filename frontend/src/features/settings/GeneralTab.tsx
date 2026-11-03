@@ -1,215 +1,73 @@
-import { useCallback, useState } from "react";
+import { useState } from "react";
 import { useTranslation } from "react-i18next";
-import { showTestNotification } from "@/lib/api";
+import { setRealtimePreference, showTestNotification } from "@/lib/api";
+import { invoke } from "@/lib/web-commands";
+import { requestBrowserNotifications } from "@/lib/browser-notifications";
 import { useToastStore } from "@/stores/toast.store";
-import { useUIStore, type RealtimePreference } from "@/stores/ui.store";
+import { useUIStore, realtimePreferenceToPollInterval, type RealtimePreference } from "@/stores/ui.store";
 
-const REALTIME_OPTIONS: Array<{
-  mode: RealtimePreference;
-  labelKey: string;
-  fallback: string;
-  descriptionKey: string;
-  descriptionFallback: string;
-}> = [
-  {
-    mode: "realtime",
-    labelKey: "settings.realtimeModeRealtime",
-    fallback: "Realtime (recommended)",
-    descriptionKey: "settings.realtimeModeRealtimeDesc",
-    descriptionFallback: "IMAP uses IDLE push when supported. Other providers check about every 3 seconds while you are active.",
-  },
-  {
-    mode: "balanced",
-    labelKey: "settings.realtimeModeBalanced",
-    fallback: "Balanced",
-    descriptionKey: "settings.realtimeModeBalancedDesc",
-    descriptionFallback: "Checks about every 15 seconds while you are active.",
-  },
-  {
-    mode: "battery",
-    labelKey: "settings.realtimeModeBattery",
-    fallback: "Battery saver",
-    descriptionKey: "settings.realtimeModeBatteryDesc",
-    descriptionFallback: "Checks about every 60 seconds while you are active and slows down in the background.",
-  },
-  {
-    mode: "manual",
-    labelKey: "settings.realtimeModeManual",
-    fallback: "Manual only",
-    descriptionKey: "settings.realtimeModeManualDesc",
-    descriptionFallback: "Stops background checks. Use Sync now to run a single pass.",
-  },
-];
+const MODES: RealtimePreference[] = ["realtime", "balanced", "battery", "manual"];
 
 export default function GeneralTab() {
   const { t } = useTranslation();
-  const addToast = useToastStore((s) => s.addToast);
-  const [testingNotification, setTestingNotification] = useState(false);
-  const realtimeMode = useUIStore((s) => s.realtimeMode);
-  const setRealtimeMode = useUIStore((s) => s.setRealtimeMode);
-  const notificationsEnabled = useUIStore((s) => s.notificationsEnabled);
-  const setNotificationsEnabled = useUIStore((s) => s.setNotificationsEnabled);
-  const keepRunningInBackground = useUIStore((s) => s.keepRunningInBackground);
-  const setKeepRunningInBackground = useUIStore((s) => s.setKeepRunningInBackground);
+  const addToast = useToastStore(s => s.addToast);
+  const mode = useUIStore(s => s.realtimeMode);
+  const ready = useUIStore(s => s.serverPreferencesReady);
+  const notifications = useUIStore(s => s.notificationsEnabled);
+  const showUnread = useUIStore(s => s.showFolderUnreadCount);
+  const [saving, setSaving] = useState(false);
+  const [testing, setTesting] = useState(false);
+  const report = (error: unknown) => addToast({ type: "error", message: error instanceof Error ? error.message : String(error) });
 
-  const toggleNotifications = useCallback(() => {
-    setNotificationsEnabled(!notificationsEnabled);
-  }, [notificationsEnabled, setNotificationsEnabled]);
-
-  const handleTestNotification = useCallback(async () => {
-    setTestingNotification(true);
+  async function updateMode(next: RealtimePreference) {
+    setSaving(true);
     try {
-      await showTestNotification();
-      addToast({
-        message: t("settings.testNotificationSent", "Test notification sent"),
-        type: "success",
-      });
-    } catch {
-      addToast({
-        message: t("settings.testNotificationFailed", "Failed to send test notification"),
-        type: "error",
-      });
-    } finally {
-      setTestingNotification(false);
-    }
-  }, [addToast, t]);
+      await setRealtimePreference(next);
+      useUIStore.getState().setRealtimeMode(next);
+    } catch (error) { report(error); } finally { setSaving(false); }
+  }
+  async function reloadPreference() {
+    try {
+      const next = await invoke<RealtimePreference>("get_realtime_preference");
+      if (!MODES.includes(next)) throw new Error(t("web.invalidPreference", "Invalid server preference."));
+      useUIStore.setState({ realtimeMode: next, pollInterval: realtimePreferenceToPollInterval(next), serverPreferencesReady: true });
+    } catch (error) { report(error); }
+  }
+  async function toggleNotifications() {
+    try {
+      if (!notifications) await requestBrowserNotifications();
+      useUIStore.getState().setNotificationsEnabled(!notifications);
+    } catch (error) { report(error); }
+  }
+  async function testNotification() {
+    setTesting(true);
+    try { await showTestNotification(); } catch (error) { report(error); } finally { setTesting(false); }
+  }
 
-  const quitOnClose = !keepRunningInBackground;
-  const toggleQuitOnClose = useCallback(() => {
-    setKeepRunningInBackground(quitOnClose);
-  }, [quitOnClose, setKeepRunningInBackground]);
-
-  const showUnreadCount = useUIStore((s) => s.showFolderUnreadCount);
-  const setShowUnreadCount = useUIStore((s) => s.setShowFolderUnreadCount);
-
-  const toggleUnreadCount = useCallback(() => {
-    setShowUnreadCount(!showUnreadCount);
-  }, [showUnreadCount, setShowUnreadCount]);
-
-  return (
-    <div>
-      <h3 style={{ fontSize: "14px", fontWeight: 600, marginBottom: "8px" }}>
-        {t("settings.realtimeMode", "Realtime Mode")}
-      </h3>
-      <p style={{ fontSize: "12px", color: "var(--color-text-secondary)", marginBottom: "12px", marginTop: 0 }}>
-        {t("settings.realtimeModeDesc", "Choose how aggressively Pebble checks for new mail.")}
-      </p>
-      <div
-        role="group"
-        aria-label={t("settings.realtimeMode", "Realtime Mode")}
-        style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}
-      >
-        {REALTIME_OPTIONS.map((option) => {
-          const selected = realtimeMode === option.mode;
-          const label = t(option.labelKey, option.fallback);
-          return (
-            <button
-              key={option.mode}
-              type="button"
-              aria-label={label}
-              aria-pressed={selected}
-              onClick={() => setRealtimeMode(option.mode)}
-              style={{
-                flex: "1 1 180px",
-                minWidth: 0,
-                padding: "8px 10px",
-                borderRadius: "6px",
-                border: selected ? "2px solid var(--color-accent)" : "1px solid var(--color-border)",
-                backgroundColor: selected ? "var(--color-bg-hover)" : "transparent",
-                cursor: "pointer",
-                textAlign: "left",
-                color: "var(--color-text-primary)",
-              }}
-            >
-              <span style={{ display: "block", fontSize: "13px", fontWeight: selected ? 600 : 500, lineHeight: 1.3 }}>
-                {label}
-              </span>
-              <span style={{ display: "block", marginTop: "4px", fontSize: "12px", lineHeight: 1.35, color: "var(--color-text-secondary)" }}>
-                {t(option.descriptionKey, option.descriptionFallback)}
-              </span>
-            </button>
-          );
-        })}
-      </div>
-
-      <h3 style={{ fontSize: "14px", fontWeight: 600, marginBottom: "16px", marginTop: "32px" }}>
-        {t("settings.notifications")}
-      </h3>
-      <label
-        style={{
-          display: "flex",
-          alignItems: "center",
-          gap: "8px",
-          cursor: "pointer",
-          fontSize: "13px",
-          color: "var(--color-text-primary)",
-        }}
-      >
-        <input type="checkbox" checked={notificationsEnabled} onChange={toggleNotifications} />
-        <span>{t("settings.enableNotifications")}</span>
-      </label>
-      <button
-        type="button"
-        aria-label={t("settings.testNotification", "Send test notification")}
-        onClick={handleTestNotification}
-        disabled={!notificationsEnabled || testingNotification}
-        style={{
-          marginTop: "12px",
-          padding: "8px 12px",
-          borderRadius: "6px",
-          border: "1px solid var(--color-border)",
-          backgroundColor: notificationsEnabled ? "var(--color-bg)" : "var(--color-bg-hover)",
-          color: notificationsEnabled ? "var(--color-text-primary)" : "var(--color-text-secondary)",
-          cursor: notificationsEnabled && !testingNotification ? "pointer" : "not-allowed",
-          fontSize: "13px",
-        }}
-      >
-        {testingNotification
-          ? t("settings.testNotificationSending", "Sending test notification...")
-          : t("settings.testNotification", "Send test notification")}
-      </button>
-
-      <h3 style={{ fontSize: "14px", fontWeight: 600, marginBottom: "16px", marginTop: "32px" }}>
-        {t("settings.closeBehavior", "Close Behavior")}
-      </h3>
-      <label
-        style={{
-          display: "flex",
-          alignItems: "center",
-          gap: "8px",
-          cursor: "pointer",
-          fontSize: "13px",
-          color: "var(--color-text-primary)",
-        }}
-      >
-        <input
-          type="checkbox"
-          checked={quitOnClose}
-          onChange={toggleQuitOnClose}
-        />
-        <span>{t("settings.quitOnClose", "Quit app when window is closed")}</span>
-      </label>
-
-      <h3 style={{ fontSize: "14px", fontWeight: 600, marginBottom: "16px", marginTop: "32px" }}>
-        {t("settings.folderCounts", "Folder Counts")}
-      </h3>
-      <label
-        style={{
-          display: "flex",
-          alignItems: "center",
-          gap: "8px",
-          cursor: "pointer",
-          fontSize: "13px",
-          color: "var(--color-text-primary)",
-        }}
-      >
-        <input
-          type="checkbox"
-          checked={showUnreadCount}
-          onChange={toggleUnreadCount}
-        />
-        <span>{t("settings.showUnreadCount", "Show unread count badges in sidebar")}</span>
-      </label>
+  return <div style={{ fontSize: 13, color: "var(--color-text-primary)" }}>
+    <h3>{t("settings.realtimeMode", "Realtime Mode")}</h3>
+    <p style={{ color: "var(--color-text-secondary)", lineHeight: 1.6 }}>{t("web.serverSync", "This setting controls the server, even when all browser tabs are closed. Manual mode only syncs when you request it.")}</p>
+    {!ready && <button type="button" onClick={reloadPreference}>{t("web.reloadServerSettings", "Load server settings")}</button>}
+    <div role="group" aria-label={t("settings.realtimeMode", "Realtime Mode")} style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 8 }}>
+      {MODES.map(option => <button key={option} type="button" disabled={!ready || saving} aria-pressed={mode === option} onClick={() => updateMode(option)} style={{
+        padding: 14, borderRadius: 6, textAlign: "left", color: "var(--color-text-primary)",
+        border: mode === option ? "2px solid var(--color-accent)" : "1px solid var(--color-border)",
+        background: mode === option ? "var(--color-bg-hover)" : "transparent", cursor: ready && !saving ? "pointer" : "not-allowed",
+      }}>{t(`web.syncMode.${option}`)}</button>)}
     </div>
-  );
+    <h3 style={{ marginTop: 28 }}>{t("settings.notifications")}</h3>
+    <p style={{ color: "var(--color-text-secondary)", lineHeight: 1.6 }}>{t("web.notificationScope", "Notifications require browser permission and an open Pebble tab. Server sync, rules, and snooze reminders continue without a browser, but closed-browser push delivery is not supported.")}</p>
+    <label style={{ display: "flex", gap: 8, alignItems: "center" }}>
+      <input type="checkbox" checked={notifications} onChange={toggleNotifications} />
+      {t("settings.enableNotifications")}
+    </label>
+    <button type="button" onClick={testNotification} disabled={!notifications || testing} style={{ marginTop: 12 }}>
+      {testing ? t("settings.testNotificationSending", "Sending test notification...") : t("settings.testNotification", "Send test notification")}
+    </button>
+    <h3 style={{ marginTop: 28 }}>{t("settings.folderCounts", "Folder Counts")}</h3>
+    <label style={{ display: "flex", gap: 8, alignItems: "center" }}>
+      <input type="checkbox" checked={showUnread} onChange={() => useUIStore.getState().setShowFolderUnreadCount(!showUnread)} />
+      {t("settings.showUnreadCount", "Show unread count badges in sidebar")}
+    </label>
+  </div>;
 }

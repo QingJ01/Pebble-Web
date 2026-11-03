@@ -5,7 +5,7 @@ import Placeholder from "@tiptap/extension-placeholder";
 import { Markdown as MarkdownExtension } from "tiptap-markdown";
 import TurndownService from "turndown";
 import { getSignature } from "@/lib/signatures";
-import { sanitizeHtml } from "@/lib/sanitizeHtml";
+import { sanitizeComposeQuoteHtml } from "@/lib/sanitizeHtml";
 import type { Message } from "@/lib/ipc-types";
 import type { TFunction } from "i18next";
 
@@ -87,7 +87,7 @@ export function extractComposeBodyHtml(html: string) {
       body = parseBodyHtml(decoded);
     }
 
-    return sanitizeHtml(body);
+    return sanitizeComposeQuoteHtml(body);
   } catch {
     return `<p>${escapeHtml(html)}</p>`;
   }

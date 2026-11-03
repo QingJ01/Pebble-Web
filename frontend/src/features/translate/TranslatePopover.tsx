@@ -2,6 +2,7 @@ import { useState, useEffect } from "react";
 import { useTranslation } from "react-i18next";
 import { Copy, Check, X } from "lucide-react";
 import { translateText } from "@/lib/api";
+import { profileLocalStorage } from "@/lib/profileStorage";
 
 interface Props {
   text: string;
@@ -15,11 +16,11 @@ export default function TranslatePopover({ text, position, onClose }: Props) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [copied, setCopied] = useState(false);
-  const uiLang = localStorage.getItem("pebble-language") || "zh";
+  const uiLang = profileLocalStorage.getItem("pebble-language") || "zh";
   const [targetLang, setTargetLang] = useState(uiLang === "en" ? "zh" : "en");
 
   const [privacyAcked, setPrivacyAcked] = useState(() =>
-    localStorage.getItem("pebble-translate-privacy-ack") === "1",
+    profileLocalStorage.getItem("pebble-translate-privacy-ack") === "1",
   );
 
   useEffect(() => {
@@ -44,7 +45,7 @@ export default function TranslatePopover({ text, position, onClose }: Props) {
   }, [text, targetLang, privacyAcked]);
 
   function handleAcceptPrivacy() {
-    localStorage.setItem("pebble-translate-privacy-ack", "1");
+    profileLocalStorage.setItem("pebble-translate-privacy-ack", "1");
     setPrivacyAcked(true);
   }
 

@@ -11,12 +11,14 @@
 
 /** @rust pebble-core/src/types.rs → Account */
 export interface Account {
+  account_label?: string | null;
+  provider_display_name?: string | null;
   id: string;
   email: string;
   display_name: string;
   color?: string | null;
   /** ProviderType enum (rename_all = "lowercase") */
-  provider: "imap" | "gmail" | "outlook";
+  provider: "imap" | "pop3" | "gmail" | "outlook";
   created_at: number;
   updated_at: number;
 }
@@ -33,6 +35,12 @@ export interface Folder {
   color: string | null;
   is_system: boolean;
   sort_order: number;
+}
+
+/** @rust src-tauri/src/commands/folders.rs → ImapSyncFolderSettings */
+export interface ImapSyncFolderSettings {
+  folders: Folder[];
+  selected_remote_ids: string[];
 }
 
 /** @rust pebble-core/src/types.rs → EmailAddress */
@@ -158,6 +166,8 @@ export type ConnectionSecurity = "tls" | "starttls" | "plain";
 
 /** @rust src-tauri/src/commands/accounts.rs → AddAccountRequest */
 export interface AddAccountRequest {
+  sync_range_days?: number | null;
+  account_label?: string | null;
   email: string;
   display_name: string;
   provider: string;
@@ -169,6 +179,8 @@ export interface AddAccountRequest {
   password: string;
   imap_security: ConnectionSecurity;
   smtp_security: ConnectionSecurity;
+  accept_invalid_certs?: boolean;
+  allow_plaintext?: boolean;
   proxy_host?: string;
   proxy_port?: number;
 }
@@ -322,11 +334,76 @@ export interface BackupPreview {
   rule_count: number;
   kanban_card_count: number;
   kanban_note_count: number;
+  contact_count: number;
   has_translate_config: boolean;
+  has_encrypted_secrets: boolean;
+  secret_account_count: number;
+  has_translate_secret: boolean;
   size_bytes: number;
 }
 
 // ─── Contacts types ─────────────────────────────────────────────────────────────
+
+/** @rust pebble-core/src/types.rs → ContactEmailLabel */
+export type ContactEmailLabel = "work" | "personal" | "other";
+
+/** @rust pebble-core/src/types.rs → ContactEmail */
+export interface ContactEmail {
+  id: string;
+  address: string;
+  label: ContactEmailLabel;
+  is_primary: boolean;
+}
+
+/** @rust pebble-core/src/types.rs → Contact */
+export interface Contact {
+  id: string;
+  display_name: string;
+  notes: string;
+  is_favorite: boolean;
+  emails: ContactEmail[];
+  created_at: number;
+  updated_at: number;
+}
+
+/** @rust pebble-core/src/types.rs → ContactEmailInput */
+export interface ContactEmailInput {
+  id?: string | null;
+  address: string;
+  label: ContactEmailLabel;
+  is_primary: boolean;
+}
+
+/** @rust pebble-core/src/types.rs → ContactInput */
+export interface ContactInput {
+  id?: string | null;
+  display_name: string;
+  notes: string;
+  is_favorite: boolean;
+  emails: ContactEmailInput[];
+}
+
+/** @rust pebble-core/src/types.rs → ContactSuggestionSource */
+export type ContactSuggestionSource = "saved" | "recent";
+
+/** @rust pebble-core/src/types.rs → ContactSuggestion */
+export interface ContactSuggestion {
+  contact_id: string | null;
+  name: string | null;
+  address: string;
+  source: ContactSuggestionSource;
+  is_favorite: boolean;
+  last_interaction_at: number | null;
+}
+
+/** @rust pebble-core/src/types.rs → VcardImportResult */
+export interface VcardImportResult {
+  created: number;
+  merged: number;
+  skipped: number;
+  invalid: number;
+  errors: string[];
+}
 
 /** @rust pebble-core/src/types.rs → KnownContact */
 export interface KnownContact {

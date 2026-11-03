@@ -1,9 +1,10 @@
-import { useState, useRef } from "react";
+import { useState } from "react";
 import { translateText } from "@/lib/api";
 import { sanitizeHtml } from "@/lib/sanitizeHtml";
 import type { Message, RenderedHtml, TranslateResult } from "@/lib/api";
 import { useToastStore } from "@/stores/toast.store";
 import { extractErrorMessage } from "@/lib/extractErrorMessage";
+import { profileLocalStorage } from "@/lib/profileStorage";
 
 // Translation cache: avoids re-translating on toggle or revisit (capped at 20 entries)
 const translationCache = new Map<string, TranslateResult & { _isHtml?: boolean }>();
@@ -19,7 +20,6 @@ export function useBilingualTranslation(
   const [bilingualMode, setBilingualMode] = useState(false);
   const [bilingualResult, setBilingualResult] = useState<TranslateResult | null>(null);
   const [bilingualLoading, setBilingualLoading] = useState(false);
-  const loadingRef = useRef(false);
 
   async function handleBilingualToggle() {
     if (bilingualMode) {
@@ -27,10 +27,8 @@ export function useBilingualTranslation(
       return;
     }
     if (!message || !messageId) return;
-    if (loadingRef.current) return;
-    loadingRef.current = true;
 
-    const uiLang = localStorage.getItem("pebble-language") || "zh";
+    const uiLang = profileLocalStorage.getItem("pebble-language") || "zh";
     const cacheKey = `${messageId}:${uiLang}`;
 
     // Check cache first
@@ -108,7 +106,6 @@ export function useBilingualTranslation(
       addToast({ message: `Translation failed: ${extractErrorMessage(err)}`, type: "error" });
     } finally {
       setBilingualLoading(false);
-      loadingRef.current = false;
     }
   }
 

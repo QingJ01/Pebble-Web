@@ -35,23 +35,30 @@ function loadLegacyContextNotes(): Record<string, string> {
 }
 
 let legacyContextNotes = loadLegacyContextNotes();
-if (typeof localStorage !== "undefined") {
-  localStorage.removeItem(LEGACY_CONTEXT_NOTES_STORAGE_KEY);
-}
+let nextContextNoteGeneration = 0;
+const latestContextNoteGeneration = new Map<string, number>();
+const contextNoteMutationGeneration = new Map<string, number>();
+let nextFetchGeneration = 0;
+let latestFetchGeneration = 0;
 
 async function loadContextNotes(): Promise<Record<string, string>> {
   const backendNotes = await listKanbanContextNotes();
   const legacyNotes = legacyContextNotes;
-  legacyContextNotes = {};
   const legacyEntries = Object.entries(legacyNotes).filter(
     ([messageId, note]) => messageId && note && backendNotes[messageId] === undefined,
   );
 
-  if (legacyEntries.length === 0) {
-    return backendNotes;
-  }
+  const mergedNotes = legacyEntries.length === 0
+    ? backendNotes
+    : await mergeKanbanContextNotes(Object.fromEntries(legacyEntries));
 
-  return mergeKanbanContextNotes(Object.fromEntries(legacyEntries));
+  legacyContextNotes = {};
+  if (typeof localStorage !== "undefined") {
+    try {
+      localStorage.removeItem(LEGACY_CONTEXT_NOTES_STORAGE_KEY);
+    } catch { /* keep the in-memory migration result */ }
+  }
+  return mergedNotes;
 }
 
 function buildIdSet(cards: KanbanCard[]): Set<string> {
@@ -65,12 +72,34 @@ export const useKanbanStore = create<KanbanState>((set, get) => ({
   loading: false,
 
   fetchCards: async () => {
+    const fetchGeneration = ++nextFetchGeneration;
+    latestFetchGeneration = fetchGeneration;
+    const contextNoteGenerationAtStart = nextContextNoteGeneration;
+    const pendingContextNotesAtStart = new Set(latestContextNoteGeneration.keys());
     set({ loading: true });
     try {
       const [cards, contextNotes] = await Promise.all([listKanbanCards(), loadContextNotes()]);
-      set({ cards, cardIdSet: buildIdSet(cards), contextNotes });
+      if (latestFetchGeneration !== fetchGeneration) return;
+      set((state) => {
+        const mergedContextNotes = { ...contextNotes };
+        const notesToPreserve = new Set([
+          ...pendingContextNotesAtStart,
+          ...latestContextNoteGeneration.keys(),
+          ...[...contextNoteMutationGeneration.entries()]
+            .filter(([, generation]) => generation > contextNoteGenerationAtStart)
+            .map(([messageId]) => messageId),
+        ]);
+        for (const messageId of notesToPreserve) {
+          if (Object.prototype.hasOwnProperty.call(state.contextNotes, messageId)) {
+            mergedContextNotes[messageId] = state.contextNotes[messageId];
+          } else {
+            delete mergedContextNotes[messageId];
+          }
+        }
+        return { cards, cardIdSet: buildIdSet(cards), contextNotes: mergedContextNotes };
+      });
     } finally {
-      set({ loading: false });
+      if (latestFetchGeneration === fetchGeneration) set({ loading: false });
     }
   },
 
@@ -126,6 +155,11 @@ export const useKanbanStore = create<KanbanState>((set, get) => ({
 
   setContextNote: async (messageId, note) => {
     const prev = get().contextNotes;
+    const hadPreviousNote = Object.prototype.hasOwnProperty.call(prev, messageId);
+    const previousNote = prev[messageId];
+    const generation = ++nextContextNoteGeneration;
+    latestContextNoteGeneration.set(messageId, generation);
+    contextNoteMutationGeneration.set(messageId, generation);
     const next = { ...prev };
     if (note) {
       next[messageId] = note;
@@ -135,9 +169,30 @@ export const useKanbanStore = create<KanbanState>((set, get) => ({
     set({ contextNotes: next });
     try {
       const saved = await setKanbanContextNote(messageId, note);
-      set({ contextNotes: saved });
+      if (latestContextNoteGeneration.get(messageId) !== generation) return;
+      set((state) => {
+        const merged = { ...state.contextNotes };
+        if (Object.prototype.hasOwnProperty.call(saved, messageId)) {
+          merged[messageId] = saved[messageId];
+        } else {
+          delete merged[messageId];
+        }
+        return { contextNotes: merged };
+      });
+      latestContextNoteGeneration.delete(messageId);
     } catch (err) {
-      set({ contextNotes: prev });
+      if (latestContextNoteGeneration.get(messageId) === generation) {
+        set((state) => {
+          const rolledBack = { ...state.contextNotes };
+          if (hadPreviousNote) {
+            rolledBack[messageId] = previousNote;
+          } else {
+            delete rolledBack[messageId];
+          }
+          return { contextNotes: rolledBack };
+        });
+        latestContextNoteGeneration.delete(messageId);
+      }
       throw err;
     }
   },

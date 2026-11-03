@@ -22,6 +22,9 @@ type AccountProxyDraft = {
   error: string | null;
 };
 
+const usesMailProxySetting = (provider: Account["provider"]) =>
+  provider === "imap" || provider === "pop3";
+
 const emptyAccountDraft = (): AccountProxyDraft => ({
   mode: "inherit",
   host: "",
@@ -86,8 +89,9 @@ export default function ProxyTab() {
     });
 
     proxyAccounts.forEach((account) => {
-      const loadProxy =
-        account.provider === "imap" ? getAccountProxySetting : getOAuthAccountProxySetting;
+      const loadProxy = usesMailProxySetting(account.provider)
+        ? getAccountProxySetting
+        : getOAuthAccountProxySetting;
       setAccountProxyDrafts((current) => ({
         ...current,
         [account.id]: {
@@ -175,7 +179,7 @@ export default function ProxyTab() {
     const normalizedPort =
       parsedPort === undefined || Number.isNaN(parsedPort) ? undefined : parsedPort;
     try {
-      if (account.provider === "imap") {
+      if (usesMailProxySetting(account.provider)) {
         await updateAccountProxySetting(
           account.id,
           draft.mode,
@@ -206,7 +210,7 @@ export default function ProxyTab() {
         {t("settings.globalProxy", "Global Proxy")}
       </h3>
       <p style={{ fontSize: "12px", color: "var(--color-text-secondary)", marginBottom: "12px", marginTop: 0 }}>
-        {t("settings.globalProxyDesc", "Used by translation, OAuth, Gmail/Outlook API requests, IMAP, and SMTP when an account does not define its own SOCKS5 proxy.")}
+        {t("settings.globalProxyDesc", "Used by translation, OAuth, Gmail/Outlook API requests, IMAP, POP3, and SMTP when an account does not define its own SOCKS5 proxy.")}
       </p>
       <div
         role="group"

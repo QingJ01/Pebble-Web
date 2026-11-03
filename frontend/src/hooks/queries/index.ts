@@ -28,3 +28,12 @@ export {
   usePendingMailOpsQuery,
   pendingMailOpsQueryKey,
 } from "./usePendingMailOpsQuery";
+export {
+  useContactsQuery,
+  useContactByAddressQuery,
+  contactsQueryKey,
+  contactByAddressQueryKey,
+  contactSuggestionsQueryKey,
+  contactsQueryRoot,
+  contactSuggestionsQueryRoot,
+} from "./useContactsQuery";

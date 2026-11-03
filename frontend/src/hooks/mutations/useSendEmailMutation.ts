@@ -30,6 +30,7 @@ export function useSendEmailMutation() {
         params.attachmentPaths,
       ),
     onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["accounts"] });
       queryClient.invalidateQueries({ queryKey: ["messages"] });
     },
   });

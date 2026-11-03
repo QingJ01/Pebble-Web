@@ -7,6 +7,9 @@ interface Props {
   confirmLabel?: string;
   cancelLabel?: string;
   destructive?: boolean;
+  busy?: boolean;
+  confirmDisabled?: boolean;
+  busyConfirmLabel?: string;
   onConfirm: () => void;
   onCancel: () => void;
 }
@@ -29,6 +32,9 @@ export default function ConfirmDialog({
   confirmLabel,
   cancelLabel,
   destructive,
+  busy = false,
+  confirmDisabled = false,
+  busyConfirmLabel,
   onConfirm,
   onCancel,
 }: Props) {
@@ -38,6 +44,8 @@ export default function ConfirmDialog({
   const cancelRef = useRef<HTMLButtonElement>(null);
   const onConfirmRef = useRef(onConfirm);
   const onCancelRef = useRef(onCancel);
+  const busyRef = useRef(busy);
+  busyRef.current = busy;
 
   useEffect(() => { onConfirmRef.current = onConfirm; }, [onConfirm]);
   useEffect(() => { onCancelRef.current = onCancel; }, [onCancel]);
@@ -56,7 +64,9 @@ export default function ConfirmDialog({
     function handleKey(e: KeyboardEvent) {
       if (e.key === "Escape") {
         e.preventDefault();
-        onCancelRef.current();
+        if (!busyRef.current) {
+          onCancelRef.current();
+        }
         return;
       }
 
@@ -90,6 +100,7 @@ export default function ConfirmDialog({
     <div
       role="dialog"
       aria-modal="true"
+      aria-busy={busy || undefined}
       aria-labelledby="confirm-dialog-title"
       aria-describedby="confirm-dialog-message"
       style={{
@@ -132,7 +143,8 @@ export default function ConfirmDialog({
         <div style={{ display: "flex", justifyContent: "flex-end", gap: "8px" }}>
           <button
             ref={cancelRef}
-            onClick={onCancel}
+            onClick={() => { if (!busy) onCancel(); }}
+            aria-disabled={busy || undefined}
             style={{
               padding: "7px 16px",
               borderRadius: "6px",
@@ -140,14 +152,17 @@ export default function ConfirmDialog({
               backgroundColor: "transparent",
               color: "var(--color-text-primary)",
               fontSize: "13px",
-              cursor: "pointer",
+              cursor: busy ? "wait" : "pointer",
+              opacity: busy ? 0.65 : 1,
             }}
           >
             {cancelLabel || t("common.cancel", "Cancel")}
           </button>
           <button
             ref={confirmRef}
-            onClick={onConfirm}
+            onClick={() => { if (!busy && !confirmDisabled) onConfirm(); }}
+            disabled={confirmDisabled}
+            aria-disabled={busy || confirmDisabled || undefined}
             style={{
               padding: "7px 16px",
               borderRadius: "6px",
@@ -156,10 +171,13 @@ export default function ConfirmDialog({
               color: "#fff",
               fontSize: "13px",
               fontWeight: 600,
-              cursor: "pointer",
+              cursor: busy ? "wait" : confirmDisabled ? "not-allowed" : "pointer",
+              opacity: busy || confirmDisabled ? 0.65 : 1,
             }}
           >
-            {confirmLabel || t("common.confirm", "Confirm")}
+            {busy
+              ? busyConfirmLabel || confirmLabel || t("common.confirm", "Confirm")
+              : confirmLabel || t("common.confirm", "Confirm")}
           </button>
         </div>
       </div>

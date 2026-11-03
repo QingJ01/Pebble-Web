@@ -1,16 +1,18 @@
 import { useEffect, useRef, useState } from "react";
 import i18n from "@/lib/i18n";
+import http from "@/api-client";
 import { useConfirmStore } from "@/stores/confirm.store";
 import { X } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { useQueryClient, type QueryClient } from "@tanstack/react-query";
-import { addAccount, startSync, testImapConnection } from "@/lib/api";
+import { addAccount, startSync, testImapConnection, testPop3Connection, completeOAuthFlow } from "@/lib/api";
 import type { AddAccountRequest } from "@/lib/api";
 import { accountsQueryKey } from "@/hooks/queries";
 import { extractErrorMessage } from "@/lib/extractErrorMessage";
 import { realtimePreferenceToPollInterval, useUIStore } from "@/stores/ui.store";
 import { useToastStore } from "@/stores/toast.store";
 import { inputStyle, labelStyle } from "../styles/form";
+import SyncRangeFields, { syncRangeDays, syncRangeDraft } from "./SyncRangeFields";
 
 const FOLDER_REFRESH_ATTEMPTS = 5;
 const FOLDER_REFRESH_INTERVAL_MS = 2000;
@@ -85,6 +87,7 @@ export default function AccountSetup({ onClose }: Props) {
   const initialForm: AddAccountRequest = {
     email: "",
     display_name: "",
+    account_label: "",
     provider: "imap",
     imap_host: "",
     imap_port: 993,
@@ -92,10 +95,13 @@ export default function AccountSetup({ onClose }: Props) {
     smtp_host: "",
     smtp_port: 587,
     smtp_security: "starttls",
+    accept_invalid_certs: false,
+    allow_plaintext: false,
     username: "",
     password: "",
   };
   const [form, setForm] = useState<AddAccountRequest>(initialForm);
+  const [syncRange, setSyncRange] = useState(() => syncRangeDraft(null));
   const initialFormRef = useRef(initialForm);
 
   const [loading, setLoading] = useState(false);
@@ -113,7 +119,7 @@ export default function AccountSetup({ onClose }: Props) {
     const isDirty = (Object.keys(current) as Array<keyof AddAccountRequest>).some(
       (k) => current[k] !== initial[k],
     );
-    if (!isDirty) {
+    if (!isDirty && syncRange.preset === "all" && !syncRange.customDays) {
       onClose();
       return;
     }
@@ -169,15 +175,31 @@ export default function AccountSetup({ onClose }: Props) {
     setTestResult(null);
     setTestLoading(true);
     try {
-      const report = await testImapConnection(
-        form.imap_host,
-        form.imap_port,
-        form.imap_security,
-        form.proxy_host,
-        form.proxy_port,
-        form.username || undefined,
-        form.password || undefined,
-      );
+      const report =
+        form.provider === "pop3"
+          ? await testPop3Connection(
+              form.imap_host,
+              form.imap_port,
+              form.imap_security,
+              form.accept_invalid_certs,
+              form.proxy_host,
+              form.proxy_port,
+              form.username || undefined,
+              form.password || undefined,
+              form.allow_plaintext,
+            )
+          : await testImapConnection(
+              form.imap_host,
+              form.imap_port,
+              form.imap_security,
+              form.accept_invalid_certs,
+              form.proxy_host,
+              form.proxy_port,
+              form.username || undefined,
+              form.password || undefined,
+              form.email || undefined,
+              form.allow_plaintext,
+            );
       setTestResult({ ok: true, message: report });
     } catch (err) {
       const msg = extractErrorMessage(err);
@@ -187,10 +209,47 @@ export default function AccountSetup({ onClose }: Props) {
     }
   }
 
+  const [oauthLoading, setOauthLoading] = useState(false);
+  const [oauthProviders, setOauthProviders] = useState({ gmail: false, outlook: false });
+  useEffect(() => {
+    let active = true;
+    http.get<{ gmail: boolean; outlook: boolean }>("/oauth/providers")
+      .then(({ data }) => { if (active) setOauthProviders(data); })
+      .catch(() => {});
+    return () => { active = false; };
+  }, []);
+
+  async function handleOAuth(provider: "gmail" | "outlook") {
+    const days = syncRangeDays(syncRange);
+    if (days === undefined) return;
+    setOauthLoading(true);
+    setError(null);
+    try {
+      const account = await completeOAuthFlow(
+        provider,
+        form.email || "",
+        form.display_name || "",
+        form.proxy_host?.trim() || undefined,
+        form.proxy_port,
+        form.account_label || undefined,
+        days,
+      );
+      await queryClient.invalidateQueries({ queryKey: accountsQueryKey });
+      await startSync(account.id, syncPollInterval);
+      refreshFoldersAfterSyncStart(queryClient, account.id);
+      onClose();
+    } catch (err) {
+      const msg = extractErrorMessage(err);
+      setError(msg);
+    } finally {
+      setOauthLoading(false);
+    }
+  }
+
   function applyPreset(key: string) {
     const preset = PRESETS[key];
     if (!preset) return;
-    setForm((prev) => ({ ...prev, ...preset }));
+    setForm((prev) => ({ ...prev, provider: "imap", ...preset }));
   }
 
   function handleChange(field: keyof AddAccountRequest, value: string | number | boolean) {
@@ -200,16 +259,38 @@ export default function AccountSetup({ onClose }: Props) {
       if (field === "email" && prev.username === prev.email) {
         updated.username = value as string;
       }
+      // The plaintext opt-in checkbox only shows while a connection is
+      // unencrypted. If the user switches both sides back to an encrypted
+      // mode, clear the flag so a transiently-checked box can't persist
+      // allow_plaintext=true onto an encrypted account (issue #70).
+      if (field === "imap_security" || field === "smtp_security") {
+        const anyPlain =
+          updated.imap_security === "plain" || updated.smtp_security === "plain";
+        if (!anyPlain) {
+          updated.allow_plaintext = false;
+        }
+      }
       return updated;
     });
   }
 
+  function handleIncomingProtocolChange(provider: "imap" | "pop3") {
+    setForm((prev) => ({
+      ...prev,
+      provider,
+      imap_port: provider === "pop3" ? 995 : 993,
+      imap_security: "tls",
+    }));
+  }
+
   async function handleSubmit(e: React.SyntheticEvent<HTMLFormElement>) {
     e.preventDefault();
+    const days = form.provider === "pop3" ? null : syncRangeDays(syncRange);
+    if (days === undefined) return;
     setError(null);
     setLoading(true);
     try {
-      const account = await addAccount(form);
+      const account = await addAccount({ ...form, sync_range_days: days });
       // Invalidate accounts immediately so UI reflects the new account
       await queryClient.invalidateQueries({ queryKey: accountsQueryKey });
       onClose();
@@ -235,6 +316,48 @@ export default function AccountSetup({ onClose }: Props) {
     flexDirection: "column",
     gap: "0",
   };
+  const isPop3 = form.provider === "pop3";
+  const incomingHostLabel = isPop3
+    ? t("accountSetup.pop3Host", "POP3 host")
+    : t("accountSetup.imapHost", "IMAP host");
+  const incomingPortLabel = isPop3
+    ? t("accountSetup.pop3Port", "POP3 port")
+    : t("accountSetup.imapPort", "IMAP port");
+  const incomingHostPlaceholder = isPop3 ? "pop.example.com" : "imap.example.com";
+  const canTestConnection =
+    !!form.imap_host && (!isPop3 || (!!form.username && !!form.password));
+
+  const proxyFields = (
+    <div style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: "12px", marginBottom: "16px" }}>
+      <div style={fieldStyle}>
+        <label htmlFor="setup-proxy-host" style={labelStyle}>
+          {t("accountSetup.proxyHost", "SOCKS5 Proxy")}
+          {" "}<span style={{ color: "var(--color-text-secondary)", fontWeight: 400 }}>({t("settings.optional", "optional")})</span>
+        </label>
+        <input
+          id="setup-proxy-host"
+          aria-label={t("accountSetup.proxyHost", "SOCKS5 Proxy")}
+          style={inputStyle}
+          type="text"
+          value={form.proxy_host ?? ""}
+          onChange={(e) => setForm((prev) => ({ ...prev, proxy_host: e.target.value || undefined }))}
+          placeholder="127.0.0.1"
+        />
+      </div>
+      <div style={fieldStyle}>
+        <label htmlFor="setup-proxy-port" style={labelStyle}>{t("accountSetup.proxyPort", "Port")}</label>
+        <input
+          id="setup-proxy-port"
+          aria-label={t("accountSetup.proxyPort", "Port")}
+          style={{ ...inputStyle, width: "80px" }}
+          type="number"
+          value={form.proxy_port ?? ""}
+          onChange={(e) => setForm((prev) => ({ ...prev, proxy_port: e.target.value ? parseInt(e.target.value, 10) : undefined }))}
+          placeholder="7890"
+        />
+      </div>
+    </div>
+  );
 
   return (
     <div
@@ -305,6 +428,72 @@ export default function AccountSetup({ onClose }: Props) {
 
         {/* Scrollable body */}
         <div className="scroll-region account-setup-scroll" style={{ overflowY: "auto", padding: "20px" }}>
+          <div style={{ ...fieldStyle, marginBottom: "16px" }}>
+            <label htmlFor="setup-account-label" style={labelStyle}>{t("accountSetup.accountLabel", "Account label")}</label>
+            <input id="setup-account-label" style={inputStyle} type="text" maxLength={120}
+              value={form.account_label || ""} onChange={(e) => handleChange("account_label", e.target.value)} />
+            <small>{t("accountSetup.accountLabelHelp", "Only used to identify this account in Pebble; never sent as your sender name.")}</small>
+          </div>
+          {/* OAuth sign-in buttons */}
+          {(!oauthProviders.gmail || !oauthProviders.outlook) && <p style={{ fontSize: 12, color: "var(--color-text-secondary)" }}>{t("web.oauthSetup", "Unavailable providers require the server administrator to configure OAuth client credentials and a trusted callback URL.")}</p>}
+          <SyncRangeFields value={syncRange} onChange={setSyncRange} disabled={loading || oauthLoading} />
+          <div style={{ display: "flex", gap: "8px", marginBottom: "16px" }}>
+            <button
+              type="button"
+              disabled={loading || oauthLoading || !oauthProviders.gmail || syncRangeDays(syncRange) === undefined}
+              onClick={() => handleOAuth("gmail")}
+              style={{
+                flex: 1,
+                padding: "10px 16px",
+                borderRadius: "6px",
+                border: "1px solid var(--color-border)",
+                backgroundColor: "var(--color-bg)",
+                color: "var(--color-text-primary)",
+                fontSize: "13px",
+                fontWeight: 500,
+                cursor: oauthLoading ? "wait" : "pointer",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                gap: "8px",
+                opacity: oauthLoading ? 0.7 : 1,
+              }}
+            >
+              <svg width="16" height="16" viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#34A853" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#FBBC05" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg>
+              {oauthLoading ? t("accountSetup.adding", "Signing in...") : t("accountSetup.signInGoogle", "Sign in with Google")}
+            </button>
+            <button
+              type="button"
+              disabled={loading || oauthLoading || !oauthProviders.outlook || syncRangeDays(syncRange) === undefined}
+              onClick={() => handleOAuth("outlook")}
+              style={{
+                flex: 1,
+                padding: "10px 16px",
+                borderRadius: "6px",
+                border: "1px solid var(--color-border)",
+                backgroundColor: "var(--color-bg)",
+                color: "var(--color-text-primary)",
+                fontSize: "13px",
+                fontWeight: 500,
+                cursor: oauthLoading ? "wait" : "pointer",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                gap: "8px",
+                opacity: oauthLoading ? 0.7 : 1,
+              }}
+            >
+              <svg width="16" height="16" viewBox="0 0 23 23"><path fill="#f35325" d="M1 1h10v10H1z"/><path fill="#81bc06" d="M12 1h10v10H12z"/><path fill="#05a6f0" d="M1 12h10v10H1z"/><path fill="#ffba08" d="M12 12h10v10H12z"/></svg>
+              {oauthLoading ? t("accountSetup.adding", "Signing in...") : t("accountSetup.signInOutlook", "Sign in with Microsoft")}
+            </button>
+          </div>
+
+          {proxyFields}
+
+          <div style={{ textAlign: "center", color: "var(--color-text-secondary)", fontSize: "12px", marginBottom: "16px" }}>
+            {t("accountSetup.orManual", "or add account manually")}
+          </div>
+
           {/* Preset buttons */}
           <div style={{ marginBottom: "20px" }}>
             <span style={{ ...labelStyle, marginBottom: "8px" }}>{t("accountSetup.quickSetup", "Quick setup")}</span>
@@ -351,24 +540,41 @@ export default function AccountSetup({ onClose }: Props) {
 
             {/* Display name */}
             <div style={fieldStyle}>
-              <label htmlFor="setup-display-name" style={labelStyle}>{t("accountSetup.displayName", "Display name")}</label>
+              <label htmlFor="setup-display-name" style={labelStyle}>{t("accountSetup.displayName", "Sender name")}</label>
               <input
                 id="setup-display-name"
                 name="display_name"
                 autoComplete="name"
                 style={inputStyle}
                 type="text"
-                required
                 value={form.display_name}
                 onChange={(e) => handleChange("display_name", e.target.value)}
                 placeholder={t("accountSetup.namePlaceholder", "Your Name")}
               />
             </div>
 
-            {/* IMAP */}
+            {/* Incoming */}
+            <div style={fieldStyle}>
+              <label htmlFor="setup-incoming-protocol" style={labelStyle}>
+                {t("accountSetup.incomingProtocol", "Incoming protocol")}
+              </label>
+              <select
+                id="setup-incoming-protocol"
+                value={isPop3 ? "pop3" : "imap"}
+                onChange={(e) => handleIncomingProtocolChange(e.target.value as "imap" | "pop3")}
+                style={inputStyle}
+              >
+                <option value="imap">{t("accountSetup.incomingProtocolImap", "IMAP")}</option>
+                <option value="pop3">{t("accountSetup.incomingProtocolPop3", "POP3")}</option>
+              </select>
+              {isPop3 && <div style={{ color: "var(--color-text-secondary)", fontSize: "12px", marginTop: "6px" }}>
+                {t("syncRange.pop3", "POP3 does not support server-side date filtering; all mail will be synced.")}
+              </div>}
+            </div>
+
             <div style={{ display: "grid", gridTemplateColumns: "1fr auto auto", gap: "12px" }}>
               <div style={fieldStyle}>
-                <label htmlFor="setup-imap-host" style={labelStyle}>{t("accountSetup.imapHost", "IMAP host")}</label>
+                <label htmlFor="setup-imap-host" style={labelStyle}>{incomingHostLabel}</label>
                 <input
                   id="setup-imap-host"
                   name="imap_host"
@@ -377,11 +583,11 @@ export default function AccountSetup({ onClose }: Props) {
                   required
                   value={form.imap_host}
                   onChange={(e) => handleChange("imap_host", e.target.value)}
-                  placeholder="imap.example.com"
+                  placeholder={incomingHostPlaceholder}
                 />
               </div>
               <div style={fieldStyle}>
-                <label htmlFor="setup-imap-port" style={labelStyle}>{t("accountSetup.imapPort", "IMAP port")}</label>
+                <label htmlFor="setup-imap-port" style={labelStyle}>{incomingPortLabel}</label>
                 <input
                   id="setup-imap-port"
                   name="imap_port"
@@ -402,6 +608,7 @@ export default function AccountSetup({ onClose }: Props) {
                 >
                   <option value="tls">{t("accountSetup.securityTls", "SSL/TLS")}</option>
                   <option value="starttls">{t("accountSetup.securityStarttls", "STARTTLS")}</option>
+                  <option value="plain">{t("accountSetup.securityPlain", "None")}</option>
                 </select>
               </div>
             </div>
@@ -443,9 +650,57 @@ export default function AccountSetup({ onClose }: Props) {
                 >
                   <option value="tls">{t("accountSetup.securityTls", "SSL/TLS")}</option>
                   <option value="starttls">{t("accountSetup.securityStarttls", "STARTTLS")}</option>
+                  <option value="plain">{t("accountSetup.securityPlain", "None")}</option>
                 </select>
               </div>
             </div>
+
+            {/* TLS certificate policy */}
+            <label
+              htmlFor="setup-accept-invalid-certs"
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: "8px",
+                fontSize: "12px",
+                color: "var(--color-text-primary)",
+              }}
+            >
+              <input
+                id="setup-accept-invalid-certs"
+                type="checkbox"
+                checked={!!form.accept_invalid_certs}
+                onChange={(e) => handleChange("accept_invalid_certs", e.target.checked)}
+              />
+              {t("accountSetup.acceptInvalidCerts", "Allow invalid TLS certificates")}
+            </label>
+
+            {(form.imap_security === "plain" || form.smtp_security === "plain") && (
+              <label
+                htmlFor="setup-allow-plaintext"
+                style={{
+                  display: "flex",
+                  alignItems: "flex-start",
+                  gap: "8px",
+                  fontSize: "12px",
+                  color: "var(--color-warning, #b45309)",
+                }}
+              >
+                <input
+                  id="setup-allow-plaintext"
+                  type="checkbox"
+                  checked={!!form.allow_plaintext}
+                  onChange={(e) => handleChange("allow_plaintext", e.target.checked)}
+                  style={{ marginTop: "2px" }}
+                />
+                <span>
+                  {t(
+                    "accountSetup.allowPlaintext",
+                    "Allow unencrypted connection (insecure — your password is sent in cleartext)",
+                  )}
+                </span>
+              </label>
+            )}
 
             {/* Username */}
             <div style={fieldStyle}>
@@ -456,7 +711,6 @@ export default function AccountSetup({ onClose }: Props) {
                 autoComplete="username"
                 style={inputStyle}
                 type="text"
-                required
                 value={form.username}
                 onChange={(e) => handleChange("username", e.target.value)}
                 placeholder={t("accountSetup.usernameHint", "Defaults to email address")}
@@ -521,7 +775,7 @@ export default function AccountSetup({ onClose }: Props) {
             <div style={{ display: "flex", gap: "10px", marginTop: "4px" }}>
               <button
                 type="button"
-                disabled={testLoading || !form.imap_host}
+                disabled={testLoading || !canTestConnection}
                 onClick={handleTestConnection}
                 style={{
                   padding: "9px 16px",
@@ -531,15 +785,15 @@ export default function AccountSetup({ onClose }: Props) {
                   color: "var(--color-text-primary)",
                   fontSize: "13px",
                   fontWeight: 500,
-                  cursor: testLoading || !form.imap_host ? "not-allowed" : "pointer",
-                  opacity: testLoading || !form.imap_host ? 0.6 : 1,
+                  cursor: testLoading || !canTestConnection ? "not-allowed" : "pointer",
+                  opacity: testLoading || !canTestConnection ? 0.6 : 1,
                 }}
               >
                 {testLoading ? t("accountSetup.testing", "Testing...") : t("accountSetup.testConnection", "Test Connection")}
               </button>
               <button
                 type="submit"
-                disabled={loading}
+                disabled={loading || oauthLoading || (!isPop3 && syncRangeDays(syncRange) === undefined)}
                 style={{
                   flex: 1,
                   padding: "9px 16px",
