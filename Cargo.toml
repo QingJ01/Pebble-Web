@@ -64,6 +64,9 @@ jsonwebtoken = { workspace = true }
 argon2 = { workspace = true }
 hex = "0.4"
 base64 = "0.22"
+reqwest = { workspace = true }
+sha2 = "0.10"
+zeroize = "1"
 lol_html = { workspace = true }
 tokio-util = { version = "0.7", features = ["io"] }
 rusqlite = { workspace = true }
@@ -75,3 +78,4 @@ pebble-privacy = { path = "crates/pebble-privacy" }
 pebble-crypto = { path = "crates/pebble-crypto" }
 pebble-mail = { path = "crates/pebble-mail" }
 pebble-translate = { path = "crates/pebble-translate" }
+pebble-oauth = { path = "crates/pebble-oauth" }

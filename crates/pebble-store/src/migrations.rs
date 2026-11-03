@@ -2,7 +2,7 @@ use pebble_core::{build_snippet, PebbleError, Result};
 use rusqlite::{Connection, OptionalExtension};
 use std::collections::HashSet;
 
-const CURRENT_VERSION: u32 = 18;
+const CURRENT_VERSION: u32 = 19;
 const ACCOUNT_COLOR_PRESETS: [&str; 12] = [
     "#0ea5e9", "#22c55e", "#f59e0b", "#8b5cf6", "#f43f5e", "#14b8a6", "#6366f1", "#f97316",
     "#06b6d4", "#ec4899", "#84cc16", "#3b82f6",
@@ -98,7 +98,7 @@ fn rebuild_accounts_with_pop3_provider(conn: &Connection) -> Result<()> {
     {
         conn.execute_batch("ALTER TABLE accounts ADD COLUMN auth_data BLOB;")
             .map_err(|e| {
-                PebbleError::Storage(format!("Migration V12 auth_data column failed: {e}"))
+                PebbleError::Storage(format!("Migration V13 auth_data column failed: {e}"))
             })?;
     }
     if conn
@@ -107,7 +107,7 @@ fn rebuild_accounts_with_pop3_provider(conn: &Connection) -> Result<()> {
     {
         conn.execute_batch("ALTER TABLE accounts ADD COLUMN sync_state TEXT;")
             .map_err(|e| {
-                PebbleError::Storage(format!("Migration V12 sync_state column failed: {e}"))
+                PebbleError::Storage(format!("Migration V13 sync_state column failed: {e}"))
             })?;
     }
 
@@ -117,7 +117,7 @@ fn rebuild_accounts_with_pop3_provider(conn: &Connection) -> Result<()> {
             email TEXT NOT NULL,
             display_name TEXT NOT NULL DEFAULT '',
             color TEXT,
-            provider TEXT NOT NULL CHECK(provider IN ('imap', 'pop3', 'gmail', 'outlook')),
+            provider TEXT NOT NULL CHECK(provider IN ('imap', 'gmail', 'outlook', 'pop3')),
             auth_data BLOB,
             sync_state TEXT,
             created_at INTEGER NOT NULL,
@@ -129,7 +129,7 @@ fn rebuild_accounts_with_pop3_provider(conn: &Connection) -> Result<()> {
         DROP TABLE accounts;
         ALTER TABLE accounts_new RENAME TO accounts;",
     )
-    .map_err(|e| PebbleError::Storage(format!("Migration V12 failed: {e}")))?;
+    .map_err(|e| PebbleError::Storage(format!("Migration V13 failed: {e}")))?;
     Ok(())
 }
 
@@ -369,81 +369,91 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
     }
 
     if version < 12 {
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| PebbleError::Storage(format!("Migration V12 begin failed: {e}")))?;
+        if table_exists(&tx, "labels")?
+            && tx.prepare("SELECT account_id FROM labels LIMIT 0").is_err()
+        {
+            tx.execute_batch(
+                "ALTER TABLE labels ADD COLUMN account_id TEXT REFERENCES accounts(id) ON DELETE CASCADE;
+                 CREATE INDEX IF NOT EXISTS idx_labels_account ON labels(account_id);",
+            )
+            .map_err(|e| PebbleError::Storage(format!("Migration V12 labels failed: {e}")))?;
+        }
+        set_schema_version(&tx, 12)?;
+        tx.commit()
+            .map_err(|e| PebbleError::Storage(format!("Migration V12 commit failed: {e}")))?;
+    }
+
+    // V13 appends the desktop POP3 provider constraint after Web V12.
+    if version < 13 {
         conn.execute_batch("PRAGMA foreign_keys=OFF;")
-            .map_err(|e| PebbleError::Storage(format!("Migration V12 disable FK failed: {e}")))?;
+            .map_err(|e| PebbleError::Storage(format!("Migration V13 disable FK failed: {e}")))?;
         let migration_result = (|| -> Result<()> {
             let tx = conn
                 .unchecked_transaction()
-                .map_err(|e| PebbleError::Storage(format!("Migration V12 begin failed: {e}")))?;
+                .map_err(|e| PebbleError::Storage(format!("Migration V13 begin failed: {e}")))?;
             if !accounts_provider_check_allows_pop3(&tx)? {
                 rebuild_accounts_with_pop3_provider(&tx)?;
-            }
-            if table_exists(&tx, "labels")?
-                && tx.prepare("SELECT account_id FROM labels LIMIT 0").is_err()
-            {
-                tx.execute_batch(
-                    "ALTER TABLE labels ADD COLUMN account_id TEXT REFERENCES accounts(id) ON DELETE CASCADE;
-                     CREATE INDEX IF NOT EXISTS idx_labels_account ON labels(account_id);",
-                )
-                .map_err(|e| PebbleError::Storage(format!("Migration V12 Web labels failed: {e}")))?;
             }
             let fk_violation = tx
                 .query_row("PRAGMA foreign_key_check", [], |_| Ok(()))
                 .optional()
-                .map_err(|e| PebbleError::Storage(format!("Migration V12 FK check failed: {e}")))?;
+                .map_err(|e| PebbleError::Storage(format!("Migration V13 FK check failed: {e}")))?;
             if fk_violation.is_some() {
                 return Err(PebbleError::Storage(
-                    "Migration V12 introduced foreign key violations".to_string(),
+                    "Migration V13 introduced foreign key violations".to_string(),
                 ));
             }
-            set_schema_version(&tx, 12)?;
+            set_schema_version(&tx, 13)?;
             tx.commit()
-                .map_err(|e| PebbleError::Storage(format!("Migration V12 commit failed: {e}")))?;
+                .map_err(|e| PebbleError::Storage(format!("Migration V13 commit failed: {e}")))?;
             Ok(())
         })();
         let enable_foreign_keys_result = conn
             .execute_batch("PRAGMA foreign_keys=ON;")
-            .map_err(|e| PebbleError::Storage(format!("Migration V12 enable FK failed: {e}")));
+            .map_err(|e| PebbleError::Storage(format!("Migration V13 enable FK failed: {e}")));
         migration_result?;
         enable_foreign_keys_result?;
     }
 
-    // V13: rebuild snippets to strip leaked HTML/CSS from previews
-    if version < 13 {
+    // V14: rebuild snippets to strip leaked HTML/CSS from previews.
+    if version < 14 {
         let tx = conn
             .unchecked_transaction()
-            .map_err(|e| PebbleError::Storage(format!("Migration V13 begin failed: {e}")))?;
+            .map_err(|e| PebbleError::Storage(format!("Migration V14 begin failed: {e}")))?;
         rebuild_snippets(&tx)?;
-        set_schema_version(&tx, 13)?;
+        set_schema_version(&tx, 14)?;
         tx.commit()
-            .map_err(|e| PebbleError::Storage(format!("Migration V13 commit failed: {e}")))?;
+            .map_err(|e| PebbleError::Storage(format!("Migration V14 commit failed: {e}")))?;
     }
 
-    // V14: enforce at most one LIVE row per (account_id, remote_id). The legacy
+    // V15: enforce at most one LIVE row per (account_id, remote_id). The legacy
     // idx_messages_account_remote index was non-unique, so a soft-delete followed
     // by a re-sync that re-fetched the same remote_id inserted a second row
     // (tombstone + new live copy). Deduplicate existing live rows first, then
     // replace the index with a partial UNIQUE index scoped to is_deleted = 0 so
     // tombstones (is_deleted = 1) can still coexist with a fresh live copy.
-    if version < 14 {
+    if version < 15 {
         let tx = conn
             .unchecked_transaction()
-            .map_err(|e| PebbleError::Storage(format!("Migration V14 begin failed: {e}")))?;
+            .map_err(|e| PebbleError::Storage(format!("Migration V15 begin failed: {e}")))?;
         // The messages table always exists in production (created in SCHEMA_V1).
         // Guard the dedup/index so the migration is a no-op on the minimal
         // schemas used by migration unit tests that omit messages — and is
         // harmless if a future store variant lacks it.
         if table_exists(&tx, "messages")? {
             tx.execute_batch(
-                "CREATE TEMP TABLE v14_message_dedup (
+                "CREATE TEMP TABLE v15_message_dedup (
                      loser_id TEXT PRIMARY KEY,
                      winner_id TEXT NOT NULL
                  );",
             )
-            .map_err(|e| PebbleError::Storage(format!("Migration V14 failed: {e}")))?;
+            .map_err(|e| PebbleError::Storage(format!("Migration V15 failed: {e}")))?;
             if table_exists(&tx, "accounts")? {
                 tx.execute_batch(
-                    "INSERT INTO v14_message_dedup (loser_id, winner_id)
+                    "INSERT INTO v15_message_dedup (loser_id, winner_id)
                      SELECT id, winner_id
                      FROM (
                          SELECT
@@ -462,13 +472,13 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
                      )
                      WHERE id != winner_id;",
                 )
-                .map_err(|e| PebbleError::Storage(format!("Migration V14 failed: {e}")))?;
+                .map_err(|e| PebbleError::Storage(format!("Migration V15 failed: {e}")))?;
             } else {
                 // Minimal migration-test schemas do not include accounts, so
                 // retain the legacy inference there only. Production always
                 // takes the provider-aware branch above.
                 tx.execute_batch(
-                    "INSERT INTO v14_message_dedup (loser_id, winner_id)
+                    "INSERT INTO v15_message_dedup (loser_id, winner_id)
                      SELECT id, winner_id
                      FROM (
                          SELECT
@@ -484,7 +494,7 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
                      )
                      WHERE id != winner_id;",
                 )
-                .map_err(|e| PebbleError::Storage(format!("Migration V14 failed: {e}")))?;
+                .map_err(|e| PebbleError::Storage(format!("Migration V15 failed: {e}")))?;
             }
 
             if table_exists(&tx, "message_folders")? {
@@ -492,17 +502,17 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
                     "INSERT OR IGNORE INTO message_folders (message_id, folder_id)
                      SELECT dedup.winner_id, relation.folder_id
                      FROM message_folders AS relation
-                     JOIN v14_message_dedup AS dedup ON dedup.loser_id = relation.message_id;",
+                     JOIN v15_message_dedup AS dedup ON dedup.loser_id = relation.message_id;",
                 )?;
             }
             if table_exists(&tx, "attachments")? {
                 tx.execute_batch(
                     "UPDATE attachments
                      SET message_id = (
-                         SELECT winner_id FROM v14_message_dedup
+                         SELECT winner_id FROM v15_message_dedup
                          WHERE loser_id = attachments.message_id
                      )
-                     WHERE message_id IN (SELECT loser_id FROM v14_message_dedup);",
+                     WHERE message_id IN (SELECT loser_id FROM v15_message_dedup);",
                 )?;
             }
             if table_exists(&tx, "message_labels")? {
@@ -510,7 +520,7 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
                     "INSERT OR IGNORE INTO message_labels (message_id, label_id)
                      SELECT dedup.winner_id, relation.label_id
                      FROM message_labels AS relation
-                     JOIN v14_message_dedup AS dedup ON dedup.loser_id = relation.message_id;",
+                     JOIN v15_message_dedup AS dedup ON dedup.loser_id = relation.message_id;",
                 )?;
             }
             if table_exists(&tx, "kanban_cards")? {
@@ -520,7 +530,7 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
                      SELECT dedup.winner_id, relation.column_name, relation.position,
                             relation.created_at, relation.updated_at
                      FROM kanban_cards AS relation
-                     JOIN v14_message_dedup AS dedup ON dedup.loser_id = relation.message_id
+                     JOIN v15_message_dedup AS dedup ON dedup.loser_id = relation.message_id
                      WHERE 1
                      ON CONFLICT(message_id) DO UPDATE SET
                          column_name = excluded.column_name,
@@ -537,7 +547,7 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
                      SELECT dedup.winner_id, relation.snoozed_at, relation.unsnoozed_at,
                             relation.return_to
                      FROM snoozed_messages AS relation
-                     JOIN v14_message_dedup AS dedup ON dedup.loser_id = relation.message_id
+                     JOIN v15_message_dedup AS dedup ON dedup.loser_id = relation.message_id
                      WHERE 1
                      ON CONFLICT(message_id) DO UPDATE SET
                          snoozed_at = excluded.snoozed_at,
@@ -551,55 +561,33 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
                     "INSERT INTO search_pending (message_id, operation, created_at)
                      SELECT dedup.winner_id, 'index', MAX(relation.created_at)
                      FROM search_pending AS relation
-                     JOIN v14_message_dedup AS dedup ON dedup.loser_id = relation.message_id
+                     JOIN v15_message_dedup AS dedup ON dedup.loser_id = relation.message_id
                      GROUP BY dedup.winner_id
                      ON CONFLICT(message_id) DO UPDATE SET
                          operation = 'index',
                          created_at = MAX(search_pending.created_at, excluded.created_at);
                      UPDATE search_pending
                      SET operation = 'index'
-                     WHERE message_id IN (SELECT winner_id FROM v14_message_dedup);
+                     WHERE message_id IN (SELECT winner_id FROM v15_message_dedup);
                      DELETE FROM search_pending
-                     WHERE message_id IN (SELECT loser_id FROM v14_message_dedup);",
+                     WHERE message_id IN (SELECT loser_id FROM v15_message_dedup);",
                 )?;
             }
             if table_exists(&tx, "pending_mail_ops")? {
                 tx.execute_batch(
                     "UPDATE pending_mail_ops
                      SET message_id = (
-                         SELECT winner_id FROM v14_message_dedup
+                         SELECT winner_id FROM v15_message_dedup
                          WHERE loser_id = pending_mail_ops.message_id
                      )
-                     WHERE message_id IN (SELECT loser_id FROM v14_message_dedup);",
+                     WHERE message_id IN (SELECT loser_id FROM v15_message_dedup);",
                 )?;
             }
 
             tx.execute_batch(
-                "DELETE FROM messages WHERE id IN (SELECT loser_id FROM v14_message_dedup);
-                 DROP TABLE v14_message_dedup;
+                "DELETE FROM messages WHERE id IN (SELECT loser_id FROM v15_message_dedup);
+                 DROP TABLE v15_message_dedup;
                  DROP INDEX IF EXISTS idx_messages_account_remote;
-                 CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_account_remote_unique
-                   ON messages(account_id, remote_id)
-                   WHERE is_deleted = 0
-                     AND remote_id != ''
-                     AND remote_id GLOB '*[^0-9]*';",
-            )
-            .map_err(|e| PebbleError::Storage(format!("Migration V14 failed: {e}")))?;
-        }
-        set_schema_version(&tx, 14)?;
-        tx.commit()
-            .map_err(|e| PebbleError::Storage(format!("Migration V14 commit failed: {e}")))?;
-    }
-
-    // V15: local-only drafts use an empty remote_id. They are distinct records,
-    // so the remote-message uniqueness constraint must not include them.
-    if version < 15 {
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|e| PebbleError::Storage(format!("Migration V15 begin failed: {e}")))?;
-        if table_exists(&tx, "messages")? {
-            tx.execute_batch(
-                "DROP INDEX IF EXISTS idx_messages_account_remote_unique;
                  CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_account_remote_unique
                    ON messages(account_id, remote_id)
                    WHERE is_deleted = 0
@@ -613,29 +601,51 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
             .map_err(|e| PebbleError::Storage(format!("Migration V15 commit failed: {e}")))?;
     }
 
-    // V16: IMAP UIDs are scoped to one mailbox, while OAuth/POP provider IDs
-    // remain account-wide. SQLite cannot express that relationship with one
-    // messages-table index, so provider-aware triggers enforce both scopes.
+    // V16: local-only drafts use an empty remote_id. They are distinct records,
+    // so the remote-message uniqueness constraint must not include them.
     if version < 16 {
         let tx = conn
             .unchecked_transaction()
             .map_err(|e| PebbleError::Storage(format!("Migration V16 begin failed: {e}")))?;
         if table_exists(&tx, "messages")? {
+            tx.execute_batch(
+                "DROP INDEX IF EXISTS idx_messages_account_remote_unique;
+                 CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_account_remote_unique
+                   ON messages(account_id, remote_id)
+                   WHERE is_deleted = 0
+                     AND remote_id != ''
+                     AND remote_id GLOB '*[^0-9]*';",
+            )
+            .map_err(|e| PebbleError::Storage(format!("Migration V16 failed: {e}")))?;
+        }
+        set_schema_version(&tx, 16)?;
+        tx.commit()
+            .map_err(|e| PebbleError::Storage(format!("Migration V16 commit failed: {e}")))?;
+    }
+
+    // V17: IMAP UIDs are scoped to one mailbox, while OAuth/POP provider IDs
+    // remain account-wide. SQLite cannot express that relationship with one
+    // messages-table index, so provider-aware triggers enforce both scopes.
+    if version < 17 {
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| PebbleError::Storage(format!("Migration V17 begin failed: {e}")))?;
+        if table_exists(&tx, "messages")? {
             tx.execute_batch("DROP INDEX IF EXISTS idx_messages_account_remote_unique;")
-                .map_err(|e| PebbleError::Storage(format!("Migration V16 failed: {e}")))?;
+                .map_err(|e| PebbleError::Storage(format!("Migration V17 failed: {e}")))?;
             if table_exists(&tx, "accounts")? && table_exists(&tx, "message_folders")? {
-                // V15's temporary index deliberately left numeric IDs
+                // V16's temporary index deliberately left numeric IDs
                 // unconstrained so mailbox-scoped IMAP UIDs could coexist.
                 // Normalize any duplicates before installing the final,
                 // provider-aware constraints. For IMAP, remove only the
                 // duplicate mailbox relation and delete/merge the message only
                 // when that leaves it without any mailbox relation.
                 tx.execute_batch(
-                    "CREATE TEMP TABLE v16_message_dedup (
+                    "CREATE TEMP TABLE v17_message_dedup (
                          loser_id TEXT PRIMARY KEY,
                          winner_id TEXT NOT NULL
                      );
-                     INSERT INTO v16_message_dedup (loser_id, winner_id)
+                     INSERT INTO v17_message_dedup (loser_id, winner_id)
                      SELECT id, winner_id
                      FROM (
                          SELECT
@@ -654,13 +664,13 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
                      )
                      WHERE id != winner_id;
 
-                     CREATE TEMP TABLE v16_imap_relation_dedup (
+                     CREATE TEMP TABLE v17_imap_relation_dedup (
                          loser_id TEXT NOT NULL,
                          winner_id TEXT NOT NULL,
                          folder_id TEXT NOT NULL,
                          PRIMARY KEY (loser_id, folder_id)
                      );
-                     INSERT INTO v16_imap_relation_dedup
+                     INSERT INTO v17_imap_relation_dedup
                          (loser_id, winner_id, folder_id)
                      SELECT message_id, winner_id, folder_id
                      FROM (
@@ -688,28 +698,28 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
                      DELETE FROM message_folders
                      WHERE EXISTS (
                          SELECT 1
-                         FROM v16_imap_relation_dedup AS dedup
+                         FROM v17_imap_relation_dedup AS dedup
                          WHERE dedup.loser_id = message_folders.message_id
                            AND dedup.folder_id = message_folders.folder_id
                      );
 
-                     INSERT OR IGNORE INTO v16_message_dedup (loser_id, winner_id)
+                     INSERT OR IGNORE INTO v17_message_dedup (loser_id, winner_id)
                      SELECT relation.loser_id, MAX(relation.winner_id)
-                     FROM v16_imap_relation_dedup AS relation
+                     FROM v17_imap_relation_dedup AS relation
                      WHERE NOT EXISTS (
                          SELECT 1 FROM message_folders
                          WHERE message_id = relation.loser_id
                      )
                      GROUP BY relation.loser_id;",
                 )
-                .map_err(|e| PebbleError::Storage(format!("Migration V16 failed: {e}")))?;
+                .map_err(|e| PebbleError::Storage(format!("Migration V17 failed: {e}")))?;
 
                 if table_exists(&tx, "message_folders")? {
                     tx.execute_batch(
                         "INSERT OR IGNORE INTO message_folders (message_id, folder_id)
                          SELECT dedup.winner_id, relation.folder_id
                          FROM message_folders AS relation
-                         JOIN v16_message_dedup AS dedup
+                         JOIN v17_message_dedup AS dedup
                            ON dedup.loser_id = relation.message_id;",
                     )?;
                 }
@@ -717,10 +727,10 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
                     tx.execute_batch(
                         "UPDATE attachments
                          SET message_id = (
-                             SELECT winner_id FROM v16_message_dedup
+                             SELECT winner_id FROM v17_message_dedup
                              WHERE loser_id = attachments.message_id
                          )
-                         WHERE message_id IN (SELECT loser_id FROM v16_message_dedup);",
+                         WHERE message_id IN (SELECT loser_id FROM v17_message_dedup);",
                     )?;
                 }
                 if table_exists(&tx, "message_labels")? {
@@ -728,7 +738,7 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
                         "INSERT OR IGNORE INTO message_labels (message_id, label_id)
                          SELECT dedup.winner_id, relation.label_id
                          FROM message_labels AS relation
-                         JOIN v16_message_dedup AS dedup
+                         JOIN v17_message_dedup AS dedup
                            ON dedup.loser_id = relation.message_id;",
                     )?;
                 }
@@ -739,7 +749,7 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
                          SELECT dedup.winner_id, relation.column_name, relation.position,
                                 relation.created_at, relation.updated_at
                          FROM kanban_cards AS relation
-                         JOIN v16_message_dedup AS dedup
+                         JOIN v17_message_dedup AS dedup
                            ON dedup.loser_id = relation.message_id
                          WHERE 1
                          ON CONFLICT(message_id) DO UPDATE SET
@@ -757,7 +767,7 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
                          SELECT dedup.winner_id, relation.snoozed_at,
                                 relation.unsnoozed_at, relation.return_to
                          FROM snoozed_messages AS relation
-                         JOIN v16_message_dedup AS dedup
+                         JOIN v17_message_dedup AS dedup
                            ON dedup.loser_id = relation.message_id
                          WHERE 1
                          ON CONFLICT(message_id) DO UPDATE SET
@@ -772,7 +782,7 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
                         "INSERT INTO search_pending (message_id, operation, created_at)
                          SELECT dedup.winner_id, 'index', MAX(relation.created_at)
                          FROM search_pending AS relation
-                         JOIN v16_message_dedup AS dedup
+                         JOIN v17_message_dedup AS dedup
                            ON dedup.loser_id = relation.message_id
                          GROUP BY dedup.winner_id
                          ON CONFLICT(message_id) DO UPDATE SET
@@ -780,29 +790,29 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
                              created_at = MAX(search_pending.created_at, excluded.created_at);
                          UPDATE search_pending
                          SET operation = 'index'
-                         WHERE message_id IN (SELECT winner_id FROM v16_message_dedup);
+                         WHERE message_id IN (SELECT winner_id FROM v17_message_dedup);
                          DELETE FROM search_pending
-                         WHERE message_id IN (SELECT loser_id FROM v16_message_dedup);",
+                         WHERE message_id IN (SELECT loser_id FROM v17_message_dedup);",
                     )?;
                 }
                 if table_exists(&tx, "pending_mail_ops")? {
                     tx.execute_batch(
                         "UPDATE pending_mail_ops
                          SET message_id = (
-                             SELECT winner_id FROM v16_message_dedup
+                             SELECT winner_id FROM v17_message_dedup
                              WHERE loser_id = pending_mail_ops.message_id
                          )
-                         WHERE message_id IN (SELECT loser_id FROM v16_message_dedup);",
+                         WHERE message_id IN (SELECT loser_id FROM v17_message_dedup);",
                     )?;
                 }
 
                 tx.execute_batch(
                     "DELETE FROM messages
-                     WHERE id IN (SELECT loser_id FROM v16_message_dedup);
-                     DROP TABLE v16_imap_relation_dedup;
-                     DROP TABLE v16_message_dedup;",
+                     WHERE id IN (SELECT loser_id FROM v17_message_dedup);
+                     DROP TABLE v17_imap_relation_dedup;
+                     DROP TABLE v17_message_dedup;",
                 )
-                .map_err(|e| PebbleError::Storage(format!("Migration V16 failed: {e}")))?;
+                .map_err(|e| PebbleError::Storage(format!("Migration V17 failed: {e}")))?;
 
                 tx.execute_batch(
                     "CREATE TRIGGER IF NOT EXISTS trg_messages_non_imap_remote_unique_insert
@@ -905,7 +915,7 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
                          SELECT RAISE(ABORT, 'duplicate live IMAP UID in folder');
                      END;",
                 )
-                .map_err(|e| PebbleError::Storage(format!("Migration V16 failed: {e}")))?;
+                .map_err(|e| PebbleError::Storage(format!("Migration V17 failed: {e}")))?;
             } else {
                 // Preserve lightweight migration-test schemas that omit
                 // account/folder metadata. Production never takes this path.
@@ -916,7 +926,7 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
                          AND remote_id != ''
                          AND remote_id GLOB '*[^0-9]*';",
                 )
-                .map_err(|e| PebbleError::Storage(format!("Migration V16 failed: {e}")))?;
+                .map_err(|e| PebbleError::Storage(format!("Migration V17 failed: {e}")))?;
             }
 
             // This is intentionally non-unique: it keeps lookups by provider
@@ -925,18 +935,18 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
                 "CREATE INDEX IF NOT EXISTS idx_messages_account_remote
                    ON messages(account_id, remote_id);",
             )
-            .map_err(|e| PebbleError::Storage(format!("Migration V16 failed: {e}")))?;
+            .map_err(|e| PebbleError::Storage(format!("Migration V17 failed: {e}")))?;
         }
-        set_schema_version(&tx, 16)?;
+        set_schema_version(&tx, 17)?;
         tx.commit()
-            .map_err(|e| PebbleError::Storage(format!("Migration V16 commit failed: {e}")))?;
+            .map_err(|e| PebbleError::Storage(format!("Migration V17 commit failed: {e}")))?;
     }
 
-    // V17: profile-level address book and hidden recent-contact suggestions.
-    if version < 17 {
+    // V18: profile-level address book and hidden recent-contact suggestions.
+    if version < 18 {
         let tx = conn
             .unchecked_transaction()
-            .map_err(|e| PebbleError::Storage(format!("Migration V17 begin failed: {e}")))?;
+            .map_err(|e| PebbleError::Storage(format!("Migration V18 begin failed: {e}")))?;
         tx.execute_batch(
             "CREATE TABLE contacts (
                  id TEXT PRIMARY KEY,
@@ -966,13 +976,13 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
                  created_at INTEGER NOT NULL
              );",
         )
-        .map_err(|e| PebbleError::Storage(format!("Migration V17 failed: {e}")))?;
-        set_schema_version(&tx, 17)?;
+        .map_err(|e| PebbleError::Storage(format!("Migration V18 failed: {e}")))?;
+        set_schema_version(&tx, 18)?;
         tx.commit()
-            .map_err(|e| PebbleError::Storage(format!("Migration V17 commit failed: {e}")))?;
+            .map_err(|e| PebbleError::Storage(format!("Migration V18 commit failed: {e}")))?;
     }
 
-    if version < 18 {
+    if version < 19 {
         let tx = conn.unchecked_transaction()?;
         // Lightweight migration fixtures may intentionally omit accounts.
         if table_exists(&tx, "accounts")? {
@@ -995,7 +1005,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     email TEXT NOT NULL,
     display_name TEXT NOT NULL DEFAULT '',
     color TEXT,
-    provider TEXT NOT NULL CHECK(provider IN ('imap', 'pop3', 'gmail', 'outlook')),
+    provider TEXT NOT NULL CHECK(provider IN ('imap', 'gmail', 'outlook')),
     auth_data BLOB,
     sync_state TEXT,
     created_at INTEGER NOT NULL,
@@ -1134,12 +1144,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn migration_v18_preserves_existing_identity_and_rolls_back_on_failure() {
+    fn migration_v19_preserves_existing_identity_and_rolls_back_on_failure() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE accounts (id TEXT PRIMARY KEY, email TEXT, display_name TEXT, auth_data BLOB);
              INSERT INTO accounts VALUES ('a', 'old@example.com', 'Original Name', X'1234');
-             PRAGMA user_version=17;",
+             PRAGMA user_version=18;",
         ).unwrap();
         run_migrations(&conn).unwrap();
         let values: (String, String, Vec<u8>, Option<String>, Option<String>, Option<String>) = conn.query_row(
@@ -1159,13 +1169,13 @@ mod tests {
         );
 
         let broken = Connection::open_in_memory().unwrap();
-        broken.execute_batch("CREATE TABLE accounts (id TEXT, provider_display_name TEXT); PRAGMA user_version=17;").unwrap();
+        broken.execute_batch("CREATE TABLE accounts (id TEXT, provider_display_name TEXT); PRAGMA user_version=18;").unwrap();
         assert!(run_migrations(&broken).is_err());
         assert_eq!(
             broken
                 .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
                 .unwrap(),
-            17
+            18
         );
         assert!(
             broken
@@ -1176,9 +1186,9 @@ mod tests {
     }
 
     #[test]
-    fn migration_v17_creates_contact_tables() {
+    fn migration_v18_creates_contact_tables() {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA user_version=14;")
+        conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA user_version=17;")
             .unwrap();
 
         run_migrations(&conn).unwrap();
@@ -1260,7 +1270,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_v12_migration_leaves_schema_version_at_v11() {
+    fn failed_v13_migration_leaves_schema_version_at_v12() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE accounts (
@@ -1282,16 +1292,16 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(
-            version, 11,
-            "completed V11 must not claim later migrations ran"
+            version, 12,
+            "completed Web V12 must not claim later migrations ran"
         );
     }
 
     #[test]
-    fn migration_v14_dedups_live_rows_and_enforces_partial_unique_index() {
+    fn migration_v15_dedups_live_rows_and_enforces_partial_unique_index() {
         let conn = Connection::open_in_memory().unwrap();
-        // Minimal messages shape at the V13 boundary: only the columns V14
-        // touches. run_migrations from user_version=13 runs just the V14 block.
+        // Minimal messages shape at the V14 boundary: only the columns V15
+        // touches. run_migrations from user_version=14 runs just the V15 block.
         conn.execute_batch(
             "CREATE TABLE messages (
                 id TEXT PRIMARY KEY,
@@ -1330,7 +1340,7 @@ mod tests {
                 created_at INTEGER NOT NULL
             );
             CREATE INDEX idx_messages_account_remote ON messages(account_id, remote_id);
-            PRAGMA user_version = 13;",
+            PRAGMA user_version = 14;",
         )
         .unwrap();
 
@@ -1524,7 +1534,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_after_v14_replaces_index_that_blocked_multiple_local_drafts() {
+    fn migration_after_v15_replaces_index_that_blocked_multiple_local_drafts() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE messages (
@@ -1537,7 +1547,7 @@ mod tests {
                 VALUES ('draft-a', 'acct', '', 0);
             CREATE UNIQUE INDEX idx_messages_account_remote_unique
                 ON messages(account_id, remote_id) WHERE is_deleted = 0;
-            PRAGMA user_version = 14;",
+            PRAGMA user_version = 15;",
         )
         .unwrap();
 
@@ -1552,7 +1562,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_from_v13_preserves_mailbox_scoped_imap_uids() {
+    fn migration_from_v14_preserves_mailbox_scoped_imap_uids() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE accounts (
@@ -1584,7 +1594,7 @@ mod tests {
             INSERT INTO message_folders (message_id, folder_id) VALUES
                 ('imap-inbox', 'folder-inbox'),
                 ('imap-sent', 'folder-sent');
-            PRAGMA user_version = 13;",
+            PRAGMA user_version = 14;",
         )
         .unwrap();
 
@@ -1647,7 +1657,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_v16_merges_existing_scoped_duplicates_and_keeps_lookup_indexed() {
+    fn migration_v17_merges_existing_scoped_duplicates_and_keeps_lookup_indexed() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE accounts (
@@ -1728,7 +1738,7 @@ mod tests {
                 ('imap-new', 'remove', 10);
             INSERT INTO pending_mail_ops (id, message_id) VALUES
                 ('pending-old', 'imap-old');
-            PRAGMA user_version = 15;",
+            PRAGMA user_version = 16;",
         )
         .unwrap();
 
@@ -1895,7 +1905,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_v12_allows_pop3_provider_without_breaking_foreign_keys() {
+    fn migration_v13_allows_pop3_provider_without_breaking_foreign_keys() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "PRAGMA foreign_keys=ON;
@@ -1926,7 +1936,7 @@ mod tests {
                 VALUES ('account-1', 'one@example.com', 'One', '#0ea5e9', 'imap', 1, 1);
             INSERT INTO folders (id, account_id, remote_id, name, folder_type, role, is_system, sort_order)
                 VALUES ('folder-1', 'account-1', 'INBOX', 'Inbox', 'folder', 'inbox', 1, 0);
-            PRAGMA user_version = 11;",
+            PRAGMA user_version = 12;",
         )
         .unwrap();
 
@@ -1941,7 +1951,7 @@ mod tests {
                 VALUES ('account-2', 'two@example.com', 'Two', 'pop3', 2, 2)",
             [],
         )
-        .expect("accounts.provider should accept pop3 after V12");
+        .expect("accounts.provider should accept pop3 after V13");
         let folder_account: String = conn
             .query_row(
                 "SELECT account_id FROM folders WHERE id = 'folder-1'",
@@ -1958,7 +1968,135 @@ mod tests {
     }
 
     #[test]
-    fn migration_v12_fk_violation_rolls_back_version_and_restores_enforcement() {
+    fn original_web_v12_upgrade_preserves_account_mail_and_user_data() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE labels ADD COLUMN account_id TEXT REFERENCES accounts(id) ON DELETE CASCADE;
+             CREATE INDEX idx_labels_account ON labels(account_id);
+             CREATE TABLE pending_mail_ops (
+                 id TEXT PRIMARY KEY,
+                 account_id TEXT NOT NULL,
+                 message_id TEXT NOT NULL,
+                 op_type TEXT NOT NULL,
+                 payload_json TEXT NOT NULL,
+                 status TEXT NOT NULL CHECK(status IN ('pending', 'in_progress', 'failed', 'done')),
+                 attempts INTEGER NOT NULL DEFAULT 0,
+                 last_error TEXT,
+                 created_at INTEGER NOT NULL,
+                 updated_at INTEGER NOT NULL,
+                 next_retry_at INTEGER
+             );
+             CREATE TABLE secure_user_data (
+                 key TEXT PRIMARY KEY,
+                 value BLOB NOT NULL,
+                 updated_at INTEGER NOT NULL
+             );
+             INSERT INTO accounts
+                 (id, email, display_name, color, provider, auth_data, sync_state, created_at, updated_at)
+             VALUES (
+                 'web-account', 'web@example.com', 'Web Account', '#0ea5e9', 'imap',
+                 X'0102030405',
+                 '{\"credentials\":\"aabbccdd\",\"provider\":\"imap\",\"legacy_cursor\":\"uid-42\"}',
+                 1, 2
+             );
+             INSERT INTO folders
+                 (id, account_id, remote_id, name, folder_type, role, is_system, sort_order)
+             VALUES ('web-folder', 'web-account', 'INBOX', 'Inbox', 'folder', 'inbox', 1, 0);
+             INSERT INTO messages
+                 (id, account_id, remote_id, subject, body_text, body_html_raw, date, created_at, updated_at)
+             VALUES ('web-message', 'web-account', 'uid-42', 'Legacy mail', 'body', '<p>body</p>', 1, 1, 2);
+             INSERT INTO message_folders (message_id, folder_id)
+             VALUES ('web-message', 'web-folder');
+             INSERT INTO attachments (id, message_id, filename, mime_type, size, local_path)
+             VALUES ('web-attachment', 'web-message', 'legacy.txt', 'text/plain', 4, 'attachments/legacy.txt');
+             INSERT INTO labels (id, name, color, is_system, account_id)
+             VALUES ('web-label', 'Follow up', '#123456', 0, 'web-account');
+             INSERT INTO message_labels (message_id, label_id)
+             VALUES ('web-message', 'web-label');
+             INSERT INTO pending_mail_ops
+                 (id, account_id, message_id, op_type, payload_json, status, created_at, updated_at, next_retry_at)
+             VALUES ('web-op', 'web-account', 'web-message', 'mark_read', '{}', 'pending', 1, 2, 3);
+             INSERT INTO secure_user_data (key, value, updated_at)
+             VALUES ('kanban_context_notes', '{\"web-message\":\"keep\"}', 2);
+             PRAGMA user_version=12;",
+        )
+        .unwrap();
+
+        run_migrations(&conn).unwrap();
+
+        let preserved_account: (String, Vec<u8>, String) = conn
+            .query_row(
+                "SELECT email, auth_data, sync_state FROM accounts WHERE id='web-account'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(preserved_account.0, "web@example.com");
+        assert_eq!(preserved_account.1, [1, 2, 3, 4, 5]);
+        let sync_state: serde_json::Value = serde_json::from_str(&preserved_account.2).unwrap();
+        assert_eq!(sync_state["credentials"], "aabbccdd");
+        assert_eq!(sync_state["legacy_cursor"], "uid-42");
+
+        let relationships: (i64, i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM message_folders WHERE message_id='web-message'),
+                    (SELECT COUNT(*) FROM attachments WHERE message_id='web-message'),
+                    (SELECT COUNT(*) FROM message_labels WHERE message_id='web-message'),
+                    (SELECT COUNT(*) FROM pending_mail_ops WHERE id='web-op' AND status='pending'),
+                    (SELECT COUNT(*) FROM labels WHERE id='web-label' AND account_id='web-account')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(relationships, (1, 1, 1, 1, 1));
+        let notes: String = conn
+            .query_row(
+                "SELECT value FROM secure_user_data WHERE key='kanban_context_notes'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(notes, r#"{"web-message":"keep"}"#);
+
+        conn.execute(
+            "INSERT INTO accounts (id, email, provider, created_at, updated_at)
+             VALUES ('pop-account', 'pop@example.com', 'pop3', 3, 3)",
+            [],
+        )
+        .expect("the appended Web V13 provider migration should allow POP3");
+        assert!(conn
+            .query_row("PRAGMA foreign_key_check", [], |_| Ok(()))
+            .optional()
+            .unwrap()
+            .is_none());
+
+        run_migrations(&conn).unwrap();
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+        let counts: (i64, i64) = conn
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM messages WHERE id='web-message'),
+                    (SELECT COUNT(*) FROM accounts WHERE id='pop-account')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (1, 1));
+        assert!(conn
+            .query_row("PRAGMA foreign_key_check", [], |_| Ok(()))
+            .optional()
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn migration_v13_fk_violation_rolls_back_version_and_restores_enforcement() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "PRAGMA foreign_keys=OFF;
@@ -1981,7 +2119,7 @@ mod tests {
                  (id, email, display_name, provider, created_at, updated_at)
              VALUES ('account-1', 'one@example.com', 'One', 'imap', 1, 1);
              INSERT INTO folders (id, account_id) VALUES ('orphan', 'missing-account');
-             PRAGMA user_version = 11;",
+             PRAGMA user_version = 12;",
         )
         .unwrap();
 
@@ -1990,7 +2128,7 @@ mod tests {
         let version: u32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 11, "failed FK validation must roll V12 back");
+        assert_eq!(version, 12, "failed FK validation must roll V13 back");
         let foreign_keys: i64 = conn
             .pragma_query_value(None, "foreign_keys", |row| row.get(0))
             .unwrap();

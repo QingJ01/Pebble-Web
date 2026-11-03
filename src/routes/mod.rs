@@ -42,7 +42,10 @@ pub fn build_router(state: AppStateRef, static_dir: &str) -> Router {
     let protected_routes = Router::new()
         .route("/api/v1/commands/{command}", post(commands::invoke))
         .route("/api/v1/oauth/{provider}/start", post(oauth::start))
-        .route("/api/v1/oauth/{provider}/status/{flow_id}", get(oauth::status))
+        .route(
+            "/api/v1/oauth/{provider}/status/{flow_id}",
+            get(oauth::status),
+        )
         // Accounts
         .route("/api/v1/accounts", get(accounts::list_accounts))
         .route("/api/v1/accounts", post(accounts::create_account))
@@ -282,6 +285,7 @@ mod tests {
             password_hash: "test-password-hash".to_string(),
             jwt_secret: "test-jwt-secret-with-at-least-32-chars".to_string(),
             sync_interval_secs: 300,
+            realtime_preference: "balanced".to_string(),
         })
         .unwrap();
 

@@ -186,14 +186,14 @@ mod tests {
     #[test]
     #[ignore] // Requires OS credential store access
     fn test_crypto_service_init() {
-        let service = CryptoService::init();
+        let service = CryptoService::init(None);
         assert!(service.is_ok());
     }
 
     #[test]
     #[ignore] // Requires OS credential store access
     fn test_crypto_service_round_trip() {
-        let service = CryptoService::init().unwrap();
+        let service = CryptoService::init(None).unwrap();
         let plaintext = b"test credentials json";
         let encrypted = service.encrypt(plaintext).unwrap();
         let decrypted = service.decrypt(&encrypted).unwrap();

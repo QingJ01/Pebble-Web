@@ -110,11 +110,7 @@ impl OAuthManager {
         }
     }
 
-    pub fn new_web(
-        config: OAuthConfig,
-        network: OAuthNetworkConfig,
-        redirect_url: String,
-    ) -> Self {
+    pub fn new_web(config: OAuthConfig, network: OAuthNetworkConfig, redirect_url: String) -> Self {
         Self {
             config,
             network,
@@ -128,10 +124,11 @@ impl OAuthManager {
             .map_err(|e| OAuthError::Config(format!("Invalid auth URL: {}", e)))?;
         let token_url = TokenUrl::new(self.config.token_url.clone())
             .map_err(|e| OAuthError::Config(format!("Invalid token URL: {}", e)))?;
-        let redirect_url = RedirectUrl::new(self.redirect_url.clone().unwrap_or_else(|| {
-            format!("http://127.0.0.1:{}/callback", self.config.redirect_port)
-        }))
-        .map_err(|e| OAuthError::Config(format!("Invalid redirect URL: {}", e)))?;
+        let redirect_url =
+            RedirectUrl::new(self.redirect_url.clone().unwrap_or_else(|| {
+                format!("http://127.0.0.1:{}/callback", self.config.redirect_port)
+            }))
+            .map_err(|e| OAuthError::Config(format!("Invalid redirect URL: {}", e)))?;
         Ok(ParsedUrls {
             auth_url,
             token_url,

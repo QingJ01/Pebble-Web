@@ -2,9 +2,9 @@ use crate::credentials::{decrypt_credentials, AccountCredentials};
 use crate::error::ApiError;
 use crate::state::AppStateRef;
 use axum::{extract::State, Json};
-use pebble_core::new_id;
-use pebble_mail::{ConnectionSecurity, SmtpConfig};
+use pebble_core::{new_id, EmailAddress};
 use pebble_mail::smtp::SmtpSender;
+use pebble_mail::{ConnectionSecurity, SmtpConfig};
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
@@ -27,12 +27,15 @@ pub async fn send_email(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // Validate attachment paths are within attachments_dir
     if let Some(ref paths) = body.attachment_paths {
-        let allowed_dir = state.attachments_dir.canonicalize().unwrap_or_else(|_| state.attachments_dir.clone());
+        let allowed_dir = state
+            .attachments_dir
+            .canonicalize()
+            .unwrap_or_else(|_| state.attachments_dir.clone());
         for path in paths {
             let p = std::path::Path::new(path);
-            let canonical = p.canonicalize().map_err(|_| {
-                ApiError::BadRequest(format!("Attachment not found: {path}"))
-            })?;
+            let canonical = p
+                .canonicalize()
+                .map_err(|_| ApiError::BadRequest(format!("Attachment not found: {path}")))?;
             if !canonical.starts_with(&allowed_dir) {
                 return Err(ApiError::BadRequest(
                     "Attachment path outside allowed directory".to_string(),
@@ -72,18 +75,40 @@ pub async fn send_email(
         .map_err(|e| ApiError::Internal(format!("Failed to decrypt credentials: {e}")))?;
 
     let smtp_config = match &creds {
-        AccountCredentials::Imap { smtp, .. } => SmtpConfig {
-            host: smtp.host.clone(),
-            port: smtp.port,
-            username: smtp.username.clone(),
-            password: smtp.password.clone(),
-            security: match smtp.security.as_str() {
+        AccountCredentials::Imap { smtp, .. } | AccountCredentials::Pop3 { smtp, .. } => {
+            if smtp.security == "plain" && !smtp.allow_plaintext {
+                return Err(ApiError::BadRequest(
+                    "Plaintext SMTP requires explicit consent".into(),
+                ));
+            }
+            let security = match smtp.security.as_str() {
                 "starttls" => ConnectionSecurity::StartTls,
                 "plain" => ConnectionSecurity::Plain,
-                _ => ConnectionSecurity::Tls,
-            },
-            proxy: None,
-        },
+                "tls" => ConnectionSecurity::Tls,
+                _ => {
+                    return Err(ApiError::BadRequest(
+                        "Unsupported SMTP security mode".into(),
+                    ))
+                }
+            };
+            let global_proxy = crate::sync::load_global_proxy(&state.store, &state.crypto)
+                .map_err(|error| ApiError::Internal(error))?;
+            let proxy = crate::sync::resolve_proxy(&sync_state, global_proxy.as_ref())
+                .map_err(ApiError::BadRequest)?
+                .map(|proxy| pebble_mail::ProxyConfig {
+                    host: proxy.host,
+                    port: proxy.port,
+                });
+            SmtpConfig {
+                host: smtp.host.clone(),
+                port: smtp.port,
+                username: smtp.username.clone(),
+                password: smtp.password.clone(),
+                security,
+                accept_invalid_certs: smtp.accept_invalid_certs,
+                proxy,
+            }
+        }
     };
 
     let sender = SmtpSender::new(
@@ -92,8 +117,13 @@ pub async fn send_email(
         smtp_config.username,
         smtp_config.password,
         smtp_config.security,
+        smtp_config.accept_invalid_certs,
         smtp_config.proxy,
     );
+    let from = EmailAddress {
+        name: None,
+        address: email,
+    };
 
     let cc = body.cc.unwrap_or_default();
     let bcc = body.bcc.unwrap_or_default();
@@ -101,7 +131,7 @@ pub async fn send_email(
 
     sender
         .send(
-            &email,
+            &from,
             &body.to,
             &cc,
             &bcc,
@@ -144,7 +174,10 @@ pub async fn stage_attachment(
         .await
         .map_err(|e| ApiError::Internal(format!("Failed to create staging dir: {e}")))?;
 
-    let safe_filename = body.filename.replace(['/', '\\', ':'], "_").replace("..", "_");
+    let safe_filename = body
+        .filename
+        .replace(['/', '\\', ':'], "_")
+        .replace("..", "_");
     let unique_name = format!("{}_{}", new_id(), safe_filename);
     let file_path = staging_dir.join(&unique_name);
 

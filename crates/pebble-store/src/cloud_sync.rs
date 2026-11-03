@@ -14,6 +14,7 @@ pub const MAX_BACKUP_SIZE_BYTES: usize = 16 * 1024 * 1024;
 /// Highest backup schema version this build understands.
 pub const BACKUP_SCHEMA_VERSION: u32 = 3;
 pub const SETTINGS_BACKUP_FILENAME: &str = "pebble-settings-backup.json";
+pub const KANBAN_CONTEXT_NOTES_KEY: &str = "kanban_context_notes";
 
 fn validate_backup_schema(backup: &SettingsBackup) -> Result<()> {
     if backup.version == 0 || backup.version > BACKUP_SCHEMA_VERSION {
@@ -340,6 +341,15 @@ impl Store {
 
         let rules = self.list_rules()?;
         let kanban_cards = self.list_kanban_cards(None)?;
+        let kanban_context_notes = self
+            .get_secure_user_data(KANBAN_CONTEXT_NOTES_KEY)?
+            .map(|bytes| {
+                serde_json::from_slice(&bytes).map_err(|e| {
+                    PebbleError::Storage(format!("Invalid kanban context notes JSON: {e}"))
+                })
+            })
+            .transpose()?
+            .unwrap_or_default();
         let contacts = self.with_read(|conn| {
             let tx = conn.unchecked_transaction()?;
             let contacts = list_all_contacts_for_backup_with_conn(&tx)?;
@@ -358,7 +368,7 @@ impl Store {
             accounts: account_backups,
             rules,
             kanban_cards,
-            kanban_context_notes: HashMap::new(),
+            kanban_context_notes,
             contacts: Some(contacts),
             translate_config,
             secret_summary: None,
@@ -459,6 +469,23 @@ impl Store {
             for card in &backup.kanban_cards {
                 Self::upsert_kanban_card_with_conn(&tx, card)?;
             }
+
+            let notes_json = serde_json::to_vec(&backup.kanban_context_notes).map_err(|e| {
+                PebbleError::Storage(format!("Failed to serialize kanban context notes: {e}"))
+            })?;
+            tx.execute(
+                "INSERT INTO secure_user_data (key, value, updated_at)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(key) DO UPDATE SET
+                     value = excluded.value,
+                     updated_at = excluded.updated_at",
+                rusqlite::params![
+                    KANBAN_CONTEXT_NOTES_KEY,
+                    notes_json,
+                    pebble_core::now_timestamp()
+                ],
+            )
+            .map_err(|e| PebbleError::Storage(e.to_string()))?;
 
             // Contacts were added in schema v2. A v1 restore must preserve
             // local contacts because the older file could not contain them.
@@ -569,6 +596,23 @@ impl Store {
             for card in &backup.kanban_cards {
                 Self::upsert_kanban_card_with_conn(&tx, card)?;
             }
+
+            let notes_json = serde_json::to_vec(&backup.kanban_context_notes).map_err(|e| {
+                PebbleError::Storage(format!("Failed to serialize kanban context notes: {e}"))
+            })?;
+            tx.execute(
+                "INSERT INTO secure_user_data (key, value, updated_at)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(key) DO UPDATE SET
+                     value = excluded.value,
+                     updated_at = excluded.updated_at",
+                rusqlite::params![
+                    KANBAN_CONTEXT_NOTES_KEY,
+                    notes_json,
+                    pebble_core::now_timestamp()
+                ],
+            )
+            .map_err(|e| PebbleError::Storage(e.to_string()))?;
 
             if backup.version >= 2 {
                 if let Some(contacts) = &backup.contacts {
@@ -1107,6 +1151,40 @@ mod tests {
 
         let accounts = store.list_accounts().unwrap();
         assert_eq!(accounts.len(), 1);
+    }
+
+    #[test]
+    fn legacy_web_backup_round_trips_kanban_context_notes() {
+        let store = Store::open_in_memory().unwrap();
+        let legacy_backup = serde_json::json!({
+            "version": 1,
+            "exported_at": now_timestamp(),
+            "accounts": [],
+            "rules": [],
+            "kanban_cards": [],
+            "kanban_context_notes": {
+                "message-1": "follow up",
+                "message-2": "waiting for reply"
+            },
+            "translate_config": null
+        });
+        let legacy_bytes = serde_json::to_vec(&legacy_backup).unwrap();
+
+        store.import_settings(&legacy_bytes).unwrap();
+        let restored: HashMap<String, String> = serde_json::from_slice(
+            &store
+                .get_secure_user_data(KANBAN_CONTEXT_NOTES_KEY)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(restored["message-1"], "follow up");
+        assert_eq!(restored["message-2"], "waiting for reply");
+
+        let current_backup: SettingsBackup =
+            serde_json::from_slice(&store.export_settings().unwrap()).unwrap();
+        assert_eq!(current_backup.kanban_context_notes, restored);
+        assert!(current_backup.contacts.is_some());
     }
 
     #[test]

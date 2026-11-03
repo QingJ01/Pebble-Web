@@ -82,8 +82,8 @@ pub async fn download_attachment(
         .await
         .map_err(|e| ApiError::Internal(format!("Failed to get attachment: {e}")))?;
 
-    let attachment = attachment
-        .ok_or_else(|| ApiError::BadRequest("Attachment not found".to_string()))?;
+    let attachment =
+        attachment.ok_or_else(|| ApiError::BadRequest("Attachment not found".to_string()))?;
 
     let file_path = match &attachment.local_path {
         Some(path) => std::path::PathBuf::from(path),
@@ -101,10 +101,12 @@ pub async fn download_attachment(
     };
 
     // Validate resolved path is within the allowed attachments directory
-    let allowed_dir = attachments_dir.canonicalize().unwrap_or_else(|_| attachments_dir.clone());
-    let canonical_path = file_path.canonicalize().map_err(|_| {
-        ApiError::NotFound("Attachment file not found".to_string())
-    })?;
+    let allowed_dir = attachments_dir
+        .canonicalize()
+        .unwrap_or_else(|_| attachments_dir.clone());
+    let canonical_path = file_path
+        .canonicalize()
+        .map_err(|_| ApiError::NotFound("Attachment file not found".to_string()))?;
     if !canonical_path.starts_with(&allowed_dir) {
         return Err(ApiError::BadRequest(
             "Attachment path outside allowed directory".to_string(),

@@ -10,9 +10,11 @@ use tokio::sync::{broadcast, Mutex};
 
 pub struct OAuthFlowRecord {
     pub provider: String,
+    pub owner_token_digest: String,
     pub state: String,
     pub verifier: String,
     pub expires_at: i64,
+    pub account_id: Option<String>,
     pub account_label: Option<String>,
     pub display_name_hint: Option<String>,
     pub sync_range_days: Option<u32>,
@@ -34,6 +36,7 @@ pub struct AppState {
     pub sync_manager: Arc<SyncManager>,
     pub ws_broadcast: broadcast::Sender<String>,
     pub oauth_flows: Mutex<HashMap<String, OAuthFlowRecord>>,
+    pub oauth_refresh_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
 impl AppState {
@@ -43,8 +46,8 @@ impl AppState {
         std::fs::create_dir_all(config.attachments_dir())
             .map_err(|e| format!("Failed to create attachments dir: {e}"))?;
 
-        let store = Store::open(&config.db_path())
-            .map_err(|e| format!("Failed to open store: {e}"))?;
+        let store =
+            Store::open(&config.db_path()).map_err(|e| format!("Failed to open store: {e}"))?;
 
         let search = TantivySearch::open(&config.index_dir())
             .map_err(|e| format!("Failed to open search index: {e}"))?;
@@ -57,26 +60,54 @@ impl AppState {
 
         let store = Arc::new(store);
         let crypto = Arc::new(crypto);
+        let search = Arc::new(search);
 
         let (ws_broadcast, _) = broadcast::channel(100);
+        let oauth_refresh_locks = Arc::new(Mutex::new(HashMap::new()));
 
+        let mut realtime_preference = config.realtime_preference.clone();
+        if let Some(ciphertext) = store
+            .get_secure_user_data("realtime_preference")
+            .map_err(|error| format!("Failed to load realtime preference: {error}"))?
+        {
+            let plaintext = crypto
+                .decrypt_for("secure_user_data.value", "realtime_preference", &ciphertext)
+                .or_else(|_| crypto.decrypt(&ciphertext))
+                .map_err(|error| format!("Failed to decrypt realtime preference: {error}"))?;
+            realtime_preference = serde_json::from_slice::<String>(&plaintext)
+                .map_err(|error| format!("Invalid realtime preference: {error}"))?;
+        } else {
+            let plaintext = serde_json::to_vec(&realtime_preference)
+                .map_err(|error| format!("Failed to serialize realtime preference: {error}"))?;
+            let ciphertext = crypto
+                .encrypt_for("secure_user_data.value", "realtime_preference", &plaintext)
+                .map_err(|error| format!("Failed to encrypt realtime preference: {error}"))?;
+            store
+                .set_secure_user_data("realtime_preference", &ciphertext)
+                .map_err(|error| format!("Failed to persist realtime preference: {error}"))?;
+        }
+        let interval = crate::config::realtime_poll_interval(&realtime_preference)
+            .ok_or_else(|| "Invalid persisted realtime preference".to_string())?;
         let sync_manager = Arc::new(SyncManager::new(
             store.clone(),
             crypto.clone(),
+            search.clone(),
+            oauth_refresh_locks.clone(),
             attachments_dir.clone(),
-            config.sync_interval_secs,
+            interval,
             ws_broadcast.clone(),
         ));
 
         Ok(Self {
             config,
             store,
-            search: Arc::new(search),
+            search,
             crypto,
             attachments_dir,
             sync_manager,
             ws_broadcast,
             oauth_flows: Mutex::new(HashMap::new()),
+            oauth_refresh_locks,
         })
     }
 }

@@ -8,6 +8,10 @@ pub struct ImapCredentials {
     pub username: String,
     pub password: String,
     pub security: String,
+    #[serde(default)]
+    pub accept_invalid_certs: bool,
+    #[serde(default)]
+    pub allow_plaintext: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -17,6 +21,28 @@ pub struct SmtpCredentials {
     pub username: String,
     pub password: String,
     pub security: String,
+    #[serde(default)]
+    pub accept_invalid_certs: bool,
+    #[serde(default)]
+    pub allow_plaintext: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Pop3Credentials {
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub password: String,
+    #[serde(default = "default_security")]
+    pub security: String,
+    #[serde(default)]
+    pub accept_invalid_certs: bool,
+    #[serde(default)]
+    pub allow_plaintext: bool,
+}
+
+fn default_security() -> String {
+    "tls".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,6 +51,11 @@ pub enum AccountCredentials {
     #[serde(rename = "imap")]
     Imap {
         imap: ImapCredentials,
+        smtp: SmtpCredentials,
+    },
+    #[serde(rename = "pop3")]
+    Pop3 {
+        pop3: Pop3Credentials,
         smtp: SmtpCredentials,
     },
 }
