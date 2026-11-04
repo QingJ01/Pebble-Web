@@ -792,6 +792,40 @@ impl Store {
         })
     }
 
+    /// Move a message to a folder and record the remote ID that folder
+    /// assigned, in one transaction so per-folder UID uniqueness is checked
+    /// against the destination rather than the old folder.
+    pub fn move_message_to_folder_with_remote_id(
+        &self,
+        message_id: &str,
+        target_folder_id: &str,
+        new_remote_id: &str,
+    ) -> Result<()> {
+        self.with_write(|conn| {
+            let now = pebble_core::now_timestamp();
+            let tx = conn.unchecked_transaction()?;
+            tx.execute(
+                "DELETE FROM message_folders WHERE message_id = ?1",
+                params![message_id],
+            )?;
+            let changed = tx.execute(
+                "UPDATE messages SET remote_id = ?1, is_deleted = 0, deleted_at = NULL, updated_at = ?2 WHERE id = ?3",
+                params![new_remote_id, now, message_id],
+            )?;
+            if changed == 0 {
+                return Err(PebbleError::Internal(format!(
+                    "Message not found for remote_id update: {message_id}"
+                )));
+            }
+            tx.execute(
+                "INSERT INTO message_folders (message_id, folder_id) VALUES (?1, ?2)",
+                params![message_id, target_folder_id],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
     pub fn update_remote_id(&self, message_id: &str, new_remote_id: &str) -> Result<()> {
         self.with_write(|conn| {
             let now = pebble_core::now_timestamp();
@@ -2053,6 +2087,39 @@ mod remote_id_scope_tests {
 
         assert!(duplicate.is_err());
         assert!(store.get_message(&second.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn moving_with_destination_uid_ignores_collisions_in_the_source_folder() {
+        let store = Store::open_in_memory().unwrap();
+        let account = make_account();
+        let inbox = make_folder(&account.id, "INBOX", FolderRole::Inbox, 0);
+        let archive = make_folder(&account.id, "Archive", FolderRole::Archive, 1);
+        let moved = make_message(&account.id, "5");
+        let inbox_neighbor = make_message(&account.id, "2");
+        store.insert_account(&account).unwrap();
+        store.insert_folder(&inbox).unwrap();
+        store.insert_folder(&archive).unwrap();
+        store
+            .insert_message(&moved, std::slice::from_ref(&inbox.id))
+            .unwrap();
+        store
+            .insert_message(&inbox_neighbor, std::slice::from_ref(&inbox.id))
+            .unwrap();
+
+        assert!(store.update_remote_id(&moved.id, "2").is_err());
+        store
+            .move_message_to_folder_with_remote_id(&moved.id, &archive.id, "2")
+            .unwrap();
+
+        assert_eq!(
+            store.get_message(&moved.id).unwrap().unwrap().remote_id,
+            "2"
+        );
+        assert_eq!(
+            store.get_message_folder_ids(&moved.id).unwrap(),
+            vec![archive.id.clone()]
+        );
     }
 
     #[test]

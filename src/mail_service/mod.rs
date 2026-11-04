@@ -43,31 +43,65 @@ pub(crate) async fn imap_move_tracked(
     uid: u32,
     dest_mailbox: &str,
 ) -> Result<(), PebbleError> {
-    let header = state
-        .store
-        .get_message(local_message_id)?
-        .and_then(|message| message.message_id_header);
-    imap.move_message_with_dedup(source_mailbox, uid, dest_mailbox, header.as_deref())
-        .await?;
+    let message = state.store.get_message(local_message_id)?;
+    let header = message
+        .as_ref()
+        .and_then(|message| message.message_id_header.clone())
+        .filter(|header| !header.trim().is_empty());
     let Some(header) = header else {
         tracing::warn!("IMAP message {local_message_id} has no Message-ID; UID not refreshed");
-        return Ok(());
+        return imap
+            .move_message_with_dedup(source_mailbox, uid, dest_mailbox, None)
+            .await;
     };
-    match imap.find_uid_by_message_id(dest_mailbox, &header).await {
-        Ok(Some(new_uid)) => {
-            if let Err(error) = state
-                .store
-                .update_remote_id(local_message_id, &new_uid.to_string())
-            {
-                tracing::warn!("Failed to store moved IMAP UID for {local_message_id}: {error}");
-            }
+
+    // A UID is only valid in the mailbox that assigned it; resolve the
+    // current one so a stale UID cannot silently move nothing.
+    let source_uid = match imap.find_uid_by_message_id(source_mailbox, &header).await? {
+        Some(current) => current,
+        None => {
+            return Err(PebbleError::Network(format!(
+                "Message {local_message_id} was not found in remote folder {source_mailbox}"
+            )))
         }
+    };
+    imap.move_message_with_dedup(source_mailbox, source_uid, dest_mailbox, Some(&header))
+        .await?;
+    if source_uid != uid {
+        tracing::info!("IMAP UID for {local_message_id} resolved from {uid} to {source_uid}");
+    }
+
+    let new_uid = match imap.find_uid_by_message_id(dest_mailbox, &header).await {
+        Ok(Some(new_uid)) => new_uid,
         Ok(None) => {
-            tracing::warn!("Moved IMAP message {local_message_id} was not found in {dest_mailbox}")
+            tracing::warn!("Moved IMAP message {local_message_id} was not found in {dest_mailbox}");
+            return Ok(());
         }
         Err(error) => {
-            tracing::warn!("Failed to look up moved IMAP UID for {local_message_id}: {error}")
+            tracing::warn!("Failed to look up moved IMAP UID for {local_message_id}: {error}");
+            return Ok(());
         }
+    };
+    let account_id = message
+        .map(|message| message.account_id)
+        .unwrap_or_default();
+    let dest_folder = state
+        .store
+        .list_folders(&account_id)?
+        .into_iter()
+        .find(|folder| folder.remote_id == dest_mailbox);
+    let stored = match dest_folder {
+        Some(folder) => state.store.move_message_to_folder_with_remote_id(
+            local_message_id,
+            &folder.id,
+            &new_uid.to_string(),
+        ),
+        None => state
+            .store
+            .update_remote_id(local_message_id, &new_uid.to_string()),
+    };
+    if let Err(error) = stored {
+        tracing::warn!("Failed to store moved IMAP UID for {local_message_id}: {error}");
     }
     Ok(())
 }
