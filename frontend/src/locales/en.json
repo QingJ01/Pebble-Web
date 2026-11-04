@@ -837,6 +837,11 @@
     "showLess": "Show less"
   },
   "web": {
+    "plaintextConsentRequired": "Explicitly allow unencrypted connections before selecting None.",
+    "plaintextPolicy": "Unencrypted connections",
+    "requireEncryption": "Require encryption",
+    "transportPolicyNote": "These settings apply to the server. Keeping current settings preserves any previously allowed security exceptions.",
+    "transportWarning": "Security exceptions can expose your password and email. Use only with a server and network you trust.",
     "serverSync": "This setting controls the server, even when all browser tabs are closed. Manual mode only syncs when you request it.",
     "syncMode": {
       "realtime": "Realtime (IDLE / frequent polling)",

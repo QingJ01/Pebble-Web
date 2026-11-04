@@ -30,6 +30,7 @@ describe("authenticated WebSocket lifecycle", () => {
     wsClient.connect();
     expect(Socket.instances).toHaveLength(1);
     const socket = Socket.instances[0];
+    expect(() => { socket.message(null); socket.message([]); socket.message("invalid"); }).not.toThrow();
     expect(socket.url).not.toContain("test-session-token");
     socket.onopen?.();
     expect(socket.send).toHaveBeenCalledWith("test-session-token");

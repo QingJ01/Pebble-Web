@@ -421,6 +421,7 @@ function EditAccountModal({ account, initialColor, onClose, onSaved }: {
   const [imapSecurity, setImapSecurity] = useState<ConnectionSecurity | "">("");
   const [smtpSecurity, setSmtpSecurity] = useState<ConnectionSecurity | "">("");
   const [acceptInvalidCerts, setAcceptInvalidCerts] = useState<"" | "false" | "true">("");
+  const [allowPlaintext, setAllowPlaintext] = useState<"" | "false" | "true">("");
   const [oauthProxyMode, setOauthProxyMode] = useState<AccountProxyMode>("inherit");
   const [proxyHost, setProxyHost] = useState("");
   const [proxyPort, setProxyPort] = useState("");
@@ -550,6 +551,10 @@ function EditAccountModal({ account, initialColor, onClose, onSaved }: {
     e.preventDefault();
     const days = isPop3 ? null : syncRangeDays(syncRange);
     if (rangeLoading || rangeError || days === undefined) return;
+    if (!isOAuth && (imapSecurity === "plain" || smtpSecurity === "plain") && allowPlaintext !== "true") {
+      setError(t("web.plaintextConsentRequired", "Explicitly allow unencrypted connections before selecting None."));
+      return;
+    }
     setLoading(true);
     setError(null);
     try {
@@ -602,6 +607,9 @@ function EditAccountModal({ account, initialColor, onClose, onSaved }: {
           proxyPort ? parseInt(proxyPort, 10) : undefined,
           accountColor,
           accountLabelValue,
+          imapSecurity && smtpSecurity && imapSecurity !== "plain" && smtpSecurity !== "plain"
+            ? false
+            : allowPlaintext === "" ? undefined : allowPlaintext === "true",
         );
       }
 
@@ -876,6 +884,26 @@ function EditAccountModal({ account, initialColor, onClose, onSaved }: {
                     <option value="true">{t("accountSetup.acceptInvalidCerts", "Allow invalid TLS certificates")}</option>
                   </select>
                 </div>
+
+                <div style={fieldStyle}>
+                  <label htmlFor="accountsetup-plaintext-policy" style={labelStyle}>
+                    {t("web.plaintextPolicy", "Unencrypted connections")}
+                  </label>
+                  <select id="accountsetup-plaintext-policy" value={allowPlaintext}
+                    onChange={(e) => setAllowPlaintext(e.target.value as "" | "false" | "true")} style={inputStyle}>
+                    <option value="">{t("settings.leaveEmptyKeep", "keep current")}</option>
+                    <option value="false">{t("web.requireEncryption", "Require encryption")}</option>
+                    <option value="true">{t("accountSetup.allowPlaintext", "Allow unencrypted connection (insecure — your password is sent in cleartext)")}</option>
+                  </select>
+                  <span style={{ color: "var(--color-text-secondary)", fontSize: "12px" }}>
+                    {t("web.transportPolicyNote", "These settings apply to the server. Keeping current settings preserves any previously allowed security exceptions.")}
+                  </span>
+                </div>
+                {(acceptInvalidCerts === "true" || allowPlaintext === "true" || imapSecurity === "plain" || smtpSecurity === "plain") && (
+                  <div role="note" style={{ color: "var(--color-warning, #b45309)", fontSize: "12px" }}>
+                    {t("web.transportWarning", "Security exceptions can expose your password and email. Use only with a server and network you trust.")}
+                  </div>
+                )}
 
               </>
             )}

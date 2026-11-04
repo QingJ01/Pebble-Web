@@ -21,8 +21,10 @@ class WebSocketClient {
     socket.onopen = () => socket.send(token);
     socket.onmessage = (event) => {
       if (this.ws !== socket) return;
-      let message: WebEvent;
-      try { message = JSON.parse(event.data); } catch { return; }
+      let parsed: unknown;
+      try { parsed = JSON.parse(event.data); } catch { return; }
+      if (!parsed || typeof parsed !== "object" || !("type" in parsed) || typeof parsed.type !== "string") return;
+      const message = parsed as WebEvent;
       if (!authenticated) {
         if (message.type === "authenticated") {
           authenticated = true;

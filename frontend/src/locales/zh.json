@@ -837,6 +837,11 @@
     "showLess": "收起"
   },
   "web": {
+    "plaintextConsentRequired": "选择不加密连接前，请明确允许使用明文连接。",
+    "plaintextPolicy": "明文连接",
+    "requireEncryption": "必须使用加密连接",
+    "transportPolicyNote": "这些设置作用于服务器。保持当前设置会保留此前允许的安全例外。",
+    "transportWarning": "安全例外可能泄露密码及邮件，请仅在可信的服务器与网络上使用。",
     "serverSync": "此设置控制服务器，即使所有浏览器标签页关闭也会生效。手动模式仅在你主动请求时同步。",
     "syncMode": {
       "realtime": "实时（IDLE / 高频轮询）",

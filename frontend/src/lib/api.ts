@@ -256,11 +256,12 @@ export async function updateAccount(
   proxyPort?: number,
   accountColor?: string,
   accountLabel?: string,
+  allowPlaintext?: boolean,
 ): Promise<void> {
   return invoke<void>("update_account", {
     accountId, email, displayName, password,
     imapHost, imapPort, smtpHost, smtpPort, imapSecurity, smtpSecurity,
-    acceptInvalidCerts, proxyHost, proxyPort, accountColor, accountLabel,
+    acceptInvalidCerts, proxyHost, proxyPort, accountColor, accountLabel, allowPlaintext,
   });
 }
 

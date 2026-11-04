@@ -171,6 +171,21 @@ describe("AccountsTab IMAP folder selection", () => {
     expect(updateAccountSyncRange).not.toHaveBeenCalled();
   });
 
+  it("requires distinct plaintext consent when changing transport to None", async () => {
+    render(<AccountsTab />);
+    fireEvent.click(screen.getByRole("button", { name: "Edit account" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "common.save" })).not.toBeDisabled());
+    fireEvent.change(screen.getAllByLabelText("Security")[0], { target: { value: "plain" } });
+    fireEvent.change(screen.getByLabelText("TLS certificate verification"), { target: { value: "true" } });
+    fireEvent.click(screen.getByRole("button", { name: "common.save" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Explicitly allow unencrypted");
+    expect(updateAccount).not.toHaveBeenCalled();
+    fireEvent.change(screen.getByLabelText("Unencrypted connections"), { target: { value: "true" } });
+    fireEvent.click(screen.getByRole("button", { name: "common.save" }));
+    await waitFor(() => expect(updateAccount).toHaveBeenCalled());
+    expect(vi.mocked(updateAccount).mock.calls[0][15]).toBe(true);
+  });
+
   it("shows a save failure without closing the editor", async () => {
     vi.mocked(updateAccountSyncRange).mockRejectedValueOnce(new Error("Sync restart failed"));
     render(<AccountsTab />);

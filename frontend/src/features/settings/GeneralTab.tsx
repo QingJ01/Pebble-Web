@@ -1,10 +1,10 @@
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { setRealtimePreference, showTestNotification } from "@/lib/api";
-import { invoke } from "@/lib/web-commands";
+import { reloadServerPreference } from "@/lib/server-preferences";
 import { requestBrowserNotifications } from "@/lib/browser-notifications";
 import { useToastStore } from "@/stores/toast.store";
-import { useUIStore, realtimePreferenceToPollInterval, type RealtimePreference } from "@/stores/ui.store";
+import { useUIStore, type RealtimePreference } from "@/stores/ui.store";
 
 const MODES: RealtimePreference[] = ["realtime", "balanced", "battery", "manual"];
 
@@ -23,14 +23,12 @@ export default function GeneralTab() {
     setSaving(true);
     try {
       await setRealtimePreference(next);
-      useUIStore.getState().setRealtimeMode(next);
+      await reloadServerPreference();
     } catch (error) { report(error); } finally { setSaving(false); }
   }
   async function reloadPreference() {
     try {
-      const next = await invoke<RealtimePreference>("get_realtime_preference");
-      if (!MODES.includes(next)) throw new Error(t("web.invalidPreference", "Invalid server preference."));
-      useUIStore.setState({ realtimeMode: next, pollInterval: realtimePreferenceToPollInterval(next), serverPreferencesReady: true });
+      await reloadServerPreference();
     } catch (error) { report(error); }
   }
   async function toggleNotifications() {

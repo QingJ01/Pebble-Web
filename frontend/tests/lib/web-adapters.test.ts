@@ -3,7 +3,7 @@ import http from "@/api-client";
 import { invoke } from "@/lib/web-commands";
 import { completeWebOAuth } from "@/lib/web-oauth";
 import { backgroundImageUrl, importBackgroundImage } from "@/lib/backgroundImage";
-import { downloadAttachment } from "@/lib/api";
+import { downloadAttachment, updateAccount } from "@/lib/api";
 
 vi.mock("@/api-client", () => ({ default: { post: vi.fn(), get: vi.fn() } }));
 
@@ -20,6 +20,15 @@ describe("authenticated browser adapters", () => {
   it("surfaces backend validation failures rather than success-shaped defaults", async () => {
     vi.mocked(http.post).mockRejectedValue({ response: { data: { error: "POP3 does not support a bounded range" } } });
     await expect(invoke("update_account_sync_range", { days: 30 })).rejects.toThrow("POP3");
+  });
+
+  it("forwards explicit plaintext consent separately from certificate exceptions", async () => {
+    vi.mocked(http.post).mockResolvedValue({ data: null });
+    await updateAccount("account", "me@example.com", "Me", undefined, undefined, undefined,
+      undefined, undefined, "plain", "tls", false, undefined, undefined, undefined, undefined, true);
+    expect(http.post).toHaveBeenCalledWith("/commands/update_account", expect.objectContaining({
+      accountId: "account", imapSecurity: "plain", acceptInvalidCerts: false, allowPlaintext: true,
+    }));
   });
 
   it("fails before starting OAuth when the popup is blocked", async () => {
