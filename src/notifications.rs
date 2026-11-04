@@ -19,6 +19,12 @@ use tracing::warn;
 const DEFAULT_TIMEOUT_SECS: u64 = 10;
 const DEFAULT_GOTIFY_PRIORITY: i32 = 5;
 const MAX_CONCURRENT_DELIVERIES: usize = 4;
+const DISCORD_CONTENT_MAX: usize = 2000;
+const DISCORD_EMBED_TITLE_MAX: usize = 256;
+const DISCORD_EMBED_DESCRIPTION_MAX: usize = 4096;
+const DISCORD_FIELD_VALUE_MAX: usize = 1024;
+const SLACK_SECTION_TEXT_MAX: usize = 3000;
+const PROVIDER_ERROR_MAX: usize = 200;
 const CONFIG_PURPOSE: &str = "webhook_config";
 
 type HmacSha256 = Hmac<Sha256>;
@@ -226,11 +232,13 @@ async fn send_slack(
     config: &WebhookConfig,
     message: &NotificationMessage,
 ) -> Result<(), String> {
+    let title = slack_escape(&message.title);
+    let body = slack_escape(&message.body);
     send_json(client.post(require_non_empty(config.url.as_deref(), "Webhook URL")?), &json!({
-        "text": message.body,
+        "text": body,
         "blocks": [{
             "type": "section",
-            "text": { "type": "mrkdwn", "text": format!("*{}*\n{}", message.title, message.body) }
+            "text": { "type": "mrkdwn", "text": truncate_chars(&format!("*{title}*\n{body}"), SLACK_SECTION_TEXT_MAX) }
         }]
     }))
     .await
@@ -244,13 +252,15 @@ async fn send_discord(
     send_json(
         client.post(require_non_empty(config.url.as_deref(), "Webhook URL")?),
         &json!({
-            "content": message.title,
+            "content": truncate_chars(&message.title, DISCORD_CONTENT_MAX),
+            // Email content is untrusted: never let it ping users, roles or @everyone.
+            "allowed_mentions": { "parse": [] },
             "embeds": [{
-                "title": message.subject,
-                "description": message.snippet,
+                "title": truncate_chars(&message.subject, DISCORD_EMBED_TITLE_MAX),
+                "description": truncate_chars(&message.snippet, DISCORD_EMBED_DESCRIPTION_MAX),
                 "fields": [
-                    { "name": "From", "value": display_sender(message), "inline": false },
-                    { "name": "Message ID", "value": message.message_id, "inline": false }
+                    { "name": "From", "value": truncate_chars(&display_sender(message), DISCORD_FIELD_VALUE_MAX), "inline": false },
+                    { "name": "Message ID", "value": truncate_chars(&message.message_id, DISCORD_FIELD_VALUE_MAX), "inline": false }
                 ]
             }]
         }),
@@ -295,11 +305,12 @@ async fn send_feishu(
         payload["timestamp"] = Value::String(timestamp.clone());
         payload["sign"] = Value::String(feishu_sign(&timestamp, secret)?);
     }
-    send_json(
+    let body = send_json_with_body(
         client.post(require_non_empty(config.url.as_deref(), "Webhook URL")?),
         &payload,
     )
-    .await
+    .await?;
+    check_app_error(&body, &["code", "StatusCode"], &["msg", "StatusMessage"])
 }
 
 async fn send_dingtalk(
@@ -314,14 +325,15 @@ async fn send_dingtalk(
         let separator = if url.contains('?') { '&' } else { '?' };
         url.push_str(&format!("{separator}timestamp={timestamp}&sign={sign}"));
     }
-    send_json(
+    let body = send_json_with_body(
         client.post(url),
         &json!({
             "msgtype": "markdown",
             "markdown": { "title": message.title, "text": message.body }
         }),
     )
-    .await
+    .await?;
+    check_app_error(&body, &["errcode"], &["errmsg"])
 }
 
 async fn send_wecom(
@@ -329,14 +341,15 @@ async fn send_wecom(
     config: &WebhookConfig,
     message: &NotificationMessage,
 ) -> Result<(), String> {
-    send_json(
+    let body = send_json_with_body(
         client.post(require_non_empty(config.url.as_deref(), "Webhook URL")?),
         &json!({
             "msgtype": "markdown",
             "markdown": { "content": message.body }
         }),
     )
-    .await
+    .await?;
+    check_app_error(&body, &["errcode"], &["errmsg"])
 }
 
 async fn send_ntfy(
@@ -397,6 +410,68 @@ async fn send_request(request: reqwest::RequestBuilder) -> Result<(), String> {
         .await
         .map_err(|e| format!("Webhook request failed: {}", e.without_url()))?;
     ensure_success(response.status()).await
+}
+
+async fn send_json_with_body(
+    request: reqwest::RequestBuilder,
+    payload: &Value,
+) -> Result<String, String> {
+    let response = request
+        .json(payload)
+        .send()
+        .await
+        .map_err(|e| format!("Webhook request failed: {}", e.without_url()))?;
+    ensure_success(response.status()).await?;
+    response
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read webhook response: {}", e.without_url()))
+}
+
+/// Feishu, DingTalk and WeCom report failures (bad signature, keyword, rate limit)
+/// as HTTP 200 with a nonzero application code in the JSON body.
+fn check_app_error(
+    body: &str,
+    code_fields: &[&str],
+    message_fields: &[&str],
+) -> Result<(), String> {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return Ok(());
+    };
+    let Some(code) = code_fields
+        .iter()
+        .find_map(|field| value.get(*field).and_then(Value::as_i64))
+    else {
+        return Ok(());
+    };
+    if code == 0 {
+        return Ok(());
+    }
+    let detail = message_fields
+        .iter()
+        .find_map(|field| value.get(*field).and_then(Value::as_str))
+        .unwrap_or("unknown error");
+    Err(format!(
+        "Webhook rejected the message: code {code}: {}",
+        truncate_chars(detail, PROVIDER_ERROR_MAX)
+    ))
+}
+
+fn truncate_chars(value: &str, max: usize) -> String {
+    if value.chars().count() <= max {
+        return value.to_string();
+    }
+    let mut truncated: String = value.chars().take(max.saturating_sub(1)).collect();
+    truncated.push('…');
+    truncated
+}
+
+/// Escapes Slack control characters so `<!channel>` or `<@U123>` in mail cannot ping.
+fn slack_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 async fn ensure_success(status: StatusCode) -> Result<(), String> {
@@ -653,6 +728,16 @@ mod tests {
         String,
         tokio::sync::mpsc::UnboundedReceiver<(axum::http::HeaderMap, String)>,
     ) {
+        respond_server(status, "").await
+    }
+
+    async fn respond_server(
+        status: axum::http::StatusCode,
+        response_body: &'static str,
+    ) -> (
+        String,
+        tokio::sync::mpsc::UnboundedReceiver<(axum::http::HeaderMap, String)>,
+    ) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let app = axum::Router::new().route(
             "/{*path}",
@@ -660,7 +745,7 @@ mod tests {
                 let tx = tx.clone();
                 async move {
                     let _ = tx.send((headers, body));
-                    status
+                    (status, response_body)
                 }
             }),
         );
@@ -778,5 +863,115 @@ mod tests {
         }
         hit.sort();
         assert_eq!(hit, vec!["global".to_string(), "rule".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn chinese_bot_app_errors_fail_delivery_despite_http_200() {
+        let cases = [
+            (
+                WebhookProvider::Feishu,
+                r#"{"code":19021,"msg":"sign match fail or timestamp is not within one hour from current time","data":{}}"#,
+                "19021",
+            ),
+            (
+                WebhookProvider::Dingtalk,
+                r#"{"errcode":310000,"errmsg":"keywords not in content"}"#,
+                "310000",
+            ),
+            (
+                WebhookProvider::Wecom,
+                r#"{"errcode":93000,"errmsg":"invalid webhook url"}"#,
+                "93000",
+            ),
+        ];
+        for (provider, response, code) in cases {
+            let (base, _rx) = respond_server(axum::http::StatusCode::OK, response).await;
+            let config = WebhookConfig {
+                url: Some(format!("{base}/hook")),
+                ..Default::default()
+            };
+            let error = send_notification(&provider, &config, &NotificationMessage::test())
+                .await
+                .unwrap_err();
+            assert!(error.contains(code), "{provider:?}: {error}");
+        }
+
+        for (provider, response) in [
+            (
+                WebhookProvider::Feishu,
+                r#"{"code":0,"msg":"success","data":{}}"#,
+            ),
+            (
+                WebhookProvider::Feishu,
+                r#"{"StatusCode":0,"StatusMessage":"success"}"#,
+            ),
+            (WebhookProvider::Dingtalk, r#"{"errcode":0,"errmsg":"ok"}"#),
+            (WebhookProvider::Wecom, r#"{"errcode":0,"errmsg":"ok"}"#),
+        ] {
+            let (base, _rx) = respond_server(axum::http::StatusCode::OK, response).await;
+            let config = WebhookConfig {
+                url: Some(format!("{base}/hook")),
+                ..Default::default()
+            };
+            send_notification(&provider, &config, &NotificationMessage::test())
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn discord_payload_disables_mentions_and_respects_length_limits() {
+        let (base, mut rx) = capture_server(axum::http::StatusCode::NO_CONTENT).await;
+        let mut message = sample_message();
+        message.subject = format!("<@123456789012345678> @everyone {}", "x".repeat(400));
+        let config = WebhookConfig {
+            url: Some(format!("{base}/hook")),
+            ..Default::default()
+        };
+        send_notification(
+            &WebhookProvider::Discord,
+            &config,
+            &NotificationMessage::from_message(&message),
+        )
+        .await
+        .unwrap();
+        let (_, body) = rx.recv().await.unwrap();
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["allowed_mentions"], json!({ "parse": [] }));
+        let title = body["embeds"][0]["title"].as_str().unwrap();
+        assert_eq!(title.chars().count(), DISCORD_EMBED_TITLE_MAX);
+        assert!(title.ends_with('…'));
+        assert!(body["content"].as_str().unwrap().chars().count() <= DISCORD_CONTENT_MAX);
+    }
+
+    #[tokio::test]
+    async fn slack_payload_escapes_mentions_from_mail() {
+        let (base, mut rx) = capture_server(axum::http::StatusCode::OK).await;
+        let mut message = sample_message();
+        message.subject = "<!channel> urgent & <@U123>".into();
+        let config = WebhookConfig {
+            url: Some(format!("{base}/hook")),
+            ..Default::default()
+        };
+        send_notification(
+            &WebhookProvider::Slack,
+            &config,
+            &NotificationMessage::from_message(&message),
+        )
+        .await
+        .unwrap();
+        let (_, body) = rx.recv().await.unwrap();
+        assert!(!body.contains("<!channel>"), "{body}");
+        assert!(!body.contains("<@U123>"), "{body}");
+        assert!(
+            body.contains("&lt;!channel&gt; urgent &amp; &lt;@U123&gt;"),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn truncate_chars_handles_multibyte_text() {
+        assert_eq!(truncate_chars("邮件标题", 10), "邮件标题");
+        assert_eq!(truncate_chars("邮件标题很长", 4), "邮件标…");
     }
 }

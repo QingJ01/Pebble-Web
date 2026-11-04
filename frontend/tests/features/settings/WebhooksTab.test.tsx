@@ -63,14 +63,30 @@ describe("WebhooksTab", () => {
     const token = screen.getByLabelText("Token") as HTMLInputElement;
     expect(token.value).toBe("");
     expect(token.placeholder).toBe("Saved — leave blank to keep");
+    const priority = screen.getByLabelText("Priority") as HTMLInputElement;
+    expect(priority.value).toBe("");
+    expect(priority.placeholder).toBe("Saved — leave blank to keep");
     fireEvent.click(screen.getAllByRole("button", { name: "Test" })[0]);
-    await waitFor(() => expect(testWebhook).toHaveBeenCalledWith("ntfy", { priority: 5 }, "wh1"));
+    await waitFor(() => expect(testWebhook).toHaveBeenCalledWith("ntfy", {}, "wh1"));
     fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Renamed" } });
     fireEvent.click(screen.getByLabelText("Notify on new mail"));
     fireEvent.click(screen.getByRole("button", { name: "common.save" }));
     await waitFor(() => expect(updateWebhook).toHaveBeenCalledWith(
       { id: "wh1", name: "Renamed", provider: "ntfy", is_enabled: true, notify_on_new_mail: false },
-      { priority: 5 },
+      {},
+    ));
+  });
+
+  it("sends an explicitly changed priority when editing", async () => {
+    vi.mocked(listWebhooks).mockResolvedValue([saved]);
+    vi.mocked(updateWebhook).mockResolvedValue();
+    render(<WebhooksTab />);
+    fireEvent.click(await screen.findByText("Team ntfy"));
+    fireEvent.change(screen.getByLabelText("Priority"), { target: { value: "2" } });
+    fireEvent.click(screen.getByRole("button", { name: "common.save" }));
+    await waitFor(() => expect(updateWebhook).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "wh1" }),
+      { priority: 2 },
     ));
   });
 });

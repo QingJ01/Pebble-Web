@@ -41,7 +41,8 @@ interface FormState {
   serverUrl: string;
   topic: string;
   token: string;
-  priority: number;
+  /** Blank while editing means "keep the saved priority". */
+  priority: string;
 }
 
 const emptyForm: FormState = {
@@ -57,7 +58,7 @@ const emptyForm: FormState = {
   serverUrl: "",
   topic: "",
   token: "",
-  priority: 5,
+  priority: "5",
 };
 
 const inputStyle: React.CSSProperties = {
@@ -160,6 +161,7 @@ export default function WebhooksTab() {
       provider: endpoint.provider,
       isEnabled: endpoint.is_enabled,
       notifyOnNewMail: endpoint.notify_on_new_mail,
+      priority: "",
     });
     setEditing(true);
     setError(null);
@@ -168,6 +170,7 @@ export default function WebhooksTab() {
   function buildConfig(): WebhookConfig {
     // Blank fields are omitted so the server keeps the saved encrypted value.
     const clean = (value: string) => value.trim() || undefined;
+    const priority = form.priority.trim() === "" ? undefined : Number(form.priority);
     switch (form.provider) {
       case "telegram":
         return { botToken: clean(form.botToken), chatId: clean(form.chatId) };
@@ -177,13 +180,13 @@ export default function WebhooksTab() {
           serverUrl: clean(form.serverUrl),
           topic: clean(form.topic),
           token: clean(form.token),
-          priority: form.priority,
+          priority,
         };
       case "gotify":
         return {
           serverUrl: clean(form.serverUrl),
           token: clean(form.token),
-          priority: form.priority,
+          priority,
         };
       case "feishu":
       case "dingtalk":
@@ -309,9 +312,12 @@ export default function WebhooksTab() {
         <input
           id="webhook-priority"
           type="number"
+          min={1}
+          max={form.provider === "ntfy" ? 5 : 10}
           value={form.priority}
-          onChange={(e) => setForm({ ...form, priority: Number(e.target.value) })}
+          onChange={(e) => setForm({ ...form, priority: e.target.value })}
           style={inputStyle}
+          placeholder={form.id !== null ? t("webhooks.keepSaved", "Saved — leave blank to keep") : undefined}
         />
       </div>
     );

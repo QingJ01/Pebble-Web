@@ -87,7 +87,7 @@ pub async fn update_webhook(
     let mut config = parse_config(body.config)?;
     if existing.endpoint.provider == body.provider {
         let existing_config = decrypt_config(&state, &id, &existing.encrypted_config)?;
-        merge_missing_config_fields(&mut config, existing_config);
+        merge_missing_config_fields(&body.provider, &mut config, existing_config);
     }
     crate::notifications::validate_config(&body.provider, &config).map_err(ApiError::BadRequest)?;
     let encrypted_config = encrypt_config(&state, &id, &config)?;
@@ -135,7 +135,7 @@ pub async fn test_webhook(
             .ok_or_else(|| ApiError::NotFound("Webhook endpoint not found".to_string()))?;
         if existing.endpoint.provider == body.provider {
             let existing_config = decrypt_config(&state, id, &existing.encrypted_config)?;
-            merge_missing_config_fields(&mut config, existing_config);
+            merge_missing_config_fields(&body.provider, &mut config, existing_config);
         }
     }
     send_notification(&body.provider, &config, &NotificationMessage::test())
@@ -185,8 +185,17 @@ fn parse_config(value: Value) -> Result<WebhookConfig, ApiError> {
         .map_err(|e| ApiError::BadRequest(format!("Invalid webhook config: {e}")))
 }
 
-fn merge_missing_config_fields(config: &mut WebhookConfig, existing: WebhookConfig) {
-    if config.url.is_none() {
+fn merge_missing_config_fields(
+    provider: &WebhookProvider,
+    config: &mut WebhookConfig,
+    existing: WebhookConfig,
+) {
+    // ntfy accepts either a full URL or server URL + topic; supplying the latter
+    // switches modes, so the saved URL must not be restored over it.
+    let switches_to_ntfy_topic = *provider == WebhookProvider::Ntfy
+        && config.url.is_none()
+        && (config.server_url.is_some() || config.topic.is_some());
+    if config.url.is_none() && !switches_to_ntfy_topic {
         config.url = existing.url;
     }
     if config.method.is_none() {
@@ -257,7 +266,7 @@ mod tests {
     fn merge_missing_config_fields_preserves_existing_values() {
         let mut config = WebhookConfig::default();
 
-        merge_missing_config_fields(&mut config, existing_config());
+        merge_missing_config_fields(&WebhookProvider::Generic, &mut config, existing_config());
 
         assert_eq!(config.url.as_deref(), Some("https://example.com/webhook"));
         assert_eq!(config.method.as_deref(), Some("PUT"));
@@ -296,7 +305,7 @@ mod tests {
             priority: Some(2),
         };
 
-        merge_missing_config_fields(&mut config, existing_config());
+        merge_missing_config_fields(&WebhookProvider::Generic, &mut config, existing_config());
 
         assert_eq!(
             config.url.as_deref(),
@@ -318,5 +327,29 @@ mod tests {
         assert_eq!(config.topic.as_deref(), Some("new-topic"));
         assert_eq!(config.token.as_deref(), Some("new-token"));
         assert_eq!(config.priority, Some(2));
+    }
+
+    #[test]
+    fn ntfy_switching_to_server_and_topic_drops_saved_url() {
+        let mut config = WebhookConfig {
+            server_url: Some("https://ntfy.new.example".to_string()),
+            topic: Some("alerts".to_string()),
+            ..Default::default()
+        };
+        merge_missing_config_fields(&WebhookProvider::Ntfy, &mut config, existing_config());
+        assert!(config.url.is_none());
+        assert_eq!(
+            config.server_url.as_deref(),
+            Some("https://ntfy.new.example")
+        );
+        assert_eq!(config.token.as_deref(), Some("old-token"));
+        assert_eq!(config.priority, Some(4));
+
+        let mut untouched = WebhookConfig::default();
+        merge_missing_config_fields(&WebhookProvider::Ntfy, &mut untouched, existing_config());
+        assert_eq!(
+            untouched.url.as_deref(),
+            Some("https://example.com/webhook")
+        );
     }
 }
