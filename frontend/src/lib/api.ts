@@ -44,6 +44,9 @@ export type {
   TranslateConfig,
   TranslateResult,
   TrustedSender,
+  WebhookConfig,
+  WebhookEndpoint,
+  WebhookProvider,
   VcardImportResult,
 } from "./ipc-types";
 
@@ -80,6 +83,9 @@ import type {
   TranslateConfig,
   TranslateResult,
   TrustedSender,
+  WebhookConfig,
+  WebhookEndpoint,
+  WebhookProvider,
   VcardImportResult,
 } from "./ipc-types";
 
@@ -543,6 +549,59 @@ export async function updateRule(rule: Rule): Promise<void> {
 
 export async function deleteRule(ruleId: string): Promise<void> {
   return invoke<void>("delete_rule", { ruleId });
+}
+
+// ─── Webhook API ─────────────────────────────────────────────────────────────
+
+export async function listWebhooks(): Promise<WebhookEndpoint[]> {
+  const { data } = await http.get<WebhookEndpoint[]>("/webhooks");
+  return data;
+}
+
+export async function createWebhook(
+  name: string,
+  provider: WebhookProvider,
+  config: WebhookConfig,
+  isEnabled: boolean,
+  notifyOnNewMail: boolean,
+): Promise<WebhookEndpoint> {
+  const { data } = await http.post<WebhookEndpoint>("/webhooks", {
+    name,
+    provider,
+    config,
+    isEnabled,
+    notifyOnNewMail,
+  });
+  return data;
+}
+
+export async function updateWebhook(
+  endpoint: Pick<WebhookEndpoint, "id" | "name" | "provider" | "is_enabled" | "notify_on_new_mail">,
+  config: WebhookConfig,
+): Promise<void> {
+  await http.put(`/webhooks/${encodeURIComponent(endpoint.id)}`, {
+    name: endpoint.name,
+    provider: endpoint.provider,
+    config,
+    isEnabled: endpoint.is_enabled,
+    notifyOnNewMail: endpoint.notify_on_new_mail,
+  });
+}
+
+export async function deleteWebhook(endpointId: string): Promise<void> {
+  await http.delete(`/webhooks/${encodeURIComponent(endpointId)}`);
+}
+
+export async function testWebhook(
+  provider: WebhookProvider,
+  config: WebhookConfig,
+  existingEndpointId?: string | null,
+): Promise<void> {
+  await http.post("/webhooks/test", { provider, config, existingEndpointId: existingEndpointId ?? null });
+}
+
+export async function testSavedWebhook(endpointId: string): Promise<void> {
+  await http.post(`/webhooks/${encodeURIComponent(endpointId)}/test`);
 }
 
 // ─── Compose API ─────────────────────────────────────────────────────────────

@@ -64,4 +64,9 @@ describe("rule-json", () => {
       { type: "MarkRead" },
     ]);
   });
+  it("round-trips webhook actions with their endpoint id", () => {
+    const json = serializeRuleActions([{ type: "SendWebhook", value: "wh1" }]);
+    expect(json).toBe(JSON.stringify([{ type: "SendWebhook", value: "wh1" }]));
+    expect(parseRuleActions(json)).toEqual([{ type: "SendWebhook", value: "wh1" }]);
+  });
 });

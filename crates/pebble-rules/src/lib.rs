@@ -120,6 +120,21 @@ mod tests {
     }
 
     #[test]
+    fn test_send_webhook_action_parses_endpoint_id() {
+        let conditions =
+            r#"{"operator":"and","conditions":[{"field":"from","op":"contains","value":"boss"}]}"#;
+        let actions = r#"[{"type":"SendWebhook","value":"wh1"},{"type":"MarkRead"}]"#;
+        let rule = make_test_rule("Notify boss", 1, conditions, actions, true);
+
+        let engine = RuleEngine::new(&[rule]);
+        let msg = make_test_message("boss@example.com", "Report", "Content");
+        let result = engine.evaluate(&msg);
+
+        assert!(matches!(&result[0], RuleAction::SendWebhook(id) if id == "wh1"));
+        assert!(matches!(result[1], RuleAction::MarkRead));
+    }
+
+    #[test]
     fn test_disabled_rules_skipped() {
         let conditions = r#"{"operator":"and","conditions":[{"field":"from","op":"contains","value":"newsletter"}]}"#;
         let actions = r#"[{"type":"AddLabel","value":"newsletters"}]"#;

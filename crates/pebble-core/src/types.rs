@@ -440,3 +440,34 @@ pub fn utc_date_from_unix_seconds(timestamp: i64) -> (i64, u32, u32) {
     year += i64::from(month <= 2);
     (year, month as u32, day as u32)
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum WebhookProvider {
+    Generic,
+    Slack,
+    Discord,
+    Telegram,
+    Feishu,
+    Dingtalk,
+    Wecom,
+    Ntfy,
+    Gotify,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebhookEndpoint {
+    pub id: String,
+    pub name: String,
+    pub provider: WebhookProvider,
+    pub is_enabled: bool,
+    pub notify_on_new_mail: bool,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct StoredWebhookEndpoint {
+    pub endpoint: WebhookEndpoint,
+    pub encrypted_config: Vec<u8>,
+}

@@ -57,4 +57,6 @@ pub enum RuleAction {
     MarkRead,
     Archive,
     SetKanbanColumn(KanbanColumn),
+    /// Delivered asynchronously by the server; value is a webhook endpoint id.
+    SendWebhook(String),
 }

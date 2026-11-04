@@ -30,7 +30,8 @@ export type ActionType =
   | "MoveToFolder"
   | "MarkRead"
   | "Archive"
-  | "SetKanbanColumn";
+  | "SetKanbanColumn"
+  | "SendWebhook";
 
 export type KanbanColumn = "todo" | "waiting" | "done";
 

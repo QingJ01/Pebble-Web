@@ -97,34 +97,41 @@ fn spawn_event_forwarders(
     mut status_rx: mpsc::UnboundedReceiver<SyncRuntimeStatus>,
     search: Arc<TantivySearch>,
     store: Arc<Store>,
+    crypto: Arc<CryptoService>,
     ws_tx: broadcast::Sender<String>,
 ) {
     let message_ws = ws_tx.clone();
     let message_account = account_id.clone();
     tokio::spawn(async move {
         while let Some(mut stored) = message_rx.recv().await {
+            let mut rule_webhook_ids = Vec::new();
             if !stored.reconciliation {
                 let rules_store = store.clone();
                 let message = stored.message.clone();
-                let refreshed = tokio::task::spawn_blocking(move || {
+                let (refreshed, webhook_ids) = tokio::task::spawn_blocking(move || {
                     let rules = rules_store.list_rules().unwrap_or_else(|error| {
                         warn!("Failed to load rules: {error}");
                         Vec::new()
                     });
-                    if !crate::mail_service::rules::apply_rules_to_message(
+                    let outcome = crate::mail_service::rules::apply_rules_to_message(
                         &rules_store,
                         &rules,
                         &message,
-                    ) {
-                        return None;
-                    }
-                    let message = rules_store.get_message(&message.id).ok().flatten()?;
-                    let folder_ids = rules_store.get_message_folder_ids(&message.id).ok()?;
-                    Some((message, folder_ids))
+                    );
+                    let refreshed = outcome
+                        .modified
+                        .then(|| {
+                            let message = rules_store.get_message(&message.id).ok().flatten()?;
+                            let folder_ids =
+                                rules_store.get_message_folder_ids(&message.id).ok()?;
+                            Some((message, folder_ids))
+                        })
+                        .flatten();
+                    (refreshed, outcome.webhook_endpoint_ids)
                 })
                 .await
-                .ok()
-                .flatten();
+                .unwrap_or_default();
+                rule_webhook_ids = webhook_ids;
                 if let Some((message, folder_ids)) = refreshed {
                     stored.message = message;
                     stored.folder_ids = folder_ids;
@@ -158,6 +165,13 @@ fn spawn_event_forwarders(
                     })
                     .to_string(),
                 );
+                // Only genuinely new mail reaches webhooks, so initial backfill never floods them.
+                tokio::spawn(crate::notifications::deliver_new_mail(
+                    store.clone(),
+                    crypto.clone(),
+                    stored.message.clone(),
+                    rule_webhook_ids,
+                ));
             }
         }
     });
@@ -493,6 +507,7 @@ impl SyncManager {
             status_rx,
             self.search.clone(),
             self.store.clone(),
+            self.crypto.clone(),
             self.ws_tx.clone(),
         );
 

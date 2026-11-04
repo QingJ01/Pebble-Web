@@ -248,7 +248,8 @@
     "loadingFolders": "正在加载...",
     "folderListFailed": "无法列出 IMAP 文件夹：{{error}}",
     "alwaysSynced": "始终同步",
-    "syncFoldersCleanupWarning": "保存后会移除未勾选文件夹的本地数据，但不会删除服务器上的邮件。"
+    "syncFoldersCleanupWarning": "保存后会移除未勾选文件夹的本地数据，但不会删除服务器上的邮件。",
+    "webhooks": "Webhook 通知"
   },
   "cloudSync": {
     "title": "设置备份",
@@ -663,7 +664,12 @@
     "actionValue": "动作值",
     "kanbanColumn": "看板列",
     "conditionValueRequired": "条件值不能为空。",
-    "contextRuleName": "选中文本规则"
+    "contextRuleName": "选中文本规则",
+    "action_SendWebhook": "发送 Webhook",
+    "webhookEndpoint": "Webhook 端点",
+    "selectWebhook": "选择 Webhook",
+    "missingWebhook": "已删除的 Webhook",
+    "actionValueRequired": "动作值不能为空。"
   },
   "translate": {
     "title": "翻译",
@@ -869,5 +875,43 @@
     "autoBackupNever": "尚无成功的自动备份。",
     "autoBackupFailed": "最近一次备份错误",
     "autoBackupStatusUnavailable": "无法加载服务器备份状态。"
+  },
+  "webhooks": {
+    "title": "Webhook 通知",
+    "description": "由服务器把新邮件和规则通知发送到 Webhook 服务，无需保持浏览器页面打开。只有新到达的邮件会触发，首次同步不会触发。URL 和 Token 加密保存，保存后不再显示，也不会包含在设置备份中。",
+    "add": "添加 Webhook",
+    "empty": "尚未配置 Webhook 端点。",
+    "name": "名称",
+    "nameRequired": "Webhook 名称不能为空",
+    "provider": "服务商",
+    "url": "Webhook URL",
+    "serverUrl": "服务器地址",
+    "topic": "主题",
+    "token": "Token",
+    "appToken": "应用 Token",
+    "botToken": "机器人 Token",
+    "chatId": "Chat ID",
+    "secret": "签名密钥",
+    "priority": "优先级",
+    "enabled": "已启用",
+    "disabled": "已停用",
+    "notifyOnNewMail": "新邮件通知",
+    "keepSaved": "已保存，留空则保持不变",
+    "test": "测试",
+    "saved": "Webhook 已保存",
+    "testSent": "测试通知已发送",
+    "testFailed": "测试失败：{{error}}",
+    "deleteFailed": "删除失败：{{error}}",
+    "deleteTitle": "删除 Webhook",
+    "confirmDelete": "删除 Webhook “{{name}}”？使用它的规则将不再发送通知。",
+    "provider_generic": "通用 Webhook",
+    "provider_slack": "Slack",
+    "provider_discord": "Discord",
+    "provider_telegram": "Telegram Bot",
+    "provider_feishu": "飞书/Lark",
+    "provider_dingtalk": "钉钉",
+    "provider_wecom": "企业微信/WeCom",
+    "provider_ntfy": "ntfy",
+    "provider_gotify": "Gotify"
   }
 }

@@ -248,7 +248,8 @@
     "loadingFolders": "Loading...",
     "folderListFailed": "Failed to list IMAP folders: {{error}}",
     "alwaysSynced": "Always synced",
-    "syncFoldersCleanupWarning": "Saving removes locally stored data for folders you uncheck. It does not delete mail from the server."
+    "syncFoldersCleanupWarning": "Saving removes locally stored data for folders you uncheck. It does not delete mail from the server.",
+    "webhooks": "Webhooks"
   },
   "cloudSync": {
     "title": "Settings Backup",
@@ -663,7 +664,12 @@
     "actionValue": "Action value",
     "kanbanColumn": "Kanban column",
     "conditionValueRequired": "Condition values cannot be empty.",
-    "contextRuleName": "Selected text rule"
+    "contextRuleName": "Selected text rule",
+    "action_SendWebhook": "Send webhook",
+    "webhookEndpoint": "Webhook endpoint",
+    "selectWebhook": "Select webhook",
+    "missingWebhook": "Deleted webhook",
+    "actionValueRequired": "Action values cannot be empty."
   },
   "translate": {
     "title": "Translation",
@@ -869,5 +875,43 @@
     "autoBackupNever": "No successful automatic backup yet.",
     "autoBackupFailed": "Last backup error",
     "autoBackupStatusUnavailable": "Unable to load server backup status."
+  },
+  "webhooks": {
+    "title": "Webhook Notifications",
+    "description": "Send new mail and rule notifications to webhook services from the server, even when no browser tab is open. Only newly arrived mail triggers webhooks, not initial sync. URLs and tokens are stored encrypted, are never shown again after saving, and are not included in settings backups.",
+    "add": "Add webhook",
+    "empty": "No webhook endpoints configured.",
+    "name": "Name",
+    "nameRequired": "Webhook name is required",
+    "provider": "Provider",
+    "url": "Webhook URL",
+    "serverUrl": "Server URL",
+    "topic": "Topic",
+    "token": "Token",
+    "appToken": "App token",
+    "botToken": "Bot token",
+    "chatId": "Chat ID",
+    "secret": "Signing secret",
+    "priority": "Priority",
+    "enabled": "Enabled",
+    "disabled": "Disabled",
+    "notifyOnNewMail": "Notify on new mail",
+    "keepSaved": "Saved — leave blank to keep",
+    "test": "Test",
+    "saved": "Webhook saved",
+    "testSent": "Test notification sent",
+    "testFailed": "Test failed: {{error}}",
+    "deleteFailed": "Delete failed: {{error}}",
+    "deleteTitle": "Delete webhook",
+    "confirmDelete": "Delete webhook \"{{name}}\"? Rules that use it will stop sending notifications.",
+    "provider_generic": "Generic Webhook",
+    "provider_slack": "Slack",
+    "provider_discord": "Discord",
+    "provider_telegram": "Telegram Bot",
+    "provider_feishu": "Feishu/Lark",
+    "provider_dingtalk": "DingTalk",
+    "provider_wecom": "WeCom/Enterprise WeChat",
+    "provider_ntfy": "ntfy",
+    "provider_gotify": "Gotify"
   }
 }

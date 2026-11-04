@@ -2,7 +2,7 @@ use pebble_core::{build_snippet, PebbleError, Result};
 use rusqlite::{Connection, OptionalExtension};
 use std::collections::HashSet;
 
-const CURRENT_VERSION: u32 = 19;
+const CURRENT_VERSION: u32 = 20;
 const ACCOUNT_COLOR_PRESETS: [&str; 12] = [
     "#0ea5e9", "#22c55e", "#f59e0b", "#8b5cf6", "#f43f5e", "#14b8a6", "#6366f1", "#f97316",
     "#06b6d4", "#ec4899", "#84cc16", "#3b82f6",
@@ -992,6 +992,26 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
                 ALTER TABLE accounts ADD COLUMN oauth_subject TEXT;",
             )?;
         }
+        set_schema_version(&tx, 19)?;
+        tx.commit()?;
+    }
+
+    if version < 20 {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS webhook_endpoints (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                provider TEXT NOT NULL CHECK(provider IN ('generic', 'slack', 'discord', 'telegram', 'feishu', 'dingtalk', 'wecom', 'ntfy', 'gotify')),
+                encrypted_config BLOB NOT NULL,
+                is_enabled INTEGER NOT NULL DEFAULT 1,
+                notify_on_new_mail INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_webhook_endpoints_enabled
+                ON webhook_endpoints(is_enabled, notify_on_new_mail);",
+        )?;
         set_schema_version(&tx, CURRENT_VERSION)?;
         tx.commit()?;
     }
