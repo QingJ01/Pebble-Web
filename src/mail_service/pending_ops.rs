@@ -412,14 +412,15 @@ async fn replay_remote_archive(
                 target_folder_remote_id(state, message, payload, FolderRole::Archive)?;
             let uid = parse_uid(message)?;
             let imap = connect_imap(state, &message.account_id).await?;
-            let result = imap
-                .move_message_with_dedup(
-                    &source_remote_id,
-                    uid,
-                    &target_remote_id,
-                    message.message_id_header.as_deref(),
-                )
-                .await;
+            let result = super::imap_move_tracked(
+                state,
+                &imap,
+                &message.id,
+                &source_remote_id,
+                uid,
+                &target_remote_id,
+            )
+            .await;
             let _ = imap.disconnect().await;
             result
         }
@@ -470,14 +471,15 @@ async fn replay_remote_restore(
                 target_folder_remote_id(state, message, payload, FolderRole::Inbox)?;
             let uid = parse_uid(message)?;
             let imap = connect_imap(state, &message.account_id).await?;
-            let result = imap
-                .move_message_with_dedup(
-                    &source_remote_id,
-                    uid,
-                    &target_remote_id,
-                    message.message_id_header.as_deref(),
-                )
-                .await;
+            let result = super::imap_move_tracked(
+                state,
+                &imap,
+                &message.id,
+                &source_remote_id,
+                uid,
+                &target_remote_id,
+            )
+            .await;
             let _ = imap.disconnect().await;
             result
         }
@@ -591,14 +593,15 @@ async fn replay_remote_move_to_folder(
                 target_folder_remote_id(state, message, payload, FolderRole::Inbox)?;
             let uid = parse_uid(message)?;
             let imap = connect_imap(state, &message.account_id).await?;
-            let result = imap
-                .move_message_with_dedup(
-                    &source_remote_id,
-                    uid,
-                    &target_remote_id,
-                    message.message_id_header.as_deref(),
-                )
-                .await;
+            let result = super::imap_move_tracked(
+                state,
+                &imap,
+                &message.id,
+                &source_remote_id,
+                uid,
+                &target_remote_id,
+            )
+            .await;
             let _ = imap.disconnect().await;
             result
         }
