@@ -117,8 +117,7 @@ pub async fn download_attachment(
             format!(
                 "attachment; filename=\"{}\"",
                 filename
-                    .replace('\\', "_")
-                    .replace('"', "_")
+                    .replace(['\\', '"'], "_")
                     .replace(['\r', '\n'], "_")
             ),
         )

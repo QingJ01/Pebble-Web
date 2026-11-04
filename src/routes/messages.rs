@@ -169,48 +169,13 @@ pub async fn update_message_flags(
     Path(message_id): Path<String>,
     Json(body): Json<UpdateFlagsRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let store = state.store.clone();
-    let is_read = body.is_read;
-    let is_starred = body.is_starred;
-
-    store
-        .with_write_async(move |conn| {
-            let mut sets = Vec::new();
-            let mut values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-
-            if let Some(read) = is_read {
-                sets.push(format!("is_read = ?{}", values.len() + 1));
-                values.push(Box::new(read as i32));
-            }
-            if let Some(starred) = is_starred {
-                sets.push(format!("is_starred = ?{}", values.len() + 1));
-                values.push(Box::new(starred as i32));
-            }
-
-            if sets.is_empty() {
-                return Ok(());
-            }
-
-            let now = pebble_core::now_timestamp();
-            sets.push(format!("updated_at = ?{}", values.len() + 1));
-            values.push(Box::new(now));
-
-            let id_idx = values.len() + 1;
-            values.push(Box::new(message_id));
-
-            let sql = format!(
-                "UPDATE messages SET {} WHERE id = ?{}",
-                sets.join(", "),
-                id_idx
-            );
-            let params: Vec<&dyn rusqlite::types::ToSql> =
-                values.iter().map(|v| v.as_ref()).collect();
-            conn.execute(&sql, params.as_slice())?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| ApiError::Internal(format!("Failed to update flags: {e}")))?;
-
+    crate::mail_service::flags::update_message_flags(
+        &state,
+        message_id,
+        body.is_read,
+        body.is_starred,
+    )
+    .await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -225,35 +190,7 @@ pub async fn move_message(
     Path(message_id): Path<String>,
     Json(body): Json<MoveMessageRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let store = state.store.clone();
-    let folder_id = body.folder_id;
-
-    store
-        .with_write_async(move |conn| {
-            let now = pebble_core::now_timestamp();
-            let tx = conn.unchecked_transaction()?;
-
-            tx.execute(
-                "DELETE FROM message_folders WHERE message_id = ?1",
-                rusqlite::params![message_id],
-            )?;
-
-            tx.execute(
-                "INSERT INTO message_folders (message_id, folder_id) VALUES (?1, ?2)",
-                rusqlite::params![message_id, folder_id],
-            )?;
-
-            tx.execute(
-                "UPDATE messages SET is_deleted = 0, deleted_at = NULL, updated_at = ?1 WHERE id = ?2",
-                rusqlite::params![now, message_id],
-            )?;
-
-            tx.commit()?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| ApiError::Internal(format!("Failed to move message: {e}")))?;
-
+    crate::mail_service::lifecycle::move_to_folder(&state, message_id, body.folder_id).await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -261,20 +198,7 @@ pub async fn delete_message(
     State(state): State<AppStateRef>,
     Path(message_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let store = state.store.clone();
-
-    store
-        .with_write_async(move |conn| {
-            let now = pebble_core::now_timestamp();
-            conn.execute(
-                "UPDATE messages SET is_deleted = 1, deleted_at = ?1, updated_at = ?1 WHERE id = ?2",
-                rusqlite::params![now, message_id],
-            )?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| ApiError::Internal(format!("Failed to delete message: {e}")))?;
-
+    crate::mail_service::lifecycle::delete_message(&state, message_id).await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -572,109 +496,16 @@ pub async fn archive_message(
     State(state): State<AppStateRef>,
     Path(message_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let store = state.store.clone();
-
-    store
-        .with_write_async(move |conn| {
-            let now = pebble_core::now_timestamp();
-            let tx = conn.unchecked_transaction()?;
-
-            // Find the account_id for this message
-            let account_id: String = tx.query_row(
-                "SELECT account_id FROM messages WHERE id = ?1",
-                rusqlite::params![message_id],
-                |row| row.get(0),
-            ).map_err(|_| pebble_core::PebbleError::Storage("Message not found".to_string()))?;
-
-            // Find the archive folder for this account
-            let archive_folder_id: Option<String> = tx.query_row(
-                "SELECT id FROM folders WHERE account_id = ?1 AND role = 'archive'",
-                rusqlite::params![account_id],
-                |row| row.get(0),
-            ).optional()
-            .map_err(|e| pebble_core::PebbleError::Storage(e.to_string()))?;
-
-            if let Some(folder_id) = archive_folder_id {
-                tx.execute(
-                    "DELETE FROM message_folders WHERE message_id = ?1",
-                    rusqlite::params![message_id],
-                )?;
-                tx.execute(
-                    "INSERT INTO message_folders (message_id, folder_id) VALUES (?1, ?2)",
-                    rusqlite::params![message_id, folder_id],
-                )?;
-                tx.execute(
-                    "UPDATE messages SET is_deleted = 0, deleted_at = NULL, updated_at = ?1 WHERE id = ?2",
-                    rusqlite::params![now, message_id],
-                )?;
-            } else {
-                // No archive folder — soft-delete as fallback
-                tx.execute(
-                    "UPDATE messages SET is_deleted = 1, deleted_at = ?1, updated_at = ?1 WHERE id = ?2",
-                    rusqlite::params![now, message_id],
-                )?;
-            }
-
-            tx.commit()?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| ApiError::Internal(format!("Failed to archive message: {e}")))?;
-
-    Ok(Json(json!("archived")))
+    let action = crate::mail_service::lifecycle::archive_message(&state, message_id).await?;
+    Ok(Json(serde_json::json!({ "ok": true, "action": action })))
 }
 
 pub async fn restore_message(
     State(state): State<AppStateRef>,
     Path(message_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let store = state.store.clone();
-
-    store
-        .with_write_async(move |conn| {
-            let now = pebble_core::now_timestamp();
-            let tx = conn.unchecked_transaction()?;
-
-            // Clear soft-delete flags
-            tx.execute(
-                "UPDATE messages SET is_deleted = 0, deleted_at = NULL, updated_at = ?1 WHERE id = ?2",
-                rusqlite::params![now, message_id],
-            )?;
-
-            // Find the account_id for this message
-            let account_id: String = tx.query_row(
-                "SELECT account_id FROM messages WHERE id = ?1",
-                rusqlite::params![message_id],
-                |row| row.get(0),
-            ).map_err(|_| pebble_core::PebbleError::Storage("Message not found".to_string()))?;
-
-            // Find the inbox folder for this account
-            let inbox_folder_id: Option<String> = tx.query_row(
-                "SELECT id FROM folders WHERE account_id = ?1 AND role = 'inbox'",
-                rusqlite::params![account_id],
-                |row| row.get(0),
-            ).optional()
-            .map_err(|e| pebble_core::PebbleError::Storage(e.to_string()))?;
-
-            // Move message to inbox if inbox folder exists
-            if let Some(folder_id) = inbox_folder_id {
-                tx.execute(
-                    "DELETE FROM message_folders WHERE message_id = ?1",
-                    rusqlite::params![message_id],
-                )?;
-                tx.execute(
-                    "INSERT INTO message_folders (message_id, folder_id) VALUES (?1, ?2)",
-                    rusqlite::params![message_id, folder_id],
-                )?;
-            }
-
-            tx.commit()?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| ApiError::Internal(format!("Failed to restore message: {e}")))?;
-
-    Ok(Json(json!({ "ok": true })))
+    crate::mail_service::lifecycle::restore_message(&state, message_id).await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 pub async fn list_starred_messages(
@@ -751,32 +582,8 @@ pub async fn empty_trash(
     State(state): State<AppStateRef>,
     Path(account_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let store = state.store.clone();
-
-    let count = store
-        .with_write_async(move |conn| {
-            let tx = conn.unchecked_transaction()?;
-
-            // Delete from message_folders for all deleted messages of this account
-            tx.execute(
-                "DELETE FROM message_folders WHERE message_id IN \
-                 (SELECT id FROM messages WHERE account_id = ?1 AND is_deleted = 1)",
-                rusqlite::params![account_id],
-            )?;
-
-            // Permanently delete messages
-            let deleted = tx.execute(
-                "DELETE FROM messages WHERE account_id = ?1 AND is_deleted = 1",
-                rusqlite::params![account_id],
-            )?;
-
-            tx.commit()?;
-            Ok(deleted)
-        })
-        .await
-        .map_err(|e| ApiError::Internal(format!("Failed to empty trash: {e}")))?;
-
-    Ok(Json(json!(count)))
+    let count = crate::mail_service::lifecycle::empty_trash(&state, account_id).await?;
+    Ok(Json(serde_json::json!({ "ok": true, "count": count })))
 }
 
 // --- Batch operations ---
@@ -805,144 +612,34 @@ pub async fn batch_archive(
     State(state): State<AppStateRef>,
     Json(body): Json<BatchMessageIds>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let store = state.store.clone();
-    let message_ids = body.message_ids;
-
-    let count = store
-        .with_write_async(move |conn| {
-            let now = pebble_core::now_timestamp();
-            let tx = conn.unchecked_transaction()?;
-            let mut total = 0usize;
-            for id in &message_ids {
-                // Find account_id for this message
-                let account_id: Option<String> = tx.query_row(
-                    "SELECT account_id FROM messages WHERE id = ?1",
-                    rusqlite::params![id],
-                    |row| row.get(0),
-                ).optional()?;
-
-                let Some(account_id) = account_id else { continue };
-
-                // Find archive folder
-                let archive_folder_id: Option<String> = tx.query_row(
-                    "SELECT id FROM folders WHERE account_id = ?1 AND role = 'archive'",
-                    rusqlite::params![account_id],
-                    |row| row.get(0),
-                ).optional()?;
-
-                if let Some(folder_id) = archive_folder_id {
-                    tx.execute(
-                        "DELETE FROM message_folders WHERE message_id = ?1",
-                        rusqlite::params![id],
-                    )?;
-                    tx.execute(
-                        "INSERT INTO message_folders (message_id, folder_id) VALUES (?1, ?2)",
-                        rusqlite::params![id, folder_id],
-                    )?;
-                    tx.execute(
-                        "UPDATE messages SET is_deleted = 0, deleted_at = NULL, updated_at = ?1 WHERE id = ?2",
-                        rusqlite::params![now, id],
-                    )?;
-                } else {
-                    tx.execute(
-                        "UPDATE messages SET is_deleted = 1, deleted_at = ?1, updated_at = ?1 WHERE id = ?2",
-                        rusqlite::params![now, id],
-                    )?;
-                }
-                total += 1;
-            }
-            tx.commit()?;
-            Ok(total)
-        })
-        .await
-        .map_err(|e| ApiError::Internal(format!("Failed to batch archive: {e}")))?;
-
-    Ok(Json(json!(count)))
+    let count = crate::mail_service::batch::batch_archive(&state, body.message_ids).await?;
+    Ok(Json(serde_json::json!({ "ok": true, "count": count })))
 }
 
 pub async fn batch_delete(
     State(state): State<AppStateRef>,
     Json(body): Json<BatchMessageIds>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let store = state.store.clone();
-    let message_ids = body.message_ids;
-
-    let count = store
-        .with_write_async(move |conn| {
-            let tx = conn.unchecked_transaction()?;
-            let mut total = 0usize;
-            for id in &message_ids {
-                tx.execute(
-                    "DELETE FROM message_folders WHERE message_id = ?1",
-                    rusqlite::params![id],
-                )?;
-                let affected =
-                    tx.execute("DELETE FROM messages WHERE id = ?1", rusqlite::params![id])?;
-                total += affected;
-            }
-            tx.commit()?;
-            Ok(total)
-        })
-        .await
-        .map_err(|e| ApiError::Internal(format!("Failed to batch delete: {e}")))?;
-
-    Ok(Json(json!(count)))
+    let count = crate::mail_service::batch::batch_delete(&state, body.message_ids).await?;
+    Ok(Json(serde_json::json!({ "ok": true, "count": count })))
 }
 
 pub async fn batch_mark_read(
     State(state): State<AppStateRef>,
     Json(body): Json<BatchMarkReadRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let store = state.store.clone();
-    let message_ids = body.message_ids;
-    let is_read = body.is_read;
-
-    let count = store
-        .with_write_async(move |conn| {
-            let now = pebble_core::now_timestamp();
-            let read_val = is_read as i32;
-            let mut total = 0usize;
-            for id in &message_ids {
-                let affected = conn.execute(
-                    "UPDATE messages SET is_read = ?1, updated_at = ?2 WHERE id = ?3",
-                    rusqlite::params![read_val, now, id],
-                )?;
-                total += affected;
-            }
-            Ok(total)
-        })
-        .await
-        .map_err(|e| ApiError::Internal(format!("Failed to batch mark read: {e}")))?;
-
-    Ok(Json(json!(count)))
+    let count =
+        crate::mail_service::batch::batch_mark_read(&state, body.message_ids, body.is_read).await?;
+    Ok(Json(serde_json::json!({ "ok": true, "count": count })))
 }
 
 pub async fn batch_star(
     State(state): State<AppStateRef>,
     Json(body): Json<BatchStarRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let store = state.store.clone();
-    let message_ids = body.message_ids;
-    let starred = body.starred;
-
-    let count = store
-        .with_write_async(move |conn| {
-            let now = pebble_core::now_timestamp();
-            let starred_val = starred as i32;
-            let mut total = 0usize;
-            for id in &message_ids {
-                let affected = conn.execute(
-                    "UPDATE messages SET is_starred = ?1, updated_at = ?2 WHERE id = ?3",
-                    rusqlite::params![starred_val, now, id],
-                )?;
-                total += affected;
-            }
-            Ok(total)
-        })
-        .await
-        .map_err(|e| ApiError::Internal(format!("Failed to batch star: {e}")))?;
-
-    Ok(Json(json!(count)))
+    let count =
+        crate::mail_service::batch::batch_star(&state, body.message_ids, body.starred).await?;
+    Ok(Json(serde_json::json!({ "ok": true, "count": count })))
 }
 
 pub async fn get_messages_batch(

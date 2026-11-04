@@ -19,7 +19,7 @@ use tokio::time::{timeout, Duration};
 use tracing::{error, info, warn};
 
 use crate::credentials::{
-    decrypt_credentials, AccountCredentials, ImapCredentials, Pop3Credentials,
+    decrypt_credentials, AccountCredentials, ImapCredentials, Pop3Credentials, SmtpCredentials,
 };
 
 /// Handle for a running sync worker task.
@@ -88,6 +88,7 @@ async fn stop_handle(mut handle: SyncHandle) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_event_forwarders(
     account_id: String,
     mut error_rx: mpsc::UnboundedReceiver<SyncError>,
@@ -95,19 +96,53 @@ fn spawn_event_forwarders(
     mut progress_rx: mpsc::UnboundedReceiver<SyncProgress>,
     mut status_rx: mpsc::UnboundedReceiver<SyncRuntimeStatus>,
     search: Arc<TantivySearch>,
+    store: Arc<Store>,
     ws_tx: broadcast::Sender<String>,
 ) {
     let message_ws = ws_tx.clone();
     let message_account = account_id.clone();
     tokio::spawn(async move {
-        while let Some(stored) = message_rx.recv().await {
-            if let Err(error) = search.index_message(&stored.message, &stored.folder_ids) {
+        while let Some(mut stored) = message_rx.recv().await {
+            if !stored.reconciliation {
+                let rules_store = store.clone();
+                let message = stored.message.clone();
+                let refreshed = tokio::task::spawn_blocking(move || {
+                    let rules = rules_store.list_rules().unwrap_or_else(|error| {
+                        warn!("Failed to load rules: {error}");
+                        Vec::new()
+                    });
+                    if !crate::mail_service::rules::apply_rules_to_message(
+                        &rules_store,
+                        &rules,
+                        &message,
+                    ) {
+                        return None;
+                    }
+                    let message = rules_store.get_message(&message.id).ok().flatten()?;
+                    let folder_ids = rules_store.get_message_folder_ids(&message.id).ok()?;
+                    Some((message, folder_ids))
+                })
+                .await
+                .ok()
+                .flatten();
+                if let Some((message, folder_ids)) = refreshed {
+                    stored.message = message;
+                    stored.folder_ids = folder_ids;
+                    crate::mail_service::emit_pending_ops_changed_via(&message_ws);
+                }
+            }
+            let indexed = if stored.message.is_deleted {
+                search.remove_message(&stored.message.id)
+            } else {
+                search.index_message(&stored.message, &stored.folder_ids)
+            };
+            if let Err(error) = indexed {
                 warn!(
                     "Failed to index synced message {}: {error}",
                     stored.message.id
                 );
             }
-            if stored.notify {
+            if stored.notify && !stored.reconciliation {
                 let payload = serde_json::json!({
                     "account_id": message_account,
                     "message_id": stored.message.id,
@@ -457,6 +492,7 @@ impl SyncManager {
             progress_rx,
             status_rx,
             self.search.clone(),
+            self.store.clone(),
             self.ws_tx.clone(),
         );
 
@@ -665,13 +701,37 @@ pub(crate) fn build_imap_config(
     })
 }
 
-fn build_pop3_config(
+pub(crate) fn build_pop3_config(
     creds: &Pop3Credentials,
     sync_state: &serde_json::Value,
     email: &str,
     global_proxy: Option<&pebble_core::HttpProxyConfig>,
 ) -> Result<Pop3Config, String> {
     Ok(Pop3Config {
+        host: creds.host.clone(),
+        port: creds.port,
+        username: if creds.username.trim().is_empty() {
+            email.to_string()
+        } else {
+            creds.username.clone()
+        },
+        password: creds.password.clone(),
+        security: connection_security(&creds.security, creds.allow_plaintext)?,
+        accept_invalid_certs: creds.accept_invalid_certs,
+        proxy: resolve_proxy(sync_state, global_proxy)?.map(|proxy| ProxyConfig {
+            host: proxy.host,
+            port: proxy.port,
+        }),
+    })
+}
+
+pub(crate) fn build_smtp_config(
+    creds: &SmtpCredentials,
+    sync_state: &serde_json::Value,
+    email: &str,
+    global_proxy: Option<&pebble_core::HttpProxyConfig>,
+) -> Result<pebble_mail::SmtpConfig, String> {
+    Ok(pebble_mail::SmtpConfig {
         host: creds.host.clone(),
         port: creds.port,
         username: if creds.username.trim().is_empty() {

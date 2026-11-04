@@ -3,6 +3,7 @@ mod auto_backup;
 mod config;
 mod credentials;
 mod error;
+mod mail_service;
 mod maintenance;
 mod routes;
 mod state;
@@ -38,12 +39,18 @@ async fn main() {
     });
     let backup_state = state.clone();
     let backup_shutdown = shutdown_rx.clone();
-    tokio::spawn(async move {
+    let backup_task = tokio::spawn(async move {
         auto_backup::run_scheduler(backup_state, backup_shutdown).await;
+    });
+    let pending_state = state.clone();
+    let pending_shutdown = shutdown_rx.clone();
+    let pending_task = tokio::spawn(async move {
+        mail_service::pending_ops::run_pending_mail_ops_worker(pending_state, pending_shutdown)
+            .await;
     });
     let maintenance_state = state.clone();
     let maintenance_shutdown = shutdown_rx.clone();
-    tokio::spawn(async move {
+    let maintenance_task = tokio::spawn(async move {
         maintenance::run(maintenance_state, maintenance_shutdown).await;
     });
 
@@ -57,10 +64,43 @@ async fn main() {
     let listener = TcpListener::bind(&addr).await.expect("Failed to bind");
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
-            let _ = tokio::signal::ctrl_c().await;
+            shutdown_signal().await;
             let _ = shutdown_tx.send(true);
         })
         .await
         .expect("Server error");
+    for (name, task) in [
+        ("auto-backup", backup_task),
+        ("pending-ops", pending_task),
+        ("maintenance", maintenance_task),
+    ] {
+        match tokio::time::timeout(std::time::Duration::from_secs(30), task).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::warn!("{name} worker stopped abnormally: {error}"),
+            Err(_) => tracing::warn!("{name} worker did not stop within 30 seconds"),
+        }
+    }
     state.sync_manager.stop_all().await;
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+    info!("Shutdown signal received");
 }

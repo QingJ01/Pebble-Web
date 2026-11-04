@@ -1,10 +1,6 @@
-use crate::credentials::{decrypt_credentials, AccountCredentials};
 use crate::error::ApiError;
-use crate::state::AppStateRef;
+use crate::state::{AppState, AppStateRef};
 use axum::{extract::State, Json};
-use pebble_core::{new_id, EmailAddress};
-use pebble_mail::smtp::SmtpSender;
-use pebble_mail::{ConnectionSecurity, SmtpConfig};
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
@@ -21,132 +17,28 @@ pub struct ComposeRequest {
     pub attachment_paths: Option<Vec<String>>,
 }
 
+pub async fn send_with_service(state: &AppState, body: ComposeRequest) -> Result<(), ApiError> {
+    crate::mail_service::compose::send_email(
+        state,
+        body.account_id,
+        body.to,
+        body.cc.unwrap_or_default(),
+        body.bcc.unwrap_or_default(),
+        body.subject,
+        body.body_text,
+        body.body_html,
+        body.in_reply_to,
+        body.attachment_paths,
+    )
+    .await?;
+    Ok(())
+}
+
 pub async fn send_email(
     State(state): State<AppStateRef>,
     Json(body): Json<ComposeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // Validate attachment paths are within attachments_dir
-    let attachment_paths = body
-        .attachment_paths
-        .unwrap_or_default()
-        .iter()
-        .map(|path| {
-            crate::routes::safe_files::resolve_attachment_path(&state.attachments_dir, path)
-                .map(|path| path.to_string_lossy().to_string())
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut total_size = 0u64;
-    for path in &attachment_paths {
-        let size = tokio::fs::metadata(path)
-            .await
-            .map_err(|error| ApiError::BadRequest(format!("Attachment unavailable: {error}")))?
-            .len();
-        total_size = total_size.saturating_add(size);
-        if size > 25 * 1024 * 1024 || total_size > 25 * 1024 * 1024 {
-            return Err(ApiError::BadRequest(
-                "Attachments exceed the 25 MiB total size limit".into(),
-            ));
-        }
-    }
-
-    // Get account and decrypt credentials
-    let store = state.store.clone();
-    let account_id = body.account_id.clone();
-
-    let (email, sync_state_json) = store
-        .with_read_async(move |conn| {
-            let row = conn.query_row(
-                "SELECT email, sync_state FROM accounts WHERE id = ?1",
-                rusqlite::params![account_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
-            )?;
-            Ok(row)
-        })
-        .await
-        .map_err(|e| ApiError::Internal(format!("Failed to get account: {e}")))?;
-
-    let sync_state_str = sync_state_json
-        .ok_or_else(|| ApiError::BadRequest("Account has no credentials configured".to_string()))?;
-
-    // Extract encrypted credentials from sync_state
-    let sync_state: serde_json::Value = serde_json::from_str(&sync_state_str)
-        .map_err(|e| ApiError::Internal(format!("Invalid sync_state: {e}")))?;
-
-    let encrypted_hex = sync_state["credentials"]
-        .as_str()
-        .ok_or_else(|| ApiError::BadRequest("No credentials found in account".to_string()))?;
-
-    let creds = decrypt_credentials(&state.crypto, encrypted_hex)
-        .map_err(|e| ApiError::Internal(format!("Failed to decrypt credentials: {e}")))?;
-
-    let smtp_config = match &creds {
-        AccountCredentials::Imap { smtp, .. } | AccountCredentials::Pop3 { smtp, .. } => {
-            if smtp.security == "plain" && !smtp.allow_plaintext {
-                return Err(ApiError::BadRequest(
-                    "Plaintext SMTP requires explicit consent".into(),
-                ));
-            }
-            let security = match smtp.security.as_str() {
-                "starttls" => ConnectionSecurity::StartTls,
-                "plain" => ConnectionSecurity::Plain,
-                "tls" => ConnectionSecurity::Tls,
-                _ => {
-                    return Err(ApiError::BadRequest(
-                        "Unsupported SMTP security mode".into(),
-                    ))
-                }
-            };
-            let global_proxy = crate::sync::load_global_proxy(&state.store, &state.crypto)
-                .map_err(|error| ApiError::Internal(error))?;
-            let proxy = crate::sync::resolve_proxy(&sync_state, global_proxy.as_ref())
-                .map_err(ApiError::BadRequest)?
-                .map(|proxy| pebble_mail::ProxyConfig {
-                    host: proxy.host,
-                    port: proxy.port,
-                });
-            SmtpConfig {
-                host: smtp.host.clone(),
-                port: smtp.port,
-                username: smtp.username.clone(),
-                password: smtp.password.clone(),
-                security,
-                accept_invalid_certs: smtp.accept_invalid_certs,
-                proxy,
-            }
-        }
-    };
-
-    let sender = SmtpSender::new(
-        smtp_config.host,
-        smtp_config.port,
-        smtp_config.username,
-        smtp_config.password,
-        smtp_config.security,
-        smtp_config.accept_invalid_certs,
-        smtp_config.proxy,
-    );
-    let from = EmailAddress {
-        name: None,
-        address: email,
-    };
-
-    let cc = body.cc.unwrap_or_default();
-    let bcc = body.bcc.unwrap_or_default();
-    sender
-        .send(
-            &from,
-            &body.to,
-            &cc,
-            &bcc,
-            &body.subject,
-            &body.body_text,
-            body.body_html.as_deref(),
-            body.in_reply_to.as_deref(),
-            &attachment_paths,
-        )
-        .await
-        .map_err(|e| ApiError::Internal(format!("Failed to send email: {e}")))?;
-
+    send_with_service(&state, body).await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -171,26 +63,8 @@ pub async fn stage_attachment(
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(&body.data)
         .map_err(|e| ApiError::BadRequest(format!("Invalid base64 data: {e}")))?;
-    if bytes.is_empty() || bytes.len() > 25 * 1024 * 1024 {
-        return Err(ApiError::BadRequest(
-            "Attachment must be between 1 byte and 25 MiB".into(),
-        ));
-    }
-
-    let staging_dir = state.attachments_dir.join("staging");
-    tokio::fs::create_dir_all(&staging_dir)
-        .await
-        .map_err(|e| ApiError::Internal(format!("Failed to create staging dir: {e}")))?;
-
-    let safe_filename = crate::routes::safe_files::safe_filename(&body.filename)?;
-    let unique_name = format!("{}_{}", new_id(), safe_filename);
-    let file_path = staging_dir.join(&unique_name);
-
-    tokio::fs::write(&file_path, &bytes)
-        .await
-        .map_err(|e| ApiError::Internal(format!("Failed to write attachment: {e}")))?;
-
-    Ok(Json(StageAttachmentResponse {
-        path: file_path.to_string_lossy().to_string(),
-    }))
+    let path =
+        crate::routes::safe_files::stage_bytes(&state.attachments_dir, &body.filename, &bytes)
+            .await?;
+    Ok(Json(StageAttachmentResponse { path }))
 }

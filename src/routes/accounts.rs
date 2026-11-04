@@ -78,7 +78,7 @@ pub struct CreateAccountRequest {
 }
 
 impl CreateAccountRequest {
-    fn into_credentials(&self) -> Result<(ProviderType, AccountCredentials), ApiError> {
+    fn to_credentials(&self) -> Result<(ProviderType, AccountCredentials), ApiError> {
         let provider = match self
             .provider
             .as_deref()
@@ -236,7 +236,7 @@ pub async fn create_account(
     State(state): State<AppStateRef>,
     Json(body): Json<CreateAccountRequest>,
 ) -> Result<Json<AccountResponse>, ApiError> {
-    let (provider, credentials) = body.into_credentials()?;
+    let (provider, credentials) = body.to_credentials()?;
     pebble_store::accounts::validate_sync_range_days(body.sync_range_days)
         .map_err(|error| ApiError::BadRequest(error.to_string()))?;
     if provider == ProviderType::Pop3 && body.sync_range_days.is_some() {

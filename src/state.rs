@@ -53,6 +53,48 @@ impl AppState {
         lock.lock_owned().await
     }
 
+    #[cfg(test)]
+    pub fn for_tests(
+        store: Store,
+        search: TantivySearch,
+        crypto: CryptoService,
+        attachments_dir: PathBuf,
+    ) -> Self {
+        let store = Arc::new(store);
+        let crypto = Arc::new(crypto);
+        let search = Arc::new(search);
+        let (ws_broadcast, _) = broadcast::channel(100);
+        let oauth_refresh_locks = Arc::new(Mutex::new(HashMap::new()));
+        let sync_manager = Arc::new(SyncManager::new(
+            store.clone(),
+            crypto.clone(),
+            search.clone(),
+            oauth_refresh_locks.clone(),
+            attachments_dir.clone(),
+            15,
+            ws_broadcast.clone(),
+        ));
+        Self {
+            config: Config {
+                port: 0,
+                data_dir: attachments_dir.clone(),
+                password_hash: String::new(),
+                jwt_secret: String::new(),
+                realtime_preference: "balanced".into(),
+            },
+            store,
+            search,
+            crypto,
+            attachments_dir,
+            sync_manager,
+            ws_broadcast,
+            oauth_flows: Mutex::new(HashMap::new()),
+            oauth_refresh_locks,
+            auto_backup_wake: Notify::new(),
+            secure_settings_locks: Mutex::new(HashMap::new()),
+        }
+    }
+
     pub fn init(config: Config) -> Result<Self, String> {
         std::fs::create_dir_all(&config.data_dir)
             .map_err(|e| format!("Failed to create data dir: {e}"))?;

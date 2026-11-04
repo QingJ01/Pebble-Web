@@ -26,6 +26,71 @@ pub fn safe_filename(value: &str) -> Result<String, ApiError> {
     Ok(sanitized.chars().take(180).collect())
 }
 
+pub fn stored_filename(value: &str) -> Result<String, ApiError> {
+    let sanitized = crate::mail_service::attachments::sanitize_stored_filename(value);
+    let mut limited = String::new();
+    for ch in sanitized.chars() {
+        if limited.len() + ch.len_utf8() > 200 {
+            break;
+        }
+        limited.push(ch);
+    }
+    let limited = limited.trim_matches([' ', '.']).to_string();
+    if limited.is_empty() {
+        return Err(ApiError::BadRequest("Invalid attachment filename".into()));
+    }
+    Ok(limited)
+}
+
+pub async fn stage_bytes(root: &Path, filename: &str, bytes: &[u8]) -> Result<String, ApiError> {
+    if bytes.is_empty() || bytes.len() > 25 * 1024 * 1024 {
+        return Err(ApiError::BadRequest(
+            "Attachment must be between 1 byte and 25 MiB".into(),
+        ));
+    }
+    let filename = stored_filename(filename)?;
+    let id = pebble_core::new_id();
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|_| ApiError::BadRequest("Attachment storage is unavailable".into()))?;
+    let staging_root = canonical_root.join("staging");
+    tokio::fs::create_dir_all(&staging_root)
+        .await
+        .map_err(|error| {
+            ApiError::Internal(format!("Failed to create staging storage: {error}"))
+        })?;
+    let canonical_staging_root = staging_root.canonicalize().map_err(|error| {
+        ApiError::Internal(format!("Failed to resolve staging storage: {error}"))
+    })?;
+    if !canonical_staging_root.starts_with(&canonical_root) {
+        return Err(ApiError::BadRequest(
+            "Staging storage outside attachment storage".into(),
+        ));
+    }
+    let directory = canonical_staging_root.join(&id);
+    tokio::fs::create_dir(&directory).await.map_err(|error| {
+        ApiError::Internal(format!("Failed to create staging directory: {error}"))
+    })?;
+    let path = directory.join(&filename);
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .await
+        .map_err(|error| {
+            ApiError::Internal(format!("Failed to create staged attachment: {error}"))
+        })?;
+    use tokio::io::AsyncWriteExt;
+    if let Err(error) = file.write_all(bytes).await {
+        drop(file);
+        let _ = tokio::fs::remove_dir_all(&directory).await;
+        return Err(ApiError::Internal(format!(
+            "Failed to write staged attachment: {error}"
+        )));
+    }
+    Ok(format!("{STAGED_PREFIX}{id}/{filename}"))
+}
+
 pub fn staged_token_path(root: &Path, token: &str) -> Result<PathBuf, ApiError> {
     let relative = token
         .strip_prefix(STAGED_PREFIX)
@@ -81,5 +146,10 @@ mod tests {
         );
         assert_eq!(safe_filename("../../report.pdf").unwrap(), "report.pdf");
         assert!(safe_filename("..").is_err());
+        assert_eq!(
+            stored_filename("../报告 2024.pdf").unwrap(),
+            "报告 2024.pdf"
+        );
+        assert_eq!(stored_filename("..").unwrap(), "attachment");
     }
 }

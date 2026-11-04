@@ -749,7 +749,7 @@ async fn finish_claimed_callback(
         {
             return Err("Mailbox identity does not match the existing account".into());
         }
-        if !existing.email.eq_ignore_ascii_case(&email) {
+        if !existing.email.eq_ignore_ascii_case(email) {
             return Err("The verified mailbox address differs from the existing account".into());
         }
     } else {

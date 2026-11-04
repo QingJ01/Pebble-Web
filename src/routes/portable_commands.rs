@@ -358,21 +358,12 @@ pub async fn invoke(
         }
         "send_email" => {
             let request: crate::routes::compose::ComposeRequest = parse(args)?;
-            let _ = crate::routes::compose::send_email(
-                axum::extract::State(state.clone()),
-                axum::Json(request),
-            )
-            .await?;
+            crate::routes::compose::send_with_service(state, request).await?;
             Value::Null
         }
         "save_draft" => {
             let request: crate::routes::drafts::SaveDraftRequest = parse(args)?;
-            let result = crate::routes::drafts::save_draft(
-                axum::extract::State(state.clone()),
-                axum::Json(request),
-            )
-            .await?;
-            result.0.get("id").cloned().unwrap_or(Value::Null)
+            json!(crate::routes::drafts::save_with_service(state, request).await?)
         }
         "delete_draft" => {
             #[derive(Deserialize)]
@@ -382,12 +373,114 @@ pub async fn invoke(
                 draft_id: String,
             }
             let args: Args = parse(args)?;
-            let _ = crate::routes::drafts::delete_draft(
-                axum::extract::State(state.clone()),
-                axum::extract::Path((args.account_id, args.draft_id)),
+            crate::mail_service::drafts::delete_draft(state, args.account_id, args.draft_id)
+                .await?;
+            Value::Null
+        }
+        "update_message_flags" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct Args {
+                message_id: String,
+                is_read: Option<bool>,
+                is_starred: Option<bool>,
+            }
+            let args: Args = parse(args)?;
+            crate::mail_service::flags::update_message_flags(
+                state,
+                args.message_id,
+                args.is_read,
+                args.is_starred,
             )
             .await?;
             Value::Null
+        }
+        "archive_message" | "delete_message" | "restore_message" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct Args {
+                message_id: String,
+            }
+            let args: Args = parse(args)?;
+            use crate::mail_service::lifecycle;
+            match command {
+                "archive_message" => {
+                    json!(lifecycle::archive_message(state, args.message_id).await?)
+                }
+                "delete_message" => {
+                    lifecycle::delete_message(state, args.message_id).await?;
+                    Value::Null
+                }
+                _ => {
+                    lifecycle::restore_message(state, args.message_id).await?;
+                    Value::Null
+                }
+            }
+        }
+        "move_to_folder" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct Args {
+                message_id: String,
+                target_folder_id: String,
+            }
+            let args: Args = parse(args)?;
+            crate::mail_service::lifecycle::move_to_folder(
+                state,
+                args.message_id,
+                args.target_folder_id,
+            )
+            .await?;
+            Value::Null
+        }
+        "empty_trash" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct Args {
+                account_id: String,
+            }
+            let args: Args = parse(args)?;
+            json!(crate::mail_service::lifecycle::empty_trash(state, args.account_id).await?)
+        }
+        "batch_archive" | "batch_delete" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct Args {
+                message_ids: Vec<String>,
+            }
+            let args: Args = parse(args)?;
+            use crate::mail_service::batch;
+            if command == "batch_archive" {
+                json!(batch::batch_archive(state, args.message_ids).await?)
+            } else {
+                json!(batch::batch_delete(state, args.message_ids).await?)
+            }
+        }
+        "batch_mark_read" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct Args {
+                message_ids: Vec<String>,
+                is_read: bool,
+            }
+            let args: Args = parse(args)?;
+            json!(
+                crate::mail_service::batch::batch_mark_read(state, args.message_ids, args.is_read)
+                    .await?
+            )
+        }
+        "batch_star" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct Args {
+                message_ids: Vec<String>,
+                starred: bool,
+            }
+            let args: Args = parse(args)?;
+            json!(
+                crate::mail_service::batch::batch_star(state, args.message_ids, args.starred)
+                    .await?
+            )
         }
         "snooze_message" => {
             let args: SnoozeArgs = parse(args)?;
@@ -541,27 +634,31 @@ pub async fn invoke(
         "list_labels" => store_call(state, pebble_store::Store::list_labels).await?,
         "get_pending_mail_ops_summary" => {
             let args: PendingArgs = parse(args)?;
-            store_call(state, move |store| {
-                store.pending_mail_ops_summary(args.account_id.as_deref())
-            })
-            .await?
+            serde_json::to_value(
+                crate::mail_service::pending_ops::get_pending_mail_ops_summary(
+                    state,
+                    args.account_id,
+                )?,
+            )
+            .map_err(|error| ApiError::Internal(error.to_string()))?
         }
         "list_pending_mail_ops" => {
             let args: PendingArgs = parse(args)?;
-            store_call(state, move |store| {
-                store.list_active_pending_mail_ops(
-                    args.account_id.as_deref(),
-                    args.limit.unwrap_or(100).clamp(1, 500),
-                )
-            })
-            .await?
+            serde_json::to_value(crate::mail_service::pending_ops::list_pending_mail_ops(
+                state,
+                args.account_id,
+                args.limit,
+            )?)
+            .map_err(|error| ApiError::Internal(error.to_string()))?
         }
         "dismiss_failed_pending_mail_ops" => {
             let args: PendingArgs = parse(args)?;
-            store_call(state, move |store| {
-                store.dismiss_failed_pending_mail_ops(args.account_id.as_deref())
-            })
-            .await?
+            json!(
+                crate::mail_service::pending_ops::dismiss_failed_pending_mail_ops(
+                    state,
+                    args.account_id
+                )?
+            )
         }
         "search_messages" => {
             #[derive(Deserialize)]
@@ -968,59 +1065,14 @@ pub async fn invoke(
                 bytes: Vec<u8>,
             }
             let args: StageArgs = parse(args)?;
-            if args.bytes.is_empty() || args.bytes.len() > 25 * 1024 * 1024 {
-                return Err(ApiError::BadRequest(
-                    "Attachment must be between 1 byte and 25 MiB".into(),
-                ));
-            }
-            let filename = crate::routes::safe_files::safe_filename(&args.filename)?;
-            let id = new_id();
-            let canonical_root = state
-                .attachments_dir
-                .canonicalize()
-                .map_err(|_| ApiError::BadRequest("Attachment storage is unavailable".into()))?;
-            let staging_root = canonical_root.join("staging");
-            tokio::fs::create_dir_all(&staging_root)
-                .await
-                .map_err(|error| {
-                    ApiError::Internal(format!("Failed to create staging storage: {error}"))
-                })?;
-            let canonical_staging_root = staging_root.canonicalize().map_err(|error| {
-                ApiError::Internal(format!("Failed to resolve staging storage: {error}"))
-            })?;
-            if !canonical_staging_root.starts_with(&canonical_root) {
-                return Err(ApiError::BadRequest(
-                    "Staging storage outside attachment storage".into(),
-                ));
-            }
-            let directory = canonical_staging_root.join(&id);
-            tokio::fs::create_dir_all(&directory)
-                .await
-                .map_err(|error| {
-                    ApiError::Internal(format!("Failed to create staging directory: {error}"))
-                })?;
-            let canonical_directory = directory.canonicalize().map_err(|error| {
-                ApiError::Internal(format!("Failed to resolve staging directory: {error}"))
-            })?;
-            if !canonical_directory.starts_with(&canonical_staging_root) {
-                return Err(ApiError::BadRequest(
-                    "Staging directory outside attachment storage".into(),
-                ));
-            }
-            let path = canonical_directory.join(&filename);
-            let mut file = tokio::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-                .await
-                .map_err(|error| {
-                    ApiError::Internal(format!("Failed to create staged attachment: {error}"))
-                })?;
-            use tokio::io::AsyncWriteExt;
-            file.write_all(&args.bytes).await.map_err(|error| {
-                ApiError::Internal(format!("Failed to write staged attachment: {error}"))
-            })?;
-            json!(format!("staged:{id}/{filename}"))
+            json!(
+                crate::routes::safe_files::stage_bytes(
+                    &state.attachments_dir,
+                    &args.filename,
+                    &args.bytes
+                )
+                .await?
+            )
         }
         "cleanup_staged_compose_attachment" => {
             #[derive(Deserialize)]
@@ -1037,7 +1089,7 @@ pub async fn invoke(
             let canonical = path
                 .canonicalize()
                 .map_err(|_| ApiError::BadRequest("Staged attachment not found".into()))?;
-            if !canonical.starts_with(&canonical_root.join("staging")) || !canonical.is_file() {
+            if !canonical.starts_with(canonical_root.join("staging")) || !canonical.is_file() {
                 return Err(ApiError::BadRequest(
                     "Invalid staged attachment path".into(),
                 ));
@@ -1058,13 +1110,8 @@ pub async fn invoke(
 fn redact_log_value(content: &str, needle: &str, replacement: &str) -> String {
     let mut output = String::with_capacity(content.len());
     let mut remainder = content;
-    loop {
-        let Some(index) = remainder
-            .to_ascii_lowercase()
-            .find(&needle.to_ascii_lowercase())
-        else {
-            break;
-        };
+    let lowered_needle = needle.to_ascii_lowercase();
+    while let Some(index) = remainder.to_ascii_lowercase().find(&lowered_needle) {
         let after_key = index + needle.len();
         output.push_str(&remainder[..after_key]);
         output.push_str(replacement);
