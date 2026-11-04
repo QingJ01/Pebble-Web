@@ -535,11 +535,13 @@ async fn replay_remote_delete(
                 if trash_remote_id == source_remote_id {
                     imap.delete_message(&source_remote_id, uid).await
                 } else {
-                    imap.move_message_with_dedup(
+                    super::imap_move_tracked(
+                        state,
+                        &imap,
+                        &message.id,
                         &source_remote_id,
                         uid,
                         &trash_remote_id,
-                        message.message_id_header.as_deref(),
                     )
                     .await
                 }

@@ -192,9 +192,15 @@ pub async fn archive_message(
                     })?;
                     match connect_imap(state, &msg.account_id).await {
                         Ok(imap) => {
-                            let result = imap
-                                .move_message(&source_folder.remote_id, uid, &inbox.remote_id)
-                                .await;
+                            let result = super::imap_move_tracked(
+                                state,
+                                &imap,
+                                &msg.id,
+                                &source_folder.remote_id,
+                                uid,
+                                &inbox.remote_id,
+                            )
+                            .await;
                             let _ = imap.disconnect().await;
                             match result {
                                 Ok(()) => RemoteMutationOutcome::Applied,
@@ -363,13 +369,15 @@ pub async fn archive_message(
                         })?;
                         match connect_imap(state, &msg.account_id).await {
                             Ok(imap) => {
-                                let result = imap
-                                    .move_message(
-                                        &source_folder.remote_id,
-                                        uid,
-                                        &archive_folder.remote_id,
-                                    )
-                                    .await;
+                                let result = super::imap_move_tracked(
+                                    state,
+                                    &imap,
+                                    &msg.id,
+                                    &source_folder.remote_id,
+                                    uid,
+                                    &archive_folder.remote_id,
+                                )
+                                .await;
                                 let _ = imap.disconnect().await;
                                 match result {
                                     Ok(()) => RemoteMutationOutcome::Applied,
@@ -671,8 +679,15 @@ pub async fn delete_message(
                     Ok(imap) => {
                         let result = if !is_permanent && can_move_to_remote_trash {
                             let trash = trash_folder.as_ref().expect("checked above");
-                            imap.move_message(&source_folder.remote_id, uid, &trash.remote_id)
-                                .await
+                            super::imap_move_tracked(
+                                state,
+                                &imap,
+                                &msg.id,
+                                &source_folder.remote_id,
+                                uid,
+                                &trash.remote_id,
+                            )
+                            .await
                         } else {
                             imap.delete_message(&source_folder.remote_id, uid).await
                         };
@@ -893,9 +908,15 @@ pub async fn restore_message(
                 let uid = parse_imap_uid(&msg.remote_id)?;
                 match connect_imap(state, &msg.account_id).await {
                     Ok(imap) => {
-                        let result = imap
-                            .move_message(&source_folder.remote_id, uid, &inbox.remote_id)
-                            .await;
+                        let result = super::imap_move_tracked(
+                            state,
+                            &imap,
+                            &msg.id,
+                            &source_folder.remote_id,
+                            uid,
+                            &inbox.remote_id,
+                        )
+                        .await;
                         let _ = imap.disconnect().await;
                         match result {
                             Ok(()) => RemoteMutationOutcome::Applied,
@@ -1039,9 +1060,15 @@ pub async fn move_to_folder(
             } else if let Ok(uid) = msg.remote_id.parse::<u32>() {
                 match connect_imap(state, &msg.account_id).await {
                     Ok(imap) => {
-                        let result = imap
-                            .move_message(&source_folder.remote_id, uid, &target_folder.remote_id)
-                            .await;
+                        let result = super::imap_move_tracked(
+                            state,
+                            &imap,
+                            &msg.id,
+                            &source_folder.remote_id,
+                            uid,
+                            &target_folder.remote_id,
+                        )
+                        .await;
                         let _ = imap.disconnect().await;
                         match result {
                             Ok(()) => {

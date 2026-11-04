@@ -33,6 +33,45 @@ pub(crate) fn emit_pending_ops_changed_via(ws: &tokio::sync::broadcast::Sender<S
     let _ = ws.send(json!({ "type": MAIL_PENDING_OPS_CHANGED, "payload": null }).to_string());
 }
 
+/// Moves an IMAP message and records the UID assigned by the destination
+/// mailbox, so later mutations from that mailbox target the right message.
+pub(crate) async fn imap_move_tracked(
+    state: &AppState,
+    imap: &ImapProvider,
+    local_message_id: &str,
+    source_mailbox: &str,
+    uid: u32,
+    dest_mailbox: &str,
+) -> Result<(), PebbleError> {
+    let header = state
+        .store
+        .get_message(local_message_id)?
+        .and_then(|message| message.message_id_header);
+    imap.move_message_with_dedup(source_mailbox, uid, dest_mailbox, header.as_deref())
+        .await?;
+    let Some(header) = header else {
+        tracing::warn!("IMAP message {local_message_id} has no Message-ID; UID not refreshed");
+        return Ok(());
+    };
+    match imap.find_uid_by_message_id(dest_mailbox, &header).await {
+        Ok(Some(new_uid)) => {
+            if let Err(error) = state
+                .store
+                .update_remote_id(local_message_id, &new_uid.to_string())
+            {
+                tracing::warn!("Failed to store moved IMAP UID for {local_message_id}: {error}");
+            }
+        }
+        Ok(None) => {
+            tracing::warn!("Moved IMAP message {local_message_id} was not found in {dest_mailbox}")
+        }
+        Err(error) => {
+            tracing::warn!("Failed to look up moved IMAP UID for {local_message_id}: {error}")
+        }
+    }
+    Ok(())
+}
+
 pub(crate) struct ResolvedOAuthAuth {
     pub tokens: OAuthTokens,
     pub proxy: Option<HttpProxyConfig>,

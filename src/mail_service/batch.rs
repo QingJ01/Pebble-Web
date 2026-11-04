@@ -1,5 +1,7 @@
 use super::provider_dispatch::{parse_imap_uid, ConnectedProvider};
-use super::{find_folder_by_role, find_message_folder, refresh_search_documents};
+use super::{
+    find_folder_by_role, find_message_folder, refresh_search_documents, remove_search_documents,
+};
 use crate::state::AppState;
 use pebble_core::traits::{FolderProvider, LabelProvider};
 use pebble_core::{FolderRole, Message, PebbleError, ProviderType};
@@ -196,9 +198,15 @@ pub async fn batch_archive(
                                 if let Ok(uid) = parse_imap_uid(&msg.remote_id) {
                                     if let Ok(src) = find_message_folder(state, &msg.id, account_id)
                                     {
-                                        match imap
-                                            .move_message(&src.remote_id, uid, &af.remote_id)
-                                            .await
+                                        match super::imap_move_tracked(
+                                            state,
+                                            imap,
+                                            &msg.id,
+                                            &src.remote_id,
+                                            uid,
+                                            &af.remote_id,
+                                        )
+                                        .await
                                         {
                                             Ok(_) => remote_succeeded.push(msg.id.clone()),
                                             Err(e) => {
@@ -391,13 +399,15 @@ pub async fn batch_delete(
                                     if let Ok(src) = find_message_folder(state, &msg.id, account_id)
                                     {
                                         if src.id != trash_folder.id {
-                                            match imap
-                                                .move_message(
-                                                    &src.remote_id,
-                                                    uid,
-                                                    &trash_folder.remote_id,
-                                                )
-                                                .await
+                                            match super::imap_move_tracked(
+                                                state,
+                                                imap,
+                                                &msg.id,
+                                                &src.remote_id,
+                                                uid,
+                                                &trash_folder.remote_id,
+                                            )
+                                            .await
                                             {
                                                 Ok(_) => deleted_ids.push(msg.id.clone()),
                                                 Err(e) => {
@@ -478,22 +488,51 @@ pub async fn batch_delete(
     let ids_to_delete =
         batch_local_commit_ids(&message_ids, &deleted_ids, &queued_for_local_commit_ids);
 
-    // Local bulk soft-delete
-    state.store.bulk_soft_delete(&ids_to_delete)?;
-    let success_count = ids_to_delete.len() as u32;
-
-    // Update search index: remove deleted messages.
-    let delete_ids: Vec<String> = ids_to_delete.clone();
-    let _ = state.store.add_search_pending(&delete_ids, "remove");
+    // Mirror single-message delete: move to Trash, or purge when already in Trash.
+    let account_by_message: std::collections::HashMap<&str, &str> = groups
+        .iter()
+        .flat_map(|(account_id, (_, messages))| {
+            messages
+                .iter()
+                .map(move |msg| (msg.id.as_str(), account_id.as_str()))
+        })
+        .collect();
+    let mut moved_ids = Vec::new();
+    let mut purged_ids = Vec::new();
+    let mut soft_deleted_ids = Vec::new();
     for id in &ids_to_delete {
-        if let Err(e) = state.search.remove_message(id) {
-            warn!("Failed to remove deleted message {id} from search index: {e}");
+        let Some(account_id) = account_by_message.get(id.as_str()).copied() else {
+            continue;
+        };
+        let trash = find_folder_by_role(state, account_id, FolderRole::Trash).ok();
+        let source = find_message_folder(state, id, account_id).ok();
+        match (trash, source) {
+            (Some(trash), Some(source)) if source.id == trash.id => purged_ids.push(id.clone()),
+            (Some(trash), _) => {
+                state.store.move_message_to_folder(id, &trash.id)?;
+                moved_ids.push(id.clone());
+            }
+            (None, _) => soft_deleted_ids.push(id.clone()),
         }
     }
-    if let Err(e) = state.search.commit() {
-        warn!("Failed to commit search index after batch delete: {e}");
+    if !purged_ids.is_empty() {
+        state.store.hard_delete_messages(&purged_ids)?;
     }
-    let _ = state.store.clear_search_pending(&delete_ids);
+    state.store.bulk_soft_delete(&soft_deleted_ids)?;
+    let success_count = ids_to_delete.len() as u32;
+
+    let mut removed_ids = purged_ids.clone();
+    removed_ids.extend(soft_deleted_ids.iter().cloned());
+    if !removed_ids.is_empty() {
+        if let Err(e) = remove_search_documents(state, &removed_ids) {
+            warn!("Failed to remove deleted messages from search index: {e}");
+        }
+    }
+    if !moved_ids.is_empty() {
+        if let Err(e) = refresh_search_documents(state, &moved_ids) {
+            warn!("Failed to refresh search index after batch delete: {e}");
+        }
+    }
 
     info!(
         "Batch delete: {}/{} messages deleted",
