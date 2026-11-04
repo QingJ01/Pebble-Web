@@ -134,6 +134,10 @@ The frontend development server proxies application requests to the backend.
 | `PEBBLE_STATIC_DIR` | No | `./frontend/dist` | Frontend static files directory |
 | `PEBBLE_SYNC_INTERVAL` | No | `300` | Mail sync interval in seconds |
 | `PEBBLE_ENCRYPTION_KEY` | No | auto-generated | 32-byte hex-encoded encryption key |
+| `PEBBLE_PUBLIC_BASE_URL` | For OAuth | none | Public URL (HTTPS; `http://localhost` allowed locally) used to build OAuth callbacks `<url>/api/v1/oauth/{gmail,outlook}/callback` |
+| `PEBBLE_GOOGLE_CLIENT_ID` / `PEBBLE_GOOGLE_CLIENT_SECRET` | No | none | Gmail OAuth; both are required |
+| `PEBBLE_MICROSOFT_CLIENT_ID` | No | none | Outlook OAuth; with only an ID, sign-in uses a public client (PKCE, no secret). Enable "Allow public client flows" and register the callback URL in the Azure app |
+| `PEBBLE_MICROSOFT_CLIENT_SECRET` | No | none | Outlook confidential-client secret; leave empty for a public client |
 
 Security notes:
 

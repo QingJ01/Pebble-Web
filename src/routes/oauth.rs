@@ -60,41 +60,56 @@ pub struct CallbackQuery {
 }
 
 pub(crate) fn provider_config(provider: &str) -> Result<(OAuthConfig, String), ApiError> {
-    let (id_key, secret_key, auth_url, token_url, scopes, callback_path) = match provider {
-        "gmail" => (
-            "PEBBLE_GOOGLE_CLIENT_ID",
-            "PEBBLE_GOOGLE_CLIENT_SECRET",
-            GOOGLE_AUTH_URL,
-            GOOGLE_TOKEN_URL,
-            vec!["openid", "email", "profile", "https://mail.google.com/"],
-            "/api/v1/oauth/gmail/callback",
-        ),
-        "outlook" => (
-            "PEBBLE_MICROSOFT_CLIENT_ID",
-            "PEBBLE_MICROSOFT_CLIENT_SECRET",
-            MICROSOFT_AUTH_URL,
-            MICROSOFT_TOKEN_URL,
-            vec![
-                "openid",
-                "email",
-                "offline_access",
-                "User.Read",
-                "Mail.ReadWrite",
-                "Mail.Send",
-            ],
-            "/api/v1/oauth/outlook/callback",
-        ),
-        _ => return Err(ApiError::NotFound("Unsupported OAuth provider".into())),
-    };
-    let client_id = std::env::var(id_key).unwrap_or_default();
-    let client_secret = std::env::var(secret_key).unwrap_or_default();
-    if client_id.trim().is_empty() || client_secret.trim().is_empty() {
+    resolve_provider_config(provider, |key| std::env::var(key).ok())
+}
+
+fn resolve_provider_config(
+    provider: &str,
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<(OAuthConfig, String), ApiError> {
+    // Microsoft supports public clients (no secret, PKCE only); Google web clients require a secret.
+    let (id_key, secret_key, secret_required, auth_url, token_url, scopes, callback_path) =
+        match provider {
+            "gmail" => (
+                "PEBBLE_GOOGLE_CLIENT_ID",
+                "PEBBLE_GOOGLE_CLIENT_SECRET",
+                true,
+                GOOGLE_AUTH_URL,
+                GOOGLE_TOKEN_URL,
+                vec!["openid", "email", "profile", "https://mail.google.com/"],
+                "/api/v1/oauth/gmail/callback",
+            ),
+            "outlook" => (
+                "PEBBLE_MICROSOFT_CLIENT_ID",
+                "PEBBLE_MICROSOFT_CLIENT_SECRET",
+                false,
+                MICROSOFT_AUTH_URL,
+                MICROSOFT_TOKEN_URL,
+                vec![
+                    "openid",
+                    "email",
+                    "offline_access",
+                    "User.Read",
+                    "Mail.ReadWrite",
+                    "Mail.Send",
+                ],
+                "/api/v1/oauth/outlook/callback",
+            ),
+            _ => return Err(ApiError::NotFound("Unsupported OAuth provider".into())),
+        };
+    let client_id = env(id_key)
+        .map(|value| value.trim().to_string())
+        .unwrap_or_default();
+    let client_secret = env(secret_key)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if client_id.is_empty() || (secret_required && client_secret.is_none()) {
         return Err(ApiError::NotFound(
             "OAuth provider is not configured".into(),
         ));
     }
-    let public_base = std::env::var("PEBBLE_PUBLIC_BASE_URL")
-        .map_err(|_| ApiError::Internal("PEBBLE_PUBLIC_BASE_URL is required for OAuth".into()))?;
+    let public_base = env("PEBBLE_PUBLIC_BASE_URL")
+        .ok_or_else(|| ApiError::Internal("PEBBLE_PUBLIC_BASE_URL is required for OAuth".into()))?;
     let base = reqwest::Url::parse(&public_base)
         .map_err(|_| ApiError::Internal("Invalid OAuth public base URL".into()))?;
     if !base.username().is_empty()
@@ -120,7 +135,7 @@ pub(crate) fn provider_config(provider: &str) -> Result<(OAuthConfig, String), A
     Ok((
         OAuthConfig {
             client_id,
-            client_secret: Some(client_secret),
+            client_secret,
             auth_url: auth_url.into(),
             token_url: token_url.into(),
             scopes: scopes.into_iter().map(str::to_owned).collect(),
@@ -985,6 +1000,75 @@ pub async fn callback(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn env_from(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |key| map.get(key).cloned()
+    }
+
+    #[test]
+    fn outlook_public_client_needs_only_client_id() {
+        let env = env_from(&[
+            ("PEBBLE_MICROSOFT_CLIENT_ID", " outlook-client "),
+            ("PEBBLE_PUBLIC_BASE_URL", "https://mail.example.com"),
+        ]);
+        let (config, redirect) = resolve_provider_config("outlook", env).unwrap();
+        assert_eq!(config.client_id, "outlook-client");
+        assert!(config.client_secret.is_none());
+        assert_eq!(
+            redirect,
+            "https://mail.example.com/api/v1/oauth/outlook/callback"
+        );
+    }
+
+    #[test]
+    fn outlook_blank_secret_is_treated_as_public_client() {
+        let env = env_from(&[
+            ("PEBBLE_MICROSOFT_CLIENT_ID", "outlook-client"),
+            ("PEBBLE_MICROSOFT_CLIENT_SECRET", "   "),
+            ("PEBBLE_PUBLIC_BASE_URL", "https://mail.example.com"),
+        ]);
+        let (config, _) = resolve_provider_config("outlook", env).unwrap();
+        assert!(config.client_secret.is_none());
+    }
+
+    #[test]
+    fn outlook_confidential_client_keeps_secret() {
+        let env = env_from(&[
+            ("PEBBLE_MICROSOFT_CLIENT_ID", "outlook-client"),
+            ("PEBBLE_MICROSOFT_CLIENT_SECRET", "outlook-secret"),
+            ("PEBBLE_PUBLIC_BASE_URL", "https://mail.example.com"),
+        ]);
+        let (config, _) = resolve_provider_config("outlook", env).unwrap();
+        assert_eq!(config.client_secret.as_deref(), Some("outlook-secret"));
+    }
+
+    #[test]
+    fn gmail_still_requires_client_secret() {
+        let env = env_from(&[
+            ("PEBBLE_GOOGLE_CLIENT_ID", "google-client"),
+            ("PEBBLE_PUBLIC_BASE_URL", "https://mail.example.com"),
+        ]);
+        assert!(matches!(
+            resolve_provider_config("gmail", env),
+            Err(ApiError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn missing_client_id_is_not_configured() {
+        let env = env_from(&[
+            ("PEBBLE_MICROSOFT_CLIENT_SECRET", "outlook-secret"),
+            ("PEBBLE_PUBLIC_BASE_URL", "https://mail.example.com"),
+        ]);
+        assert!(matches!(
+            resolve_provider_config("outlook", env),
+            Err(ApiError::NotFound(_))
+        ));
+    }
 
     fn test_flow(provider: &str, state: &str, expires_at: i64) -> OAuthFlowRecord {
         OAuthFlowRecord {
