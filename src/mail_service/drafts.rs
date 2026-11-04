@@ -362,6 +362,24 @@ fn save_draft_locally(
     Ok(id)
 }
 
+/// True for drafts saved only locally (no IMAP UID), which the generic
+/// message lifecycle cannot delete remotely.
+pub(crate) fn is_local_fallback_draft(state: &AppState, message: &pebble_core::Message) -> bool {
+    if !message.is_draft {
+        return false;
+    }
+    let provider = state
+        .store
+        .get_account(&message.account_id)
+        .ok()
+        .flatten()
+        .map(|account| account.provider);
+    matches!(
+        provider,
+        Some(ProviderType::Imap) | Some(ProviderType::Pop3)
+    ) && message.remote_id.parse::<u32>().is_err()
+}
+
 pub async fn delete_draft(
     state: &AppState,
     account_id: String,
@@ -786,5 +804,27 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(source_dir);
         let _ = std::fs::remove_dir_all(&state.attachments_dir);
+    }
+
+    #[tokio::test]
+    async fn generic_delete_removes_local_imap_draft_without_uid() {
+        let state = test_state();
+        state
+            .store
+            .insert_account(&make_account(
+                "account-imap",
+                "imap@example.com",
+                ProviderType::Imap,
+            ))
+            .unwrap();
+        let draft = make_local_draft("account-imap", "local-draft-1", "local-draft-1");
+        state.store.insert_message(&draft, &[]).unwrap();
+        assert!(is_local_fallback_draft(&state, &draft));
+
+        crate::mail_service::lifecycle::delete_message(&state, "local-draft-1".into())
+            .await
+            .unwrap();
+
+        assert!(state.store.get_message("local-draft-1").unwrap().is_none());
     }
 }

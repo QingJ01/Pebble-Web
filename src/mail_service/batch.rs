@@ -328,8 +328,28 @@ pub async fn batch_delete(
     state: &AppState,
     message_ids: Vec<String>,
 ) -> std::result::Result<u32, PebbleError> {
+    let mut local_draft_count = 0u32;
+    let mut message_ids = message_ids;
+    let mut remaining = Vec::with_capacity(message_ids.len());
+    for id in message_ids.drain(..) {
+        match state.store.get_message(&id)? {
+            Some(msg) if super::drafts::is_local_fallback_draft(state, &msg) => {
+                match super::drafts::delete_draft(state, msg.account_id.clone(), msg.id.clone())
+                    .await
+                {
+                    Ok(()) => {
+                        let _ = remove_search_documents(state, std::slice::from_ref(&msg.id));
+                        local_draft_count += 1;
+                    }
+                    Err(e) => warn!("Batch delete failed for local draft {}: {e}", msg.id),
+                }
+            }
+            _ => remaining.push(id),
+        }
+    }
+    let message_ids = remaining;
     let Some(groups) = prepare_batch(state.store.clone(), &message_ids).await? else {
-        return Ok(0);
+        return Ok(local_draft_count);
     };
 
     // Track which messages were successfully deleted remotely
@@ -519,7 +539,7 @@ pub async fn batch_delete(
         state.store.hard_delete_messages(&purged_ids)?;
     }
     state.store.bulk_soft_delete(&soft_deleted_ids)?;
-    let success_count = ids_to_delete.len() as u32;
+    let success_count = ids_to_delete.len() as u32 + local_draft_count;
 
     let mut removed_ids = purged_ids.clone();
     removed_ids.extend(soft_deleted_ids.iter().cloned());

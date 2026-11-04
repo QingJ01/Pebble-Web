@@ -508,6 +508,11 @@ pub async fn delete_message(
     message_id: String,
 ) -> std::result::Result<(), PebbleError> {
     let (msg, provider_type) = resolve_message_context(state, &message_id)?;
+    if super::drafts::is_local_fallback_draft(state, &msg) {
+        super::drafts::delete_draft(state, msg.account_id.clone(), msg.id.clone()).await?;
+        remove_search_documents(state, std::slice::from_ref(&message_id))?;
+        return Ok(());
+    }
 
     let source_folder = find_message_folder(state, &message_id, &msg.account_id)?;
     let trash_folder = find_folder_by_role(state, &msg.account_id, FolderRole::Trash).ok();
