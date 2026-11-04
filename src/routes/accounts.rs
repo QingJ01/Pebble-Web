@@ -102,6 +102,7 @@ impl CreateAccountRequest {
         let pop3_security = self
             .pop3_security
             .clone()
+            .or_else(|| self.imap_security.clone())
             .unwrap_or_else(|| "tls".to_string());
         let smtp_security = self
             .smtp_security
