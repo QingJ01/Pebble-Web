@@ -352,6 +352,20 @@ pub async fn batch_delete(
         return Ok(local_draft_count);
     };
 
+    // Capture each message's Trash membership before remote moves relink it.
+    let mut in_trash_before: std::collections::HashSet<String> = Default::default();
+    for (account_id, (_, messages)) in &groups {
+        if let Ok(trash) = find_folder_by_role(state, account_id, FolderRole::Trash) {
+            for msg in messages {
+                if find_message_folder(state, &msg.id, account_id)
+                    .is_ok_and(|source| source.id == trash.id)
+                {
+                    in_trash_before.insert(msg.id.clone());
+                }
+            }
+        }
+    }
+
     // Track which messages were successfully deleted remotely
     let mut deleted_ids: Vec<String> = Vec::new();
     let mut queued_for_local_commit_ids: Vec<String> = Vec::new();
@@ -525,14 +539,13 @@ pub async fn batch_delete(
             continue;
         };
         let trash = find_folder_by_role(state, account_id, FolderRole::Trash).ok();
-        let source = find_message_folder(state, id, account_id).ok();
-        match (trash, source) {
-            (Some(trash), Some(source)) if source.id == trash.id => purged_ids.push(id.clone()),
-            (Some(trash), _) => {
+        match trash {
+            Some(_) if in_trash_before.contains(id) => purged_ids.push(id.clone()),
+            Some(trash) => {
                 state.store.move_message_to_folder(id, &trash.id)?;
                 moved_ids.push(id.clone());
             }
-            (None, _) => soft_deleted_ids.push(id.clone()),
+            None => soft_deleted_ids.push(id.clone()),
         }
     }
     if !purged_ids.is_empty() {
