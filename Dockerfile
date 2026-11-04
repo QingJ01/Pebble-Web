@@ -8,7 +8,7 @@ RUN npm run build
 
 # Stage 2: Build Rust backend
 FROM rust:1.91-alpine AS backend
-RUN apk add --no-cache musl-dev pkgconfig openssl-dev
+RUN apk add --no-cache musl-dev pkgconfig openssl-dev openssl-libs-static
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
