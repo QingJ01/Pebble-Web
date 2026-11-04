@@ -66,6 +66,8 @@ hex = "0.4"
 base64 = "0.22"
 reqwest = { workspace = true }
 sha2 = "0.10"
+hmac = "0.12"
+urlencoding = "2"
 zeroize = "1"
 lol_html = { workspace = true }
 tokio-util = { version = "0.7", features = ["io"] }

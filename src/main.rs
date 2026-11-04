@@ -5,6 +5,7 @@ mod credentials;
 mod error;
 mod mail_service;
 mod maintenance;
+mod notifications;
 mod routes;
 mod state;
 mod sync;

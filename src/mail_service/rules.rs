@@ -83,6 +83,7 @@ pub(crate) fn apply_rule_action(
                 message_id, column
             );
         }
+        RuleAction::SendWebhook(_) => {}
     }
     Ok(())
 }
@@ -193,27 +194,42 @@ fn queue_remote_rule_action(
             queue_pending_mail_op(store, &message, "move_to_folder", payload)?;
             Ok(true)
         }
-        RuleAction::AddLabel(_) | RuleAction::SetKanbanColumn(_) => Ok(false),
+        RuleAction::AddLabel(_) | RuleAction::SetKanbanColumn(_) | RuleAction::SendWebhook(_) => {
+            Ok(false)
+        }
     }
 }
 
-/// Evaluates rules for one stored message. Returns true when any action ran.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct RuleOutcome {
+    /// True when any action changed stored message state.
+    pub modified: bool,
+    /// Webhook endpoints requested by matching rules, deduplicated in order.
+    pub webhook_endpoint_ids: Vec<String>,
+}
+
+/// Evaluates rules for one stored message.
 pub(crate) fn apply_rules_to_message(
     store: &Store,
     rules: &[pebble_core::Rule],
     message: &pebble_core::Message,
-) -> bool {
+) -> RuleOutcome {
+    let mut outcome = RuleOutcome::default();
     if rules.is_empty() {
-        return false;
+        return outcome;
     }
     let engine = pebble_rules::RuleEngine::new(rules);
-    let actions = engine.evaluate(message);
-    let mut applied = false;
-    for action in actions {
+    for action in engine.evaluate(message) {
+        if let pebble_rules::types::RuleAction::SendWebhook(endpoint_id) = &action {
+            if !outcome.webhook_endpoint_ids.contains(endpoint_id) {
+                outcome.webhook_endpoint_ids.push(endpoint_id.clone());
+            }
+            continue;
+        }
         match apply_rule_action(store, &message.account_id, &message.id, &action) {
-            Ok(()) => applied = true,
+            Ok(()) => outcome.modified = true,
             Err(error) => warn!("Rule action failed for message {}: {error}", message.id),
         }
     }
-    applied
+    outcome
 }
