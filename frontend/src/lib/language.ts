@@ -1,3 +1,5 @@
+import { profileLocalStorage } from "@/lib/profileStorage";
+
 export type Language = "en" | "zh";
 
 export const LANGUAGE_STORAGE_KEY = "pebble-language";
@@ -11,11 +13,11 @@ function normalizeSavedLanguage(value: string | null): Language | null {
 
 export function detectSystemLanguage(source: NavigatorLanguageSource = navigator): Language {
   const primaryLanguage = source.languages?.[0] || source.language || "";
-  return primaryLanguage.toLowerCase().startsWith("en") ? "en" : "zh";
+  return primaryLanguage.toLowerCase().startsWith("zh") ? "zh" : "en";
 }
 
 export function getInitialLanguage(
-  storage: LanguageStorage = localStorage,
+  storage: LanguageStorage = profileLocalStorage,
   source: NavigatorLanguageSource = navigator,
 ): Language {
   return normalizeSavedLanguage(storage.getItem(LANGUAGE_STORAGE_KEY)) ?? detectSystemLanguage(source);

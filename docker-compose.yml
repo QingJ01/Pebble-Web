@@ -10,7 +10,7 @@ services:
       - PEBBLE_JWT_SECRET=${PEBBLE_JWT_SECRET:?Set PEBBLE_JWT_SECRET in .env}
       - PEBBLE_DATA_DIR=/data
       - PEBBLE_PORT=8080
-      - PEBBLE_SYNC_INTERVAL=${PEBBLE_SYNC_INTERVAL:-300}
+      - PEBBLE_REALTIME_PREFERENCE=${PEBBLE_REALTIME_PREFERENCE:-balanced}
     restart: unless-stopped
 
 volumes:

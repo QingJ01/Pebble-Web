@@ -82,34 +82,23 @@ pub async fn download_attachment(
         .await
         .map_err(|e| ApiError::Internal(format!("Failed to get attachment: {e}")))?;
 
-    let attachment = attachment
-        .ok_or_else(|| ApiError::BadRequest("Attachment not found".to_string()))?;
+    let attachment =
+        attachment.ok_or_else(|| ApiError::BadRequest("Attachment not found".to_string()))?;
 
     let file_path = match &attachment.local_path {
         Some(path) => std::path::PathBuf::from(path),
         None => {
-            // Sanitize filename by stripping path separators
-            let safe_filename = std::path::Path::new(&attachment.filename)
-                .file_name()
-                .and_then(|f| f.to_str())
-                .unwrap_or("attachment")
-                .to_string();
+            let safe_filename = crate::routes::safe_files::safe_filename(&attachment.filename)?;
             attachments_dir
                 .join(&attachment.message_id)
                 .join(&safe_filename)
         }
     };
 
-    // Validate resolved path is within the allowed attachments directory
-    let allowed_dir = attachments_dir.canonicalize().unwrap_or_else(|_| attachments_dir.clone());
-    let canonical_path = file_path.canonicalize().map_err(|_| {
-        ApiError::NotFound("Attachment file not found".to_string())
-    })?;
-    if !canonical_path.starts_with(&allowed_dir) {
-        return Err(ApiError::BadRequest(
-            "Attachment path outside allowed directory".to_string(),
-        ));
-    }
+    let canonical_path = crate::routes::safe_files::resolve_attachment_path(
+        &attachments_dir,
+        &file_path.to_string_lossy(),
+    )?;
 
     let file = tokio::fs::File::open(&canonical_path)
         .await
@@ -125,7 +114,12 @@ pub async fn download_attachment(
         .header(header::CONTENT_TYPE, content_type)
         .header(
             header::CONTENT_DISPOSITION,
-            format!("attachment; filename=\"{}\"", filename),
+            format!(
+                "attachment; filename=\"{}\"",
+                filename
+                    .replace(['\\', '"'], "_")
+                    .replace(['\r', '\n'], "_")
+            ),
         )
         .body(body)
         .map_err(|e| ApiError::Internal(format!("Failed to build response: {e}")))?;

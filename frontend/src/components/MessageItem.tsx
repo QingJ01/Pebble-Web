@@ -50,7 +50,6 @@ function MessageItem({ message, labels = [], isSelected, onClick, onToggleStar, 
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const [showActions, setShowActions] = useState(false);
-  const fontWeight = message.is_read ? "normal" : "600";
   const inKanban = useKanbanStore((s) => s.cardIdSet.has(message.id));
   const archiveActionLabel = folderRole === "archive"
     ? t("messageActions.unarchive", "Unarchive")
@@ -78,7 +77,6 @@ function MessageItem({ message, labels = [], isSelected, onClick, onToggleStar, 
       style={{
         position: "relative",
         color: "var(--color-text-primary)",
-        fontWeight,
         cursor: "pointer",
         padding: "10px 14px",
         borderBottom: "1px solid var(--color-border)",
@@ -144,6 +142,7 @@ function MessageItem({ message, labels = [], isSelected, onClick, onToggleStar, 
             alignItems: "center",
             gap: "6px",
             fontSize: "13px",
+            fontWeight: "600",
             overflow: "hidden",
             whiteSpace: "nowrap",
             flex: 1,
@@ -182,6 +181,7 @@ function MessageItem({ message, labels = [], isSelected, onClick, onToggleStar, 
       <div
         style={{
           fontSize: "12.5px",
+          fontWeight: message.is_read ? "400" : "600",
           overflow: "hidden",
           textOverflow: "ellipsis",
           whiteSpace: "nowrap",
@@ -343,14 +343,26 @@ function MessageItem({ message, labels = [], isSelected, onClick, onToggleStar, 
           <button
             onClick={(e) => {
               e.stopPropagation();
-              updateMessageFlags(message.id, undefined, !message.is_starred)
+              const nextStarred = !message.is_starred;
+              const previousLists = snapshotMessagesCache(queryClient);
+              onToggleStar?.(message.id, nextStarred);
+              updateMessageFlags(message.id, undefined, nextStarred)
                 .then(() => {
                   invalidateMessageViews();
                   queryClient.invalidateQueries({ queryKey: ["starred-messages"] });
                   queryClient.invalidateQueries({ queryKey: ["message", message.id] });
                 })
-                .catch(console.error);
-              if (onToggleStar) onToggleStar(message.id, !message.is_starred);
+                .catch(() => {
+                  restoreMessagesCache(queryClient, previousLists);
+                  onToggleStar?.(message.id, message.is_starred);
+                  invalidateMessageViews();
+                  queryClient.invalidateQueries({ queryKey: ["starred-messages"] });
+                  queryClient.invalidateQueries({ queryKey: ["message", message.id] });
+                  const failureMessage = message.is_starred
+                    ? t("messageActions.unstarFailed", "Failed to unstar message")
+                    : t("messageActions.starFailed", "Failed to star message");
+                  useToastStore.getState().addToast({ message: failureMessage, type: "error" });
+                });
             }}
             aria-label={message.is_starred ? t("messageActions.unstar") : t("messageActions.star")}
             aria-pressed={message.is_starred}

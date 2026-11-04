@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fmt::Display;
 use std::future::Future;
 use std::pin::Pin;
@@ -5,15 +6,24 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use async_imap::Client;
+use async_imap::{types::NameAttribute, Client};
 use futures::TryStreamExt;
 use pebble_core::{new_id, Folder, FolderRole, FolderType, PebbleError, Result};
 use serde::de::Deserializer;
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
+use tokio_native_tls as async_native_tls;
 use tokio_rustls::client::TlsStream;
 use tracing::debug;
+
+use rustls::{
+    client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+    crypto::{verify_tls12_signature, verify_tls13_signature, CryptoProvider},
+    pki_types::{CertificateDer, ServerName, UnixTime},
+    server::ParsedCertificate,
+    DigitallySignedStruct, Error as TlsError, SignatureScheme,
+};
 
 /// Connection security mode for mail protocols.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -45,6 +55,8 @@ pub struct ImapConfig {
     #[serde(skip_serializing)]
     pub password: String,
     pub security: ConnectionSecurity,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub accept_invalid_certs: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy: Option<ProxyConfig>,
 }
@@ -57,6 +69,7 @@ impl std::fmt::Debug for ImapConfig {
             .field("username", &self.username)
             .field("password", &"[REDACTED]")
             .field("security", &self.security)
+            .field("accept_invalid_certs", &self.accept_invalid_certs)
             .field("proxy", &self.proxy)
             .finish()
     }
@@ -79,6 +92,8 @@ impl<'de> serde::Deserialize<'de> for ImapConfig {
             #[serde(default)]
             use_tls: Option<bool>,
             #[serde(default)]
+            accept_invalid_certs: bool,
+            #[serde(default)]
             proxy: Option<ProxyConfig>,
         }
 
@@ -94,6 +109,7 @@ impl<'de> serde::Deserialize<'de> for ImapConfig {
             username: raw.username,
             password: raw.password,
             security,
+            accept_invalid_certs: raw.accept_invalid_certs,
             proxy: raw.proxy,
         })
     }
@@ -108,6 +124,8 @@ pub struct SmtpConfig {
     #[serde(skip_serializing)]
     pub password: String,
     pub security: ConnectionSecurity,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub accept_invalid_certs: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy: Option<ProxyConfig>,
 }
@@ -120,6 +138,7 @@ impl std::fmt::Debug for SmtpConfig {
             .field("username", &self.username)
             .field("password", &"[REDACTED]")
             .field("security", &self.security)
+            .field("accept_invalid_certs", &self.accept_invalid_certs)
             .field("proxy", &self.proxy)
             .finish()
     }
@@ -142,6 +161,8 @@ impl<'de> serde::Deserialize<'de> for SmtpConfig {
             #[serde(default)]
             use_tls: Option<bool>,
             #[serde(default)]
+            accept_invalid_certs: bool,
+            #[serde(default)]
             proxy: Option<ProxyConfig>,
         }
 
@@ -157,9 +178,32 @@ impl<'de> serde::Deserialize<'de> for SmtpConfig {
             username: raw.username,
             password: raw.password,
             security,
+            accept_invalid_certs: raw.accept_invalid_certs,
             proxy: raw.proxy,
         })
     }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn incremental_fetch_uids(since_uid: Option<u32>, searched_uids: &[u32]) -> Vec<u32> {
+    let Some(since_uid) = since_uid else {
+        return searched_uids.to_vec();
+    };
+    let mut uids = searched_uids
+        .iter()
+        .copied()
+        .filter(|uid| *uid > since_uid)
+        .collect::<Vec<_>>();
+    uids.sort_unstable();
+    uids.dedup();
+    uids
+}
+
+fn should_search_incremental_uids(next_uid: u32, mailbox_uid_next: Option<u32>) -> bool {
+    mailbox_uid_next.is_none_or(|uid_next| next_uid < uid_next)
 }
 
 /// Stream wrapper that replays buffered prefix bytes, then delegates to inner.
@@ -222,6 +266,7 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for PrefixedStream<T> {
 /// `match self.session { Tls(_) => ..., Plain(_) => ... }` duplication.
 enum InnerStream {
     Tls(Box<TlsStream<TcpStream>>),
+    NativeTls(Box<async_native_tls::TlsStream<TcpStream>>),
     Plain(TcpStream),
 }
 
@@ -229,6 +274,7 @@ impl std::fmt::Debug for InnerStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             InnerStream::Tls(_) => f.debug_struct("InnerStream::Tls").finish(),
+            InnerStream::NativeTls(_) => f.debug_struct("InnerStream::NativeTls").finish(),
             InnerStream::Plain(_) => f.debug_struct("InnerStream::Plain").finish(),
         }
     }
@@ -242,6 +288,7 @@ impl AsyncRead for InnerStream {
     ) -> Poll<io::Result<()>> {
         match self.get_mut() {
             InnerStream::Tls(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
+            InnerStream::NativeTls(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
             InnerStream::Plain(s) => Pin::new(s).poll_read(cx, buf),
         }
     }
@@ -255,6 +302,7 @@ impl AsyncWrite for InnerStream {
     ) -> Poll<io::Result<usize>> {
         match self.get_mut() {
             InnerStream::Tls(s) => Pin::new(s.as_mut()).poll_write(cx, buf),
+            InnerStream::NativeTls(s) => Pin::new(s.as_mut()).poll_write(cx, buf),
             InnerStream::Plain(s) => Pin::new(s).poll_write(cx, buf),
         }
     }
@@ -262,6 +310,7 @@ impl AsyncWrite for InnerStream {
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
             InnerStream::Tls(s) => Pin::new(s.as_mut()).poll_flush(cx),
+            InnerStream::NativeTls(s) => Pin::new(s.as_mut()).poll_flush(cx),
             InnerStream::Plain(s) => Pin::new(s).poll_flush(cx),
         }
     }
@@ -269,6 +318,7 @@ impl AsyncWrite for InnerStream {
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
             InnerStream::Tls(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
+            InnerStream::NativeTls(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
             InnerStream::Plain(s) => Pin::new(s).poll_shutdown(cx),
         }
     }
@@ -301,6 +351,37 @@ where
 pub struct ImapMailboxStatus {
     pub uid_validity: Option<u32>,
     pub highest_modseq: Option<u64>,
+    pub uid_next: Option<u32>,
+    /// Number of messages in the mailbox as reported by SELECT.
+    pub exists: u32,
+}
+
+fn imap_since_date(timestamp: i64) -> String {
+    let (year, month, day) = pebble_core::utc_date_from_unix_seconds(timestamp);
+    let month = match month {
+        1 => "Jan",
+        2 => "Feb",
+        3 => "Mar",
+        4 => "Apr",
+        5 => "May",
+        6 => "Jun",
+        7 => "Jul",
+        8 => "Aug",
+        9 => "Sep",
+        10 => "Oct",
+        11 => "Nov",
+        _ => "Dec",
+    };
+    format!("{day:02}-{month}-{year:04}")
+}
+
+fn imap_since_search_criteria(cutoff: i64, since_uid: Option<u32>) -> Option<String> {
+    let mut criteria = format!("SINCE {}", imap_since_date(cutoff));
+    if let Some(uid) = since_uid {
+        let next_uid = uid.checked_add(1)?;
+        criteria.push_str(&format!(" UID {next_uid}:*"));
+    }
+    Some(criteria)
 }
 
 /// An IMAP provider that manages a connection and session.
@@ -310,21 +391,36 @@ pub struct ImapProvider {
 }
 
 /// Build a rustls TLS connector with bundled root certificates.
-fn build_tls_connector() -> Result<tokio_rustls::TlsConnector> {
+fn build_tls_connector(accept_invalid_certs: bool) -> Result<tokio_rustls::TlsConnector> {
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let mut root_store = rustls::RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let config = rustls::ClientConfig::builder_with_provider(provider)
+    let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
-        .map_err(|e| PebbleError::Network(format!("TLS protocol versions: {e}")))?
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
+        .map_err(|e| PebbleError::Network(format!("TLS protocol versions: {e}")))?;
+    let config = if accept_invalid_certs {
+        builder
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptInvalidCertsVerifier {
+                roots: root_store,
+                provider,
+            }))
+            .with_no_client_auth()
+    } else {
+        builder
+            .with_root_certificates(root_store)
+            .with_no_client_auth()
+    };
     Ok(tokio_rustls::TlsConnector::from(Arc::new(config)))
 }
 
 /// Perform a TLS handshake using rustls on the given TCP stream.
-async fn tls_connect(host: &str, tcp: TcpStream) -> Result<TlsStream<TcpStream>> {
-    let connector = build_tls_connector()?;
+async fn tls_connect(
+    host: &str,
+    tcp: TcpStream,
+    accept_invalid_certs: bool,
+) -> Result<TlsStream<TcpStream>> {
+    let connector = build_tls_connector(accept_invalid_certs)?;
     let server_name = rustls::pki_types::ServerName::try_from(host)
         .map_err(|e| PebbleError::Network(format!("Invalid server name '{}': {}", host, e)))?
         .to_owned();
@@ -334,6 +430,112 @@ async fn tls_connect(host: &str, tcp: TcpStream) -> Result<TlsStream<TcpStream>>
         connector.connect(server_name, tcp),
     )
     .await
+}
+
+/// Build a native-tls connector (delegates to OS TLS: SChannel/SecureTransport/OpenSSL).
+fn build_native_tls_connector(
+    accept_invalid_certs: bool,
+) -> Result<async_native_tls::TlsConnector> {
+    let mut builder = native_tls::TlsConnector::builder();
+    if accept_invalid_certs {
+        builder.danger_accept_invalid_certs(true);
+        builder.danger_accept_invalid_hostnames(true);
+        builder.min_protocol_version(Some(native_tls::Protocol::Tlsv10));
+    }
+    let connector = builder
+        .build()
+        .map_err(|e| PebbleError::Network(format!("native-tls init: {e}")))?;
+    Ok(async_native_tls::TlsConnector::from(connector))
+}
+
+/// Perform a TLS handshake using native-tls (OS TLS backend) on the given TCP stream.
+/// Used as fallback when rustls fails (e.g. servers that only offer DHE cipher suites).
+async fn native_tls_connect(
+    host: &str,
+    tcp: TcpStream,
+    accept_invalid_certs: bool,
+) -> Result<async_native_tls::TlsStream<TcpStream>> {
+    let connector = build_native_tls_connector(accept_invalid_certs)?;
+    with_imap_timeout(
+        &format!("TLS handshake (native-tls) with {host}"),
+        IMAP_CONNECT_TIMEOUT_SECS,
+        connector.connect(host, tcp),
+    )
+    .await
+}
+
+#[derive(Debug)]
+pub(crate) struct AcceptInvalidCertsVerifier {
+    roots: rustls::RootCertStore,
+    provider: Arc<CryptoProvider>,
+}
+
+impl AcceptInvalidCertsVerifier {
+    pub(crate) fn new(roots: rustls::RootCertStore) -> Self {
+        Self {
+            roots,
+            provider: Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
+        }
+    }
+}
+
+impl ServerCertVerifier for AcceptInvalidCertsVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> std::result::Result<ServerCertVerified, TlsError> {
+        if !self.roots.is_empty() {
+            if let Ok(cert) = ParsedCertificate::try_from(end_entity) {
+                let _ = rustls::client::verify_server_cert_signed_by_trust_anchor(
+                    &cert,
+                    &self.roots,
+                    intermediates,
+                    now,
+                    self.provider.signature_verification_algorithms.all,
+                );
+                let _ = rustls::client::verify_server_name(&cert, server_name);
+            }
+        }
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, TlsError> {
+        verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, TlsError> {
+        verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
 }
 
 impl ImapProvider {
@@ -415,16 +617,9 @@ impl ImapProvider {
         Ok(greeting)
     }
 
-    /// Send STARTTLS command on a raw TCP stream and upgrade to TLS.
-    /// Returns the original greeting bytes (for replay) and the TLS stream.
-    async fn starttls_upgrade(
-        host: &str,
-        tcp: TcpStream,
-        greeting: Vec<u8>,
-    ) -> Result<(Vec<u8>, TlsStream<TcpStream>)> {
-        let mut tcp = tcp;
-
-        // Send STARTTLS command
+    /// Send STARTTLS command and read the server response.
+    /// Returns the TCP stream ready for TLS upgrade.
+    async fn negotiate_starttls(mut tcp: TcpStream) -> Result<TcpStream> {
         with_imap_timeout(
             "Send STARTTLS",
             IMAP_COMMAND_TIMEOUT_SECS,
@@ -433,7 +628,6 @@ impl ImapProvider {
         .await?;
         with_imap_timeout("Flush STARTTLS", IMAP_COMMAND_TIMEOUT_SECS, tcp.flush()).await?;
 
-        // Read STARTTLS response
         let mut resp = Vec::new();
         let mut buf = [0u8; 4096];
         loop {
@@ -461,11 +655,86 @@ impl ImapProvider {
             }
         }
         debug!("STARTTLS accepted, upgrading connection");
+        Ok(tcp)
+    }
 
-        // Upgrade to TLS
-        let tls_stream = tls_connect(host, tcp).await?;
+    /// Connect via STARTTLS: read greeting, optionally send ID, negotiate
+    /// STARTTLS, upgrade to TLS (rustls or native-tls), then login.
+    async fn connect_starttls(
+        &self,
+        tcp: TcpStream,
+        needs_id: bool,
+        use_native_tls: bool,
+    ) -> Result<ImapSession> {
+        let mut tcp = tcp;
 
-        Ok((greeting, tls_stream))
+        // Read greeting
+        let mut greeting = vec![0u8; 8192];
+        let n = with_imap_timeout(
+            "Read greeting",
+            IMAP_COMMAND_TIMEOUT_SECS,
+            tcp.read(&mut greeting),
+        )
+        .await?;
+        greeting.truncate(n);
+
+        // Send ID command before STARTTLS if needed (on plain connection)
+        if needs_id {
+            with_imap_timeout(
+                "Send ID",
+                IMAP_COMMAND_TIMEOUT_SECS,
+                tcp.write_all(
+                    b"A000 ID (\"name\" \"Pebble\" \"version\" \"1.0\" \"vendor\" \"Pebble\")\r\n",
+                ),
+            )
+            .await?;
+            with_imap_timeout("Flush ID", IMAP_COMMAND_TIMEOUT_SECS, tcp.flush()).await?;
+
+            let mut resp = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = with_imap_timeout(
+                    "Read ID response",
+                    IMAP_COMMAND_TIMEOUT_SECS,
+                    tcp.read(&mut buf),
+                )
+                .await?;
+                if n == 0 {
+                    return Err(PebbleError::Network("Connection closed during ID".into()));
+                }
+                resp.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&resp);
+                if text.contains("A000 OK") || text.contains("A000 NO") || text.contains("A000 BAD")
+                {
+                    break;
+                }
+            }
+            debug!("IMAP ID command accepted (pre-STARTTLS)");
+        }
+
+        // STARTTLS negotiation
+        let tcp = Self::negotiate_starttls(tcp).await?;
+
+        // TLS upgrade
+        let inner = if use_native_tls {
+            let tls = native_tls_connect(&self.config.host, tcp, self.config.accept_invalid_certs)
+                .await?;
+            InnerStream::NativeTls(Box::new(tls))
+        } else {
+            let tls = tls_connect(&self.config.host, tcp, self.config.accept_invalid_certs).await?;
+            InnerStream::Tls(Box::new(tls))
+        };
+
+        // Replay the original greeting so Client::new() is happy
+        let stream = PrefixedStream::with_prefix(greeting, inner);
+        let client = Client::new(stream);
+        tokio::time::timeout(
+            Duration::from_secs(IMAP_COMMAND_TIMEOUT_SECS),
+            client.login(&self.config.username, &self.config.password),
+        )
+        .await
+        .map_err(|_| imap_timeout_error("IMAP login", IMAP_COMMAND_TIMEOUT_SECS))?
+        .map_err(|(e, _)| PebbleError::Auth(format!("IMAP login failed: {e}")))
     }
 
     /// Establish a TCP connection, optionally through a SOCKS5 proxy.
@@ -517,20 +786,44 @@ impl ImapProvider {
 
         let session: ImapSession = match self.config.security {
             ConnectionSecurity::Tls => {
-                // Implicit TLS — wrap immediately
-                debug!(
-                    "Starting TLS handshake (rustls) with SNI={}",
-                    self.config.host
-                );
-                let mut tls_stream = tls_connect(&self.config.host, tcp).await?;
+                // Implicit TLS — wrap immediately; try rustls, fall back to native-tls
+                debug!("Starting TLS handshake with SNI={}", self.config.host);
+                let inner = match tls_connect(
+                    &self.config.host,
+                    tcp,
+                    self.config.accept_invalid_certs,
+                )
+                .await
+                {
+                    Ok(tls) => InnerStream::Tls(Box::new(tls)),
+                    Err(rustls_err) => {
+                        debug!(
+                            "rustls handshake failed ({}), retrying with native-tls",
+                            rustls_err
+                        );
+                        let tcp = self.tcp_connect().await?;
+                        let tls = native_tls_connect(
+                            &self.config.host,
+                            tcp,
+                            self.config.accept_invalid_certs,
+                        )
+                            .await
+                            .map_err(|e| {
+                                PebbleError::Network(format!(
+                                    "TLS failed with both backends — rustls: {rustls_err}, native-tls: {e}"
+                                ))
+                            })?;
+                        InnerStream::NativeTls(Box::new(tls))
+                    }
+                };
 
+                let mut inner = inner;
                 let prefix = if needs_id {
-                    Self::send_id_before_login(&mut tls_stream).await?
+                    Self::send_id_before_login(&mut inner).await?
                 } else {
                     Vec::new()
                 };
-                let stream =
-                    PrefixedStream::with_prefix(prefix, InnerStream::Tls(Box::new(tls_stream)));
+                let stream = PrefixedStream::with_prefix(prefix, inner);
 
                 let client = Client::new(stream);
                 tokio::time::timeout(
@@ -542,68 +835,25 @@ impl ImapProvider {
                 .map_err(|(e, _)| PebbleError::Auth(format!("IMAP login failed: {e}")))?
             }
             ConnectionSecurity::StartTls => {
-                // Connect plain, read greeting, optionally send ID, then STARTTLS upgrade
-                let mut tcp = tcp;
-
-                // Read greeting
-                let mut greeting = vec![0u8; 8192];
-                let n = with_imap_timeout(
-                    "Read greeting",
-                    IMAP_COMMAND_TIMEOUT_SECS,
-                    tcp.read(&mut greeting),
-                )
-                .await?;
-                greeting.truncate(n);
-
-                // Send ID command before STARTTLS if needed (on plain connection)
-                if needs_id {
-                    with_imap_timeout(
-                        "Send ID",
-                        IMAP_COMMAND_TIMEOUT_SECS,
-                        tcp.write_all(b"A000 ID (\"name\" \"Pebble\" \"version\" \"1.0\" \"vendor\" \"Pebble\")\r\n"),
-                    )
-                    .await?;
-                    with_imap_timeout("Flush ID", IMAP_COMMAND_TIMEOUT_SECS, tcp.flush()).await?;
-
-                    let mut resp = Vec::new();
-                    let mut buf = [0u8; 4096];
-                    loop {
-                        let n = with_imap_timeout(
-                            "Read ID response",
-                            IMAP_COMMAND_TIMEOUT_SECS,
-                            tcp.read(&mut buf),
-                        )
-                        .await?;
-                        if n == 0 {
-                            return Err(PebbleError::Network("Connection closed during ID".into()));
-                        }
-                        resp.extend_from_slice(&buf[..n]);
-                        let text = String::from_utf8_lossy(&resp);
-                        if text.contains("A000 OK")
-                            || text.contains("A000 NO")
-                            || text.contains("A000 BAD")
-                        {
-                            break;
-                        }
+                // Connect plain, read greeting, optionally send ID, STARTTLS, upgrade TLS.
+                // Try rustls first, fall back to native-tls on handshake failure.
+                match self.connect_starttls(tcp, needs_id, false).await {
+                    Ok(session) => session,
+                    Err(rustls_err) => {
+                        debug!(
+                            "STARTTLS with rustls failed ({}), retrying with native-tls",
+                            rustls_err
+                        );
+                        let tcp = self.tcp_connect().await?;
+                        self.connect_starttls(tcp, needs_id, true)
+                            .await
+                            .map_err(|native_err| {
+                                PebbleError::Network(format!(
+                                    "STARTTLS failed with both TLS backends — rustls: {rustls_err}, native-tls: {native_err}"
+                                ))
+                            })?
                     }
-                    debug!("IMAP ID command accepted (pre-STARTTLS)");
                 }
-
-                // STARTTLS upgrade
-                let (greeting, tls_stream) =
-                    Self::starttls_upgrade(&self.config.host, tcp, greeting).await?;
-
-                // Replay the original greeting so Client::new() is happy
-                let stream =
-                    PrefixedStream::with_prefix(greeting, InnerStream::Tls(Box::new(tls_stream)));
-                let client = Client::new(stream);
-                tokio::time::timeout(
-                    Duration::from_secs(IMAP_COMMAND_TIMEOUT_SECS),
-                    client.login(&self.config.username, &self.config.password),
-                )
-                .await
-                .map_err(|_| imap_timeout_error("IMAP login", IMAP_COMMAND_TIMEOUT_SECS))?
-                .map_err(|(e, _)| PebbleError::Auth(format!("IMAP login failed: {e}")))?
             }
             ConnectionSecurity::Plain => {
                 // Plain TCP — no encryption
@@ -683,37 +933,117 @@ impl ImapProvider {
             tcp
         };
 
+        // Helper: reconnect TCP for TLS fallback (no report, just the socket)
+        let reconnect_tcp = |config: &ImapConfig| {
+            let addr_clone = addr.clone();
+            let proxy = config.proxy.clone();
+            async move {
+                if let Some(ref proxy) = proxy {
+                    let proxy_addr = format!("{}:{}", proxy.host, proxy.port);
+                    let stream = tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        tokio_socks::tcp::Socks5Stream::connect(
+                            proxy_addr.as_str(),
+                            addr_clone.as_str(),
+                        ),
+                    )
+                    .await
+                    .map_err(|_| {
+                        PebbleError::Network(format!(
+                            "SOCKS5 reconnect to {proxy_addr} timed out (10s)"
+                        ))
+                    })?
+                    .map_err(|e| PebbleError::Network(format!("SOCKS5 proxy: {e}")))?;
+                    Ok::<TcpStream, PebbleError>(stream.into_inner())
+                } else {
+                    let tcp = tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        TcpStream::connect(&addr_clone),
+                    )
+                    .await
+                    .map_err(|_| {
+                        PebbleError::Network(format!(
+                            "TCP reconnect to {addr_clone} timed out (10s)"
+                        ))
+                    })?
+                    .map_err(|e| PebbleError::Network(format!("TCP reconnect: {e}")))?;
+                    Ok::<TcpStream, PebbleError>(tcp)
+                }
+            }
+        };
+
         // Step 2: TLS handshake (if applicable)
         match config.security {
             ConnectionSecurity::Tls => {
                 let t1 = Instant::now();
-                let mut tls = tokio::time::timeout(
+                match tokio::time::timeout(
                     std::time::Duration::from_secs(10),
-                    tls_connect(&config.host, tcp),
+                    tls_connect(&config.host, tcp, config.accept_invalid_certs),
                 )
                 .await
-                .map_err(|_| PebbleError::Network("TLS handshake timed out (10s)".into()))??;
-                report.push_str(&format!(
-                    "TLS handshake (implicit): OK ({:.0}ms)\n",
-                    t1.elapsed().as_millis()
-                ));
-
-                // Step 3: Read IMAP greeting
-                let t2 = Instant::now();
-                let mut buf = vec![0u8; 4096];
-                let n =
-                    tokio::time::timeout(std::time::Duration::from_secs(10), tls.read(&mut buf))
+                {
+                    Ok(Ok(mut tls)) => {
+                        report.push_str(&format!(
+                            "TLS handshake (rustls): OK ({:.0}ms)\n",
+                            t1.elapsed().as_millis()
+                        ));
+                        let t2 = Instant::now();
+                        let mut buf = vec![0u8; 4096];
+                        let n = tokio::time::timeout(
+                            std::time::Duration::from_secs(10),
+                            tls.read(&mut buf),
+                        )
                         .await
                         .map_err(|_| {
                             PebbleError::Network("Read IMAP greeting timed out (10s)".into())
                         })?
                         .map_err(|e| PebbleError::Network(format!("Read greeting: {e}")))?;
-                let greeting = String::from_utf8_lossy(&buf[..n]);
-                report.push_str(&format!(
-                    "IMAP greeting ({:.0}ms): {}\n",
-                    t2.elapsed().as_millis(),
-                    greeting.trim()
-                ));
+                        let greeting = String::from_utf8_lossy(&buf[..n]);
+                        report.push_str(&format!(
+                            "IMAP greeting ({:.0}ms): {}\n",
+                            t2.elapsed().as_millis(),
+                            greeting.trim()
+                        ));
+                    }
+                    Ok(Err(rustls_err)) => {
+                        report
+                            .push_str(&format!("TLS handshake (rustls): FAILED — {rustls_err}\n"));
+                        let tcp = reconnect_tcp(config).await?;
+                        let t_ntls = Instant::now();
+                        let mut tls = tokio::time::timeout(
+                            std::time::Duration::from_secs(10),
+                            native_tls_connect(&config.host, tcp, config.accept_invalid_certs),
+                        )
+                        .await
+                        .map_err(|_| {
+                            PebbleError::Network("native-tls handshake timed out (10s)".into())
+                        })??;
+                        report.push_str(&format!(
+                            "TLS handshake (native-tls fallback): OK ({:.0}ms)\n",
+                            t_ntls.elapsed().as_millis()
+                        ));
+                        let t2 = Instant::now();
+                        let mut buf = vec![0u8; 4096];
+                        let n = tokio::time::timeout(
+                            std::time::Duration::from_secs(10),
+                            tls.read(&mut buf),
+                        )
+                        .await
+                        .map_err(|_| {
+                            PebbleError::Network("Read IMAP greeting timed out (10s)".into())
+                        })?
+                        .map_err(|e| PebbleError::Network(format!("Read greeting: {e}")))?;
+                        let greeting = String::from_utf8_lossy(&buf[..n]);
+                        report.push_str(&format!(
+                            "IMAP greeting ({:.0}ms): {}\n",
+                            t2.elapsed().as_millis(),
+                            greeting.trim()
+                        ));
+                    }
+                    Err(_) => {
+                        return Err(PebbleError::Network("TLS handshake timed out (10s)".into()));
+                    }
+                }
             }
             ConnectionSecurity::StartTls => {
                 // Read plain greeting first
@@ -759,18 +1089,73 @@ impl ImapProvider {
                     resp_str.trim()
                 ));
 
-                // TLS upgrade
+                // TLS upgrade — try rustls, fall back to native-tls
                 let t3 = Instant::now();
-                tokio::time::timeout(
+                match tokio::time::timeout(
                     std::time::Duration::from_secs(10),
-                    tls_connect(&config.host, tcp),
+                    tls_connect(&config.host, tcp, config.accept_invalid_certs),
                 )
                 .await
-                .map_err(|_| PebbleError::Network("TLS upgrade timed out (10s)".into()))??;
-                report.push_str(&format!(
-                    "TLS upgrade (STARTTLS): OK ({:.0}ms)\n",
-                    t3.elapsed().as_millis()
-                ));
+                {
+                    Ok(Ok(_)) => {
+                        report.push_str(&format!(
+                            "TLS upgrade (STARTTLS, rustls): OK ({:.0}ms)\n",
+                            t3.elapsed().as_millis()
+                        ));
+                    }
+                    Ok(Err(rustls_err)) => {
+                        report.push_str(&format!(
+                            "TLS upgrade (STARTTLS, rustls): FAILED — {rustls_err}\n"
+                        ));
+                        // Reconnect and redo STARTTLS with native-tls
+                        let tcp = reconnect_tcp(config).await?;
+                        let mut tcp = tcp;
+                        // Re-read greeting (discard)
+                        let mut discard = vec![0u8; 4096];
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_secs(10),
+                            tcp.read(&mut discard),
+                        )
+                        .await
+                        .map_err(|_| PebbleError::Network("Read greeting timed out (10s)".into()))?
+                        .map_err(|e| PebbleError::Network(format!("Read greeting: {e}")))?;
+                        // Re-send STARTTLS
+                        tcp.write_all(b"A001 STARTTLS\r\n")
+                            .await
+                            .map_err(|e| PebbleError::Network(format!("Send STARTTLS: {e}")))?;
+                        tcp.flush()
+                            .await
+                            .map_err(|e| PebbleError::Network(format!("Flush: {e}")))?;
+                        let mut resp2 = vec![0u8; 4096];
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_secs(10),
+                            tcp.read(&mut resp2),
+                        )
+                        .await
+                        .map_err(|_| {
+                            PebbleError::Network("STARTTLS response timed out (10s)".into())
+                        })?
+                        .map_err(|e| {
+                            PebbleError::Network(format!("Read STARTTLS response: {e}"))
+                        })?;
+                        let t4 = Instant::now();
+                        tokio::time::timeout(
+                            std::time::Duration::from_secs(10),
+                            native_tls_connect(&config.host, tcp, config.accept_invalid_certs),
+                        )
+                        .await
+                        .map_err(|_| {
+                            PebbleError::Network("native-tls upgrade timed out (10s)".into())
+                        })??;
+                        report.push_str(&format!(
+                            "TLS upgrade (STARTTLS, native-tls fallback): OK ({:.0}ms)\n",
+                            t4.elapsed().as_millis()
+                        ));
+                    }
+                    Err(_) => {
+                        return Err(PebbleError::Network("TLS upgrade timed out (10s)".into()));
+                    }
+                }
             }
             ConnectionSecurity::Plain => {
                 // Read plain greeting
@@ -825,25 +1210,35 @@ impl ImapProvider {
             .as_mut()
             .ok_or_else(|| PebbleError::Network("Not connected".to_string()))?;
 
-        let names: Vec<String> = {
+        let mailboxes: Vec<(String, Vec<NameAttribute<'static>>)> = {
             let stream = sess
                 .list(None, Some("*"))
                 .await
                 .map_err(|e| PebbleError::Network(format!("LIST failed: {e}")))?;
             stream
-                .map_ok(|n| n.name().to_string())
+                .map_ok(|n| {
+                    let attributes = n
+                        .attributes()
+                        .iter()
+                        .cloned()
+                        .map(NameAttribute::into_owned)
+                        .collect();
+                    (n.name().to_string(), attributes)
+                })
                 .try_collect()
                 .await
                 .map_err(|e| PebbleError::Network(format!("LIST collect: {e}")))?
         };
 
-        let mut folders: Vec<Folder> = names
+        let mut folders: Vec<Folder> = mailboxes
             .into_iter()
-            .map(|raw_name| {
+            .filter(|(_, attributes)| should_sync_listed_mailbox(attributes))
+            .map(|(raw_name, attributes)| {
                 // Decode IMAP Modified UTF-7 folder name to UTF-8
                 let display_name = utf7_imap::decode_utf7_imap(raw_name.clone());
-                let role =
-                    detect_folder_role(&raw_name).or_else(|| detect_folder_role(&display_name));
+                let role = detect_folder_role_from_attributes(&attributes)
+                    .or_else(|| detect_folder_role(&raw_name))
+                    .or_else(|| detect_folder_role(&display_name));
                 let sort_order = folder_sort_order(&role);
                 Folder {
                     id: new_id(),
@@ -895,7 +1290,27 @@ impl ImapProvider {
                         Some(n) => n,
                         None => return Ok(Vec::new()),
                     };
-                    let uid_set = format!("{next_uid}:*");
+                    if !should_search_incremental_uids(next_uid, mailbox_info.uid_next) {
+                        return Ok(Vec::new());
+                    }
+                    let search_query = format!("UID {next_uid}:*");
+                    let searched_uids: Vec<u32> = with_imap_timeout(
+                        "UID SEARCH",
+                        IMAP_COMMAND_TIMEOUT_SECS,
+                        $s.uid_search(&search_query),
+                    )
+                    .await?
+                    .into_iter()
+                    .collect();
+                    let fetch_uids = incremental_fetch_uids(Some(uid), &searched_uids);
+                    if fetch_uids.is_empty() {
+                        return Ok(Vec::new());
+                    }
+                    let uid_set = fetch_uids
+                        .iter()
+                        .map(u32::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",");
                     let fetches = with_imap_timeout(
                         "UID FETCH",
                         IMAP_COMMAND_TIMEOUT_SECS,
@@ -923,28 +1338,7 @@ impl ImapProvider {
                     } else {
                         1
                     };
-                    let seq_set = format!("{start}:{exists}");
-                    let fetches = with_imap_timeout(
-                        "FETCH",
-                        IMAP_COMMAND_TIMEOUT_SECS,
-                        $s.fetch(&seq_set, "(UID BODY.PEEK[])"),
-                    )
-                    .await?;
-                    let fetches: Vec<async_imap::types::Fetch> = with_imap_timeout(
-                        "FETCH collect",
-                        IMAP_COMMAND_TIMEOUT_SECS,
-                        fetches.try_collect(),
-                    )
-                    .await?;
-                    for fetch in fetches {
-                        if let Some(uid) = fetch.uid {
-                            if let Some(body) = fetch.body() {
-                                results.push((uid, body.to_vec()));
-                            }
-                        } else {
-                            tracing::warn!("Skipping message without UID (seq={})", fetch.message);
-                        }
-                    }
+                    return Self::fetch_messages_sequence_range($s, start, exists).await;
                 }
 
                 results
@@ -953,6 +1347,165 @@ impl ImapProvider {
 
         let results = do_fetch!(sess);
 
+        Ok(results)
+    }
+
+    /// Fetch the raw bytes of the messages whose sequence numbers fall within
+    /// `[start_seq, end_seq]` (inclusive), after selecting `mailbox`.
+    ///
+    /// Sequence numbers are stable for the lifetime of a session; callers that
+    /// page backwards through a mailbox must issue these fetches on the same
+    /// connection. Returns `(uid, raw_bytes)` pairs ordered by the server
+    /// response, which is ascending sequence number.
+    pub async fn fetch_messages_page(
+        &self,
+        mailbox: &str,
+        start_seq: u32,
+        end_seq: u32,
+    ) -> Result<Vec<(u32, Vec<u8>)>> {
+        if start_seq == 0 || end_seq < start_seq {
+            return Ok(Vec::new());
+        }
+        let mut guard = self.session.lock().await;
+        let sess = guard
+            .as_mut()
+            .ok_or_else(|| PebbleError::Network("Not connected".to_string()))?;
+
+        macro_rules! do_fetch {
+            ($s:expr) => {{
+                let mailbox_info =
+                    with_imap_timeout("SELECT", IMAP_COMMAND_TIMEOUT_SECS, $s.select(mailbox))
+                        .await?;
+                if mailbox_info.exists == 0 || start_seq > mailbox_info.exists {
+                    return Ok(Vec::new());
+                }
+                let end_seq = end_seq.min(mailbox_info.exists);
+                Self::fetch_messages_sequence_range($s, start_seq, end_seq).await?
+            }};
+        }
+
+        let results = do_fetch!(sess);
+
+        Ok(results)
+    }
+
+    pub async fn search_uids_since(
+        &self,
+        mailbox: &str,
+        cutoff: i64,
+        since_uid: Option<u32>,
+    ) -> Result<(Vec<u32>, Option<u32>)> {
+        let mut guard = self.session.lock().await;
+        let sess = guard
+            .as_mut()
+            .ok_or_else(|| PebbleError::Network("Not connected".to_string()))?;
+        let mailbox_info =
+            with_imap_timeout("SELECT", IMAP_COMMAND_TIMEOUT_SECS, sess.select(mailbox)).await?;
+        let Some(criteria) = imap_since_search_criteria(cutoff, since_uid) else {
+            return Ok((Vec::new(), mailbox_info.uid_next));
+        };
+        let mut uids = with_imap_timeout(
+            "UID SEARCH",
+            IMAP_COMMAND_TIMEOUT_SECS,
+            sess.uid_search(&criteria),
+        )
+        .await?
+        .into_iter()
+        .collect::<Vec<_>>();
+        uids.sort_unstable();
+        uids.dedup();
+        Ok((uids, mailbox_info.uid_next))
+    }
+
+    pub async fn fetch_messages_by_uids(
+        &self,
+        mailbox: &str,
+        uids: &[u32],
+    ) -> Result<Vec<(u32, Vec<u8>)>> {
+        if uids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let uid_set = uids
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut guard = self.session.lock().await;
+        let sess = guard
+            .as_mut()
+            .ok_or_else(|| PebbleError::Network("Not connected".to_string()))?;
+        let _ =
+            with_imap_timeout("SELECT", IMAP_COMMAND_TIMEOUT_SECS, sess.select(mailbox)).await?;
+        let fetches = with_imap_timeout(
+            "UID FETCH",
+            IMAP_COMMAND_TIMEOUT_SECS,
+            sess.uid_fetch(&uid_set, "(UID BODY.PEEK[])"),
+        )
+        .await?;
+        let fetches: Vec<async_imap::types::Fetch> = with_imap_timeout(
+            "UID FETCH collect",
+            IMAP_COMMAND_TIMEOUT_SECS,
+            fetches.try_collect(),
+        )
+        .await?;
+        let requested: HashSet<_> = uids.iter().copied().collect();
+        let mut fetched = Vec::with_capacity(requested.len());
+        let mut fetched_uids = HashSet::with_capacity(requested.len());
+        for fetch in fetches {
+            let Some(uid) = fetch.uid else {
+                continue;
+            };
+            let Some(body) = fetch.body() else {
+                return Err(PebbleError::Network(format!(
+                    "IMAP UID FETCH returned no body for UID {uid}"
+                )));
+            };
+            fetched_uids.insert(uid);
+            fetched.push((uid, body.to_vec()));
+        }
+        if fetched_uids != requested {
+            return Err(PebbleError::Network(
+                "IMAP UID FETCH did not return every requested UID".to_string(),
+            ));
+        }
+        Ok(fetched)
+    }
+
+    /// Fetch the raw bytes of the messages whose sequence numbers fall within
+    /// `[start_seq, end_seq]` (inclusive). The caller must have already
+    /// selected the mailbox on the same session.
+    async fn fetch_messages_sequence_range(
+        sess: &mut ImapSession,
+        start_seq: u32,
+        end_seq: u32,
+    ) -> Result<Vec<(u32, Vec<u8>)>> {
+        let seq_set = if start_seq == end_seq {
+            start_seq.to_string()
+        } else {
+            format!("{start_seq}:{end_seq}")
+        };
+        let fetches = with_imap_timeout(
+            "FETCH",
+            IMAP_COMMAND_TIMEOUT_SECS,
+            sess.fetch(&seq_set, "(UID BODY.PEEK[])"),
+        )
+        .await?;
+        let fetches: Vec<async_imap::types::Fetch> = with_imap_timeout(
+            "FETCH collect",
+            IMAP_COMMAND_TIMEOUT_SECS,
+            fetches.try_collect(),
+        )
+        .await?;
+        let mut results = Vec::with_capacity(fetches.len());
+        for fetch in fetches {
+            if let Some(uid) = fetch.uid {
+                if let Some(body) = fetch.body() {
+                    results.push((uid, body.to_vec()));
+                }
+            } else {
+                tracing::warn!("Skipping message without UID (seq={})", fetch.message);
+            }
+        }
         Ok(results)
     }
 
@@ -1080,11 +1633,30 @@ impl ImapProvider {
     /// Move a message by UID from one mailbox to another.
     ///
     /// Tries IMAP MOVE (uid_mv) first, falls back to UID COPY + UID STORE \Deleted + EXPUNGE.
+    /// One-shot wrapper around [`move_message_with_dedup`] with retry-dedup disabled.
     pub async fn move_message(
         &self,
         source_mailbox: &str,
         uid: u32,
         dest_mailbox: &str,
+    ) -> Result<()> {
+        self.move_message_with_dedup(source_mailbox, uid, dest_mailbox, None)
+            .await
+    }
+
+    /// Move a message by UID with an idempotent COPY fallback.
+    ///
+    /// Pass the message's `Message-ID` header so that, on retry after a partial
+    /// COPY/EXPUNGE failure, the destination is searched for a matching copy
+    /// before COPY runs — preventing duplicate messages. `None` or an empty
+    /// header disables the check (one-shot move). `STORE \Deleted` + `EXPUNGE`
+    /// are always run and are themselves idempotent.
+    pub async fn move_message_with_dedup(
+        &self,
+        source_mailbox: &str,
+        uid: u32,
+        dest_mailbox: &str,
+        message_id_header: Option<&str>,
     ) -> Result<()> {
         let uid_str = uid.to_string();
 
@@ -1123,7 +1695,43 @@ impl ImapProvider {
                             uid
                         );
 
-                        // Re-select in case MOVE attempt changed state
+                        // Idempotency: on retry after a partial COPY/EXPUNGE
+                        // failure the destination may already hold a copy (COPY
+                        // preserves the Message-ID header). Search the dest and
+                        // skip COPY if a match is found, so a retried move does
+                        // not create duplicates. Any error here is treated as
+                        // "no match" (fall through to COPY) — never block the move.
+                        let mut already_copied = false;
+                        if let Some(h) = message_id_header {
+                            if !h.is_empty() {
+                                let criteria = format!(
+                                    "HEADER \"Message-ID\" \"{}\"",
+                                    h.replace('\\', "\\\\").replace('"', "\\\"")
+                                );
+                                let dest_selected = with_imap_timeout(
+                                    "SELECT",
+                                    IMAP_COMMAND_TIMEOUT_SECS,
+                                    $s.select(dest_mailbox),
+                                )
+                                .await
+                                .is_ok();
+                                if dest_selected {
+                                    already_copied = match with_imap_timeout(
+                                        "UID SEARCH",
+                                        IMAP_COMMAND_TIMEOUT_SECS,
+                                        $s.uid_search(criteria.as_str()),
+                                    )
+                                    .await
+                                    {
+                                        Ok(hits) => hits.into_iter().next().is_some(),
+                                        Err(_) => false,
+                                    };
+                                }
+                            }
+                        }
+
+                        // Re-select source (restores selection after the dest
+                        // search above and in case the MOVE attempt changed state).
                         with_imap_timeout(
                             "SELECT",
                             IMAP_COMMAND_TIMEOUT_SECS,
@@ -1131,12 +1739,14 @@ impl ImapProvider {
                         )
                         .await?;
 
-                        with_imap_timeout(
-                            "UID COPY",
-                            IMAP_COMMAND_TIMEOUT_SECS,
-                            $s.uid_copy(&uid_str, dest_mailbox),
-                        )
-                        .await?;
+                        if !already_copied {
+                            with_imap_timeout(
+                                "UID COPY",
+                                IMAP_COMMAND_TIMEOUT_SECS,
+                                $s.uid_copy(&uid_str, dest_mailbox),
+                            )
+                            .await?;
+                        }
 
                         let store_result = with_imap_timeout(
                             "STORE \\Deleted",
@@ -1173,6 +1783,34 @@ impl ImapProvider {
         do_move!(sess);
 
         Ok(())
+    }
+
+    /// Find the current UID of a message in `mailbox` by its Message-ID header.
+    /// Used after MOVE/COPY because the destination assigns a new UID.
+    pub async fn find_uid_by_message_id(
+        &self,
+        mailbox: &str,
+        message_id_header: &str,
+    ) -> Result<Option<u32>> {
+        if message_id_header.trim().is_empty() {
+            return Ok(None);
+        }
+        let criteria = format!(
+            "HEADER \"Message-ID\" \"{}\"",
+            message_id_header.replace('\\', "\\\\").replace('"', "\\\"")
+        );
+        let mut guard = self.session.lock().await;
+        let sess = guard
+            .as_mut()
+            .ok_or_else(|| PebbleError::Network("Not connected".to_string()))?;
+        with_imap_timeout("SELECT", IMAP_COMMAND_TIMEOUT_SECS, sess.select(mailbox)).await?;
+        let hits = with_imap_timeout(
+            "UID SEARCH",
+            IMAP_COMMAND_TIMEOUT_SECS,
+            sess.uid_search(criteria.as_str()),
+        )
+        .await?;
+        Ok(hits.into_iter().max())
     }
 
     /// Delete a message by UID: flag as \Deleted and EXPUNGE.
@@ -1296,6 +1934,8 @@ impl ImapProvider {
                 ImapMailboxStatus {
                     uid_validity: mailbox_info.uid_validity,
                     highest_modseq: mailbox_info.highest_modseq,
+                    uid_next: mailbox_info.uid_next,
+                    exists: mailbox_info.exists,
                 }
             }};
         }
@@ -1492,6 +2132,26 @@ fn parse_flags<'a>(flags: impl Iterator<Item = async_imap::types::Flag<'a>>) -> 
     (is_read, is_starred)
 }
 
+fn should_sync_listed_mailbox(attributes: &[NameAttribute<'_>]) -> bool {
+    !attributes
+        .iter()
+        .any(|attribute| matches!(attribute, NameAttribute::NoSelect))
+}
+
+fn detect_folder_role_from_attributes(attributes: &[NameAttribute<'_>]) -> Option<FolderRole> {
+    attributes.iter().find_map(|attribute| match attribute {
+        NameAttribute::Archive => Some(FolderRole::Archive),
+        NameAttribute::Drafts => Some(FolderRole::Drafts),
+        NameAttribute::Junk => Some(FolderRole::Spam),
+        NameAttribute::Sent => Some(FolderRole::Sent),
+        NameAttribute::Trash => Some(FolderRole::Trash),
+        NameAttribute::Extension(value) if value.eq_ignore_ascii_case("\\Inbox") => {
+            Some(FolderRole::Inbox)
+        }
+        _ => None,
+    })
+}
+
 /// Detect a folder role based on its name.
 pub fn detect_folder_role(name: &str) -> Option<FolderRole> {
     let lower = name.to_lowercase();
@@ -1540,11 +2200,49 @@ pub fn folder_sort_order(role: &Option<FolderRole>) -> i32 {
 
 #[cfg(test)]
 mod tls_config_tests {
-    use super::{build_tls_connector, imap_timeout_error};
+    use super::{
+        build_native_tls_connector, build_tls_connector, imap_timeout_error, ImapConfig, SmtpConfig,
+    };
 
     #[test]
     fn build_tls_connector_returns_result() {
-        assert!(build_tls_connector().is_ok());
+        assert!(build_tls_connector(false).is_ok());
+        assert!(build_tls_connector(true).is_ok());
+    }
+
+    #[test]
+    fn build_native_tls_connector_returns_result() {
+        assert!(build_native_tls_connector(false).is_ok());
+        assert!(build_native_tls_connector(true).is_ok());
+    }
+
+    #[test]
+    fn imap_config_defaults_to_certificate_verification() {
+        let config: ImapConfig = serde_json::from_value(serde_json::json!({
+            "host": "mail.example.com",
+            "port": 993,
+            "username": "user",
+            "password": "secret",
+            "security": "tls"
+        }))
+        .unwrap();
+
+        assert!(!config.accept_invalid_certs);
+    }
+
+    #[test]
+    fn smtp_config_preserves_invalid_certificate_override() {
+        let config: SmtpConfig = serde_json::from_value(serde_json::json!({
+            "host": "mail.example.com",
+            "port": 465,
+            "username": "user",
+            "password": "secret",
+            "security": "tls",
+            "accept_invalid_certs": true
+        }))
+        .unwrap();
+
+        assert!(config.accept_invalid_certs);
     }
 
     #[test]
@@ -1555,5 +2253,100 @@ mod tls_config_tests {
             error.to_string(),
             "Network error: UID FETCH timed out after 30s"
         );
+    }
+}
+
+#[cfg(test)]
+mod folder_list_tests {
+    use async_imap::types::NameAttribute;
+    use pebble_core::FolderRole;
+
+    use super::{detect_folder_role_from_attributes, should_sync_listed_mailbox};
+
+    #[test]
+    fn special_use_attributes_detect_system_folder_roles() {
+        assert_eq!(
+            detect_folder_role_from_attributes(&[NameAttribute::Sent]),
+            Some(FolderRole::Sent)
+        );
+        assert_eq!(
+            detect_folder_role_from_attributes(&[NameAttribute::Trash]),
+            Some(FolderRole::Trash)
+        );
+        assert_eq!(
+            detect_folder_role_from_attributes(&[NameAttribute::Drafts]),
+            Some(FolderRole::Drafts)
+        );
+        assert_eq!(
+            detect_folder_role_from_attributes(&[NameAttribute::Archive]),
+            Some(FolderRole::Archive)
+        );
+        assert_eq!(
+            detect_folder_role_from_attributes(&[NameAttribute::Junk]),
+            Some(FolderRole::Spam)
+        );
+    }
+
+    #[test]
+    fn extension_inbox_attribute_detects_inbox_role() {
+        assert_eq!(
+            detect_folder_role_from_attributes(&[NameAttribute::Extension("\\Inbox".into())]),
+            Some(FolderRole::Inbox)
+        );
+    }
+
+    #[test]
+    fn noselect_mailboxes_are_not_synced_as_real_folders() {
+        assert!(!should_sync_listed_mailbox(&[NameAttribute::NoSelect]));
+        assert!(!should_sync_listed_mailbox(&[
+            NameAttribute::NoSelect,
+            NameAttribute::Extension("\\HasChildren".into()),
+        ]));
+        assert!(should_sync_listed_mailbox(&[NameAttribute::Sent]));
+    }
+}
+
+#[cfg(test)]
+mod incremental_uid_tests {
+    use super::{
+        imap_since_search_criteria, incremental_fetch_uids, should_search_incremental_uids,
+    };
+
+    #[test]
+    fn sync_range_search_uses_inclusive_utc_date_and_uid_cursor() {
+        assert_eq!(
+            imap_since_search_criteria(1_704_067_200, Some(42)),
+            Some("SINCE 01-Jan-2024 UID 43:*".to_string())
+        );
+        assert_eq!(
+            imap_since_search_criteria(1_704_067_200, Some(u32::MAX)),
+            None
+        );
+    }
+
+    #[test]
+    fn incremental_fetch_skips_when_no_uid_is_newer_than_cursor() {
+        let uids = incremental_fetch_uids(Some(3291), &[1, 42, 3291]);
+
+        assert!(uids.is_empty());
+    }
+
+    #[test]
+    fn incremental_fetch_returns_only_newer_uids_sorted_and_deduped() {
+        let uids = incremental_fetch_uids(Some(42), &[45, 41, 43, 45, 42]);
+
+        assert_eq!(uids, vec![43, 45]);
+    }
+
+    #[test]
+    fn incremental_fetch_skips_search_when_uidnext_shows_no_new_mail() {
+        assert!(!should_search_incremental_uids(3292, Some(3292)));
+        assert!(!should_search_incremental_uids(3293, Some(3292)));
+    }
+
+    #[test]
+    fn incremental_fetch_searches_when_uidnext_is_missing_or_newer() {
+        assert!(should_search_incremental_uids(3292, None));
+        assert!(should_search_incremental_uids(3292, Some(3293)));
     }
 }

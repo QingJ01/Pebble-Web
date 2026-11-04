@@ -9,6 +9,8 @@ pebble-core = { path = "../pebble-core" }
 aes-gcm = { workspace = true }
 rand = { workspace = true }
 tracing = { workspace = true }
+ring = { workspace = true }
+serde = { workspace = true }
 zeroize = { version = "1", features = ["zeroize_derive"] }
 hex = "0.4"
 

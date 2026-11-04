@@ -1,21 +1,15 @@
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { File, FileText, Image, FileArchive, Film, Music, Download, Loader, Check } from "lucide-react";
-import { downloadAttachment, listAttachments } from "@/lib/api";
+import { listen } from "@/lib/web-events";
+import { Download, Loader, Check } from "lucide-react";
+import { listAttachments, downloadAttachment } from "@/lib/api";
 import type { Attachment } from "@/lib/api";
+import { sanitizeFilename } from "@/lib/sanitizeFilename";
+import { attachmentVisual } from "./attachmentVisual";
 import { useToastStore } from "@/stores/toast.store";
 
 interface Props {
   messageId: string;
-}
-
-function getMimeIcon(mimeType: string) {
-  if (mimeType.startsWith("image/")) return Image;
-  if (mimeType.startsWith("video/")) return Film;
-  if (mimeType.startsWith("audio/")) return Music;
-  if (mimeType.includes("zip") || mimeType.includes("archive") || mimeType.includes("compressed") || mimeType.includes("tar") || mimeType.includes("rar")) return FileArchive;
-  if (mimeType.includes("text") || mimeType.includes("pdf") || mimeType.includes("document") || mimeType.includes("word")) return FileText;
-  return File;
 }
 
 function formatFileSize(bytes: number): string {
@@ -38,7 +32,21 @@ export default function AttachmentList({ messageId }: Props) {
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [loading, setLoading] = useState(true);
   const [downloadingId, setDownloadingId] = useState<string | null>(null);
-  const [downloadedIds, setDownloadedIds] = useState<Set<string>>(new Set());
+  const [downloadedPaths, setDownloadedPaths] = useState<Record<string, string>>({});
+  const [downloadProgress, setDownloadProgress] = useState<Record<string, number>>({});
+
+  // Listen for download progress events
+  useEffect(() => {
+    const unlisten = listen<{ attachment_id: string; bytes_copied: number; total_bytes: number }>(
+      "attachment:download-progress",
+      (event) => {
+        const { attachment_id, bytes_copied, total_bytes } = event.payload;
+        const pct = total_bytes > 0 ? Math.round((bytes_copied / total_bytes) * 100) : 0;
+        setDownloadProgress((prev) => ({ ...prev, [attachment_id]: pct }));
+      },
+    );
+    return () => { unlisten.then((fn) => fn()); };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -65,8 +73,10 @@ export default function AttachmentList({ messageId }: Props) {
   async function handleDownload(attachment: Attachment) {
     setDownloadingId(attachment.id);
     try {
-      await downloadAttachment(attachment.id, attachment.filename);
-      setDownloadedIds((prev) => new Set(prev).add(attachment.id));
+      const safeName = sanitizeFilename(attachment.filename);
+      const downloadedPath = await downloadAttachment(attachment.id, safeName);
+      setDownloadedPaths((prev) => ({ ...prev, [attachment.id]: downloadedPath }));
+      setDownloadProgress((prev) => { const next = { ...prev }; delete next[attachment.id]; return next; });
     } catch (err) {
       console.error("Failed to download attachment:", err);
       const reason = getErrorMessage(err);
@@ -104,66 +114,38 @@ export default function AttachmentList({ messageId }: Props) {
       >
         {t("attachments.title")} ({attachments.length})
       </div>
-      <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+      <div className="attachment-list">
         {attachments.map((attachment) => {
-          const Icon = getMimeIcon(attachment.mime_type);
+          const { Icon, color } = attachmentVisual(attachment.mime_type, attachment.filename);
           const isDownloading = downloadingId === attachment.id;
 
           return (
-            <div
-              key={attachment.id}
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: "8px",
-                padding: "6px 8px",
-                borderRadius: "6px",
-                backgroundColor: "var(--color-bg-hover)",
-                fontSize: "13px",
-              }}
-            >
-              <Icon size={16} color="var(--color-text-secondary)" style={{ flexShrink: 0 }} />
-              <span
-                style={{
-                  flex: 1,
-                  overflow: "hidden",
-                  textOverflow: "ellipsis",
-                  whiteSpace: "nowrap",
-                  color: "var(--color-text-primary)",
-                }}
-              >
-                {attachment.filename}
-              </span>
-              <span
-                style={{
-                  fontSize: "11px",
-                  color: "var(--color-text-secondary)",
-                  flexShrink: 0,
-                }}
-              >
-                {formatFileSize(attachment.size)}
-              </span>
-              <div style={{ display: "flex", alignItems: "center", gap: "4px", flexShrink: 0 }}>
+            <div key={attachment.id} className="attachment-card">
+              <div className="attachment-icon-tile" style={{ backgroundColor: `${color}1f` }}>
+                <Icon size={17} color={color} />
+              </div>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div className="attachment-name" title={attachment.filename}>
+                  {attachment.filename}
+                </div>
+                <div className="attachment-meta">{formatFileSize(attachment.size)}</div>
+              </div>
+              <div style={{ display: "flex", alignItems: "center", gap: "6px", flexShrink: 0 }}>
+                {isDownloading && downloadProgress[attachment.id] != null && (
+                  <span style={{ fontSize: "10px", color: "var(--color-accent)", minWidth: "28px", textAlign: "right" }}>
+                    {downloadProgress[attachment.id]}%
+                  </span>
+                )}
                 <button
                   onClick={() => handleDownload(attachment)}
                   disabled={isDownloading}
                   aria-label={t("attachments.download") + ": " + attachment.filename}
-                  title={isDownloading ? t("attachments.downloading") : t("attachments.download")}
-                  style={{
-                    background: "none",
-                    border: "none",
-                    cursor: isDownloading ? "default" : "pointer",
-                    padding: "2px",
-                    borderRadius: "4px",
-                    color: "var(--color-text-secondary)",
-                    display: "flex",
-                    alignItems: "center",
-                    opacity: isDownloading ? 0.5 : 1,
-                  }}
+                  title={isDownloading ? t("attachments.downloading") : downloadedPaths[attachment.id] ? downloadedPaths[attachment.id] : t("attachments.download")}
+                  className="attachment-download"
                 >
                   {isDownloading ? (
                     <Loader size={14} className="spinner" />
-                  ) : downloadedIds.has(attachment.id) ? (
+                  ) : downloadedPaths[attachment.id] ? (
                     <Check size={14} style={{ color: "var(--color-accent)" }} />
                   ) : (
                     <Download size={14} />

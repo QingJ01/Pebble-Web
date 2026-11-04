@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Check, Copy, Languages, LayoutGrid, MoreHorizontal, Search, ShieldCheck, X } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
@@ -25,10 +25,15 @@ export default function SelectionActionPopover({
   const [copied, setCopied] = useState(false);
   const [showSecondaryActions, setShowSecondaryActions] = useState(false);
 
+  useEffect(() => {
+    if (!copied) return;
+    const timer = setTimeout(() => setCopied(false), 1500);
+    return () => clearTimeout(timer);
+  }, [copied]);
+
   async function handleCopy() {
     await navigator.clipboard.writeText(text);
     setCopied(true);
-    setTimeout(() => setCopied(false), 1500);
   }
 
   const left = Math.min(position.x, window.innerWidth - 260);

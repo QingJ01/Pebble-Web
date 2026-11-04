@@ -4,6 +4,7 @@ import { useMailStore } from "@/stores/mail.store";
 import { useToastStore } from "@/stores/toast.store";
 import { listTrustedSenders, removeTrustedSender } from "@/lib/api";
 import type { TrustedSender } from "@/lib/api";
+import { profileLocalStorage } from "@/lib/profileStorage";
 import {
   PRIVACY_MODE_KEY,
   readStoredPrivacyMode,
@@ -44,7 +45,7 @@ export default function PrivacyTab() {
 
   function handlePrivacyModeChange(mode: StoredPrivacyMode) {
     setPrivacyMode(mode);
-    localStorage.setItem(PRIVACY_MODE_KEY, mode);
+    profileLocalStorage.setItem(PRIVACY_MODE_KEY, mode);
   }
 
   async function handleRemoveTrust(email: string) {

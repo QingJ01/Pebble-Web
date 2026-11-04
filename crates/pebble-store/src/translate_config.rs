@@ -57,6 +57,22 @@ impl Store {
         })
     }
 
+    pub fn compare_exchange_translate_config_blob(
+        &self,
+        expected: &str,
+        replacement: &str,
+    ) -> Result<bool> {
+        self.with_write(|conn| {
+            let rows_affected = conn.execute(
+                "UPDATE translate_config
+                 SET config = ?1, updated_at = ?2
+                 WHERE id = 'active' AND config = ?3",
+                params![replacement, pebble_core::now_timestamp(), expected],
+            )?;
+            Ok(rows_affected == 1)
+        })
+    }
+
     pub fn delete_translate_config(&self) -> Result<()> {
         self.with_write(|conn| {
             conn.execute("DELETE FROM translate_config WHERE id = 'active'", [])?;
@@ -135,5 +151,32 @@ mod tests {
         store.delete_translate_config().unwrap();
         let loaded = store.get_translate_config().unwrap();
         assert!(loaded.is_none());
+    }
+
+    #[test]
+    fn compare_exchange_translate_config_does_not_overwrite_a_newer_value() {
+        let store = Store::open_in_memory().unwrap();
+        let now = now_timestamp();
+        store
+            .save_translate_config(&TranslateConfig {
+                id: "active".to_string(),
+                provider_type: "deepl".to_string(),
+                config: "legacy".to_string(),
+                is_enabled: true,
+                created_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+
+        assert!(store
+            .compare_exchange_translate_config_blob("legacy", "migrated")
+            .unwrap());
+        assert!(!store
+            .compare_exchange_translate_config_blob("legacy", "stale replacement")
+            .unwrap());
+        assert_eq!(
+            store.get_translate_config().unwrap().unwrap().config,
+            "migrated"
+        );
     }
 }

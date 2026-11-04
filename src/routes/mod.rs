@@ -2,6 +2,7 @@ pub mod accounts;
 pub mod attachments;
 pub mod auth;
 pub mod cloud_sync;
+pub mod commands;
 pub mod compose;
 pub mod contacts;
 pub mod drafts;
@@ -10,7 +11,10 @@ pub mod health;
 pub mod kanban;
 pub mod labels;
 pub mod messages;
+pub mod oauth;
+pub mod portable_commands;
 pub mod rules;
+pub mod safe_files;
 pub mod search;
 pub mod snooze;
 pub mod sync;
@@ -21,6 +25,7 @@ pub mod trusted_senders;
 use crate::state::AppStateRef;
 use crate::ws;
 use axum::{
+    extract::DefaultBodyLimit,
     middleware,
     routing::{delete, get, post, put},
     Router,
@@ -33,9 +38,17 @@ pub fn build_router(state: AppStateRef, static_dir: &str) -> Router {
     let public_routes = Router::new()
         .route("/api/v1/health", get(health::health))
         .route("/api/v1/auth/login", post(auth::login))
+        .route("/api/v1/oauth/providers", get(oauth::providers))
+        .route("/api/v1/oauth/{provider}/callback", get(oauth::callback))
         .route("/api/v1/ws", get(ws::ws_handler));
 
     let protected_routes = Router::new()
+        .route("/api/v1/commands/{command}", post(commands::invoke))
+        .route("/api/v1/oauth/{provider}/start", post(oauth::start))
+        .route(
+            "/api/v1/oauth/{provider}/status/{flow_id}",
+            get(oauth::status),
+        )
         // Accounts
         .route("/api/v1/accounts", get(accounts::list_accounts))
         .route("/api/v1/accounts", post(accounts::create_account))
@@ -240,7 +253,8 @@ pub fn build_router(state: AppStateRef, static_dir: &str) -> Router {
         .route("/api/v1/sync/trigger", post(sync::trigger_sync))
         .layer(middleware::from_fn(move |req, next| {
             crate::auth::auth_middleware(jwt_secret.clone(), req, next)
-        }));
+        }))
+        .layer(DefaultBodyLimit::max(128 * 1024 * 1024));
 
     let index_path = format!("{static_dir}/index.html");
     let spa_fallback = ServeDir::new(static_dir)
@@ -274,7 +288,7 @@ mod tests {
             data_dir: data_dir.clone(),
             password_hash: "test-password-hash".to_string(),
             jwt_secret: "test-jwt-secret-with-at-least-32-chars".to_string(),
-            sync_interval_secs: 300,
+            realtime_preference: "balanced".to_string(),
         })
         .unwrap();
 

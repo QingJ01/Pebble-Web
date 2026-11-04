@@ -132,7 +132,8 @@ npm run dev
 | `PEBBLE_PORT` | 否 | `8080` | 服务端口 |
 | `PEBBLE_DATA_DIR` | 否 | `/data` | 数据目录 |
 | `PEBBLE_STATIC_DIR` | 否 | `./frontend/dist` | 前端静态文件目录 |
-| `PEBBLE_SYNC_INTERVAL` | 否 | `300` | 邮件同步间隔，单位秒 |
+| `PEBBLE_REALTIME_PREFERENCE` | 否 | `balanced` | 服务端同步偏好：`realtime`、`balanced`、`battery` 或 `manual`；已保存的应用设置优先 |
+| `PEBBLE_SYNC_INTERVAL` | 否 | — | 已弃用并忽略；如设置会在启动时警告。请改用 `PEBBLE_REALTIME_PREFERENCE` |
 | `PEBBLE_ENCRYPTION_KEY` | 否 | 自动生成 | 32 字节 Hex 编码加密密钥 |
 
 安全建议：

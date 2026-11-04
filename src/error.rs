@@ -25,3 +25,15 @@ impl IntoResponse for ApiError {
         (status, Json(json!({ "error": message }))).into_response()
     }
 }
+
+impl From<pebble_core::PebbleError> for ApiError {
+    fn from(error: pebble_core::PebbleError) -> Self {
+        use pebble_core::PebbleError;
+        match error {
+            PebbleError::Internal(_) | PebbleError::Storage(_) => {
+                ApiError::Internal(error.to_string())
+            }
+            other => ApiError::BadRequest(other.to_string()),
+        }
+    }
+}

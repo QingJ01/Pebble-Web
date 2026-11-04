@@ -11,6 +11,8 @@ pub enum PebbleError {
     Storage(String),
     #[error("Sync error: {0}")]
     Sync(String),
+    #[error("Sync cursor expired: {0}")]
+    SyncCursorExpired(String),
     #[error("Rule error: {0}")]
     Rule(String),
     #[error("Translate error: {0}")]

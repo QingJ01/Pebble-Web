@@ -113,6 +113,8 @@ mod tests {
 
     fn test_account() -> Account {
         Account {
+            account_label: None,
+            provider_display_name: None,
             id: new_id(),
             email: "test@example.com".to_string(),
             display_name: "Test".to_string(),

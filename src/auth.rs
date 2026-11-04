@@ -10,12 +10,21 @@ use axum::{
 };
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Claims {
     pub sub: String,
     pub exp: usize,
     pub iat: usize,
+    #[serde(default)]
+    pub jti: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct AuthSession {
+    pub token_digest: String,
+    pub expires_at: i64,
 }
 
 pub fn hash_password(password: &str) -> Result<String, String> {
@@ -47,6 +56,7 @@ pub fn create_token(secret: &str, expiry_days: u64) -> Result<String, String> {
         sub: "admin".to_string(),
         iat: now,
         exp: now + (expiry_days * 24 * 60 * 60) as usize,
+        jti: Some(pebble_core::new_id()),
     };
 
     encode(
@@ -69,7 +79,7 @@ pub fn validate_token(token: &str, secret: &str) -> Result<Claims, String> {
 
 pub async fn auth_middleware(
     jwt_secret: String,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
     let auth_header = request
@@ -78,11 +88,15 @@ pub async fn auth_middleware(
         .and_then(|v| v.to_str().ok());
 
     let token = match auth_header {
-        Some(h) if h.starts_with("Bearer ") => &h[7..],
+        Some(h) if h.starts_with("Bearer ") => h[7..].to_string(),
         _ => return Err(StatusCode::UNAUTHORIZED),
     };
 
-    validate_token(token, &jwt_secret).map_err(|_| StatusCode::UNAUTHORIZED)?;
+    let claims = validate_token(&token, &jwt_secret).map_err(|_| StatusCode::UNAUTHORIZED)?;
+    request.extensions_mut().insert(AuthSession {
+        token_digest: hex::encode(Sha256::digest(token.as_bytes())),
+        expires_at: claims.exp as i64,
+    });
 
     Ok(next.run(request).await)
 }

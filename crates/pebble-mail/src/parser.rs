@@ -1,5 +1,5 @@
 use mail_parser::{Address, HeaderValue, MessageParser, MimeHeaders};
-use pebble_core::{EmailAddress, PebbleError, Result};
+use pebble_core::{build_snippet, EmailAddress, PebbleError, Result};
 
 /// Metadata about a parsed attachment.
 #[derive(Debug, Clone)]
@@ -68,17 +68,6 @@ fn extract_id_list(hv: &HeaderValue<'_>) -> Option<String> {
     }
 }
 
-/// Build a snippet from body text: first 200 chars, whitespace normalized.
-fn make_snippet(body_text: &str) -> String {
-    let normalized: String = body_text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if normalized.chars().count() > 200 {
-        let truncated: String = normalized.chars().take(200).collect();
-        format!("{truncated}...")
-    } else {
-        normalized
-    }
-}
-
 /// Parse a raw email byte slice into a `ParsedMessage`.
 pub fn parse_raw_email(raw: &[u8]) -> Result<ParsedMessage> {
     let message = MessageParser::default()
@@ -127,8 +116,8 @@ pub fn parse_raw_email(raw: &[u8]) -> Result<ParsedMessage> {
         .map(|s| s.into_owned())
         .unwrap_or_default();
 
-    // Snippet
-    let snippet = make_snippet(&body_text);
+    // Snippet: prefer body_text, but strip HTML/CSS; fall back to body_html
+    let snippet = build_snippet(&body_text, &body_html);
 
     // Attachments
     let attachments: Vec<AttachmentData> = message
@@ -293,5 +282,64 @@ mod tests {
             "Expected references_header to contain 'abc123@example.com', got: {:?}",
             refs
         );
+    }
+
+    #[test]
+    fn test_snippet_strips_css_from_html_only_email() {
+        let raw = b"From: sender@example.com\r\n\
+                    To: recv@example.com\r\n\
+                    Subject: HTML Only\r\n\
+                    MIME-Version: 1.0\r\n\
+                    Content-Type: text/html; charset=utf-8\r\n\
+                    \r\n\
+                    <html><head><style>body, p { margin: 0; padding: 0; } .mail-container { max-width: 600px; }</style></head>\
+                    <body><p>Your verification code is 123456</p></body></html>";
+
+        let parsed = parse_raw_email(raw).unwrap();
+        assert!(
+            !parsed.snippet.contains("margin"),
+            "Snippet should not contain CSS, got: {:?}",
+            parsed.snippet
+        );
+        assert!(
+            !parsed.snippet.contains("padding"),
+            "Snippet should not contain CSS, got: {:?}",
+            parsed.snippet
+        );
+        assert!(
+            parsed.snippet.contains("verification code"),
+            "Snippet should contain email body text, got: {:?}",
+            parsed.snippet
+        );
+    }
+
+    #[test]
+    fn test_snippet_fallback_to_html_when_text_empty() {
+        let raw = b"From: sender@example.com\r\n\
+                    To: recv@example.com\r\n\
+                    Subject: HTML Only No Text\r\n\
+                    MIME-Version: 1.0\r\n\
+                    Content-Type: multipart/alternative; boundary=\"boundary99\"\r\n\
+                    \r\n\
+                    --boundary99\r\n\
+                    Content-Type: text/html; charset=utf-8\r\n\
+                    \r\n\
+                    <html><body><p>Hello from HTML</p></body></html>\r\n\
+                    --boundary99--\r\n";
+
+        let parsed = parse_raw_email(raw).unwrap();
+        assert!(
+            parsed.snippet.contains("Hello from HTML"),
+            "Snippet should fall back to HTML body, got: {:?}",
+            parsed.snippet
+        );
+    }
+
+    #[test]
+    fn test_strip_html_for_snippet() {
+        let html = r#"<html><head><style>body { margin: 0; }</style></head><body><p>Hello World</p></body></html>"#;
+        let result = pebble_core::strip_html_for_snippet(html);
+        assert!(!result.contains("margin"));
+        assert!(result.contains("Hello World"));
     }
 }

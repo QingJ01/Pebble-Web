@@ -6,6 +6,22 @@ pub struct PkceState {
     pub csrf_token: CsrfToken,
 }
 
+impl PkceState {
+    pub fn into_secrets(self) -> (String, String) {
+        (
+            self.verifier.secret().to_owned(),
+            self.csrf_token.secret().to_owned(),
+        )
+    }
+
+    pub fn from_secrets(verifier: String, csrf_token: String) -> Self {
+        Self {
+            verifier: PkceCodeVerifier::new(verifier),
+            csrf_token: CsrfToken::new(csrf_token),
+        }
+    }
+}
+
 /// Generate a new random PKCE challenge/verifier pair (SHA-256).
 pub fn generate_pkce() -> (PkceCodeChallenge, PkceCodeVerifier) {
     PkceCodeChallenge::new_random_sha256()

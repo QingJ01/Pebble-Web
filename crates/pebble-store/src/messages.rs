@@ -1,10 +1,24 @@
 use pebble_core::{Attachment, Message, MessageSummary, PebbleError, Result};
 use rusqlite::{params, OptionalExtension, Row};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
+use crate::pending_ops::PendingMailOpStatus;
 use crate::Store;
 
 pub type FolderRemoteMessageState = (String, String, bool, bool, i64);
+
+#[derive(Debug)]
+pub struct ImapFolderSnapshotMessage {
+    pub message: Message,
+    pub attachments: Vec<Attachment>,
+}
+
+#[derive(Debug)]
+pub struct ImapFolderReconcileResult {
+    pub indexed_message_ids: Vec<String>,
+    pub removed_messages: Vec<Message>,
+    pub unreferenced_attachment_paths: Vec<String>,
+}
 
 /// Maps a row to a Message. Column order must match the SELECT lists used below.
 ///
@@ -115,6 +129,119 @@ fn row_to_message_summary(row: &Row) -> rusqlite::Result<MessageSummary> {
     })
 }
 
+fn upsert_message_with_conn(conn: &rusqlite::Connection, msg: &Message) -> Result<()> {
+    let to_json =
+        serde_json::to_string(&msg.to_list).map_err(|e| PebbleError::Storage(e.to_string()))?;
+    let cc_json =
+        serde_json::to_string(&msg.cc_list).map_err(|e| PebbleError::Storage(e.to_string()))?;
+    let bcc_json =
+        serde_json::to_string(&msg.bcc_list).map_err(|e| PebbleError::Storage(e.to_string()))?;
+
+    // An INSERT ... ON CONFLICT(id) statement still runs BEFORE INSERT
+    // triggers before SQLite switches to its UPDATE branch. The provider-aware
+    // remote-id uniqueness triggers therefore see the row being updated as a
+    // duplicate of itself. Update known local identities first, and only use
+    // INSERT for genuinely new messages.
+    let updated = conn.execute(
+        "UPDATE messages SET
+           account_id = ?2,
+           remote_id = ?3,
+           message_id_header = ?4,
+           in_reply_to = ?5,
+           references_header = ?6,
+           thread_id = ?7,
+           subject = ?8,
+           snippet = ?9,
+           from_address = ?10,
+           from_name = ?11,
+           to_list = ?12,
+           cc_list = ?13,
+           bcc_list = ?14,
+           body_text = ?15,
+           body_html_raw = ?16,
+           has_attachments = ?17,
+           is_read = ?18,
+           is_starred = ?19,
+           is_draft = ?20,
+           date = ?21,
+           remote_version = ?22,
+           is_deleted = ?23,
+           deleted_at = ?24,
+           created_at = ?25,
+           updated_at = ?26
+         WHERE id = ?1",
+        params![
+            msg.id,
+            msg.account_id,
+            msg.remote_id,
+            msg.message_id_header,
+            msg.in_reply_to,
+            msg.references_header,
+            msg.thread_id,
+            msg.subject,
+            msg.snippet,
+            msg.from_address,
+            msg.from_name,
+            &to_json,
+            &cc_json,
+            &bcc_json,
+            msg.body_text,
+            msg.body_html_raw,
+            msg.has_attachments as i32,
+            msg.is_read as i32,
+            msg.is_starred as i32,
+            msg.is_draft as i32,
+            msg.date,
+            msg.remote_version,
+            msg.is_deleted as i32,
+            msg.deleted_at,
+            msg.created_at,
+            msg.updated_at,
+        ],
+    )?;
+    if updated != 0 {
+        return Ok(());
+    }
+
+    conn.execute(
+        "INSERT INTO messages (id, account_id, remote_id, message_id_header, in_reply_to,
+         references_header, thread_id, subject, snippet, from_address, from_name,
+         to_list, cc_list, bcc_list, body_text, body_html_raw,
+         has_attachments, is_read, is_starred, is_draft,
+         date, remote_version, is_deleted, deleted_at, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,?21, ?22, ?23, ?24, ?25, ?26)",
+        params![
+            msg.id,
+            msg.account_id,
+            msg.remote_id,
+            msg.message_id_header,
+            msg.in_reply_to,
+            msg.references_header,
+            msg.thread_id,
+            msg.subject,
+            msg.snippet,
+            msg.from_address,
+            msg.from_name,
+            to_json,
+            cc_json,
+            bcc_json,
+            msg.body_text,
+            msg.body_html_raw,
+            msg.has_attachments as i32,
+            msg.is_read as i32,
+            msg.is_starred as i32,
+            msg.is_draft as i32,
+            msg.date,
+            msg.remote_version,
+            msg.is_deleted as i32,
+            msg.deleted_at,
+            msg.created_at,
+            msg.updated_at,
+        ],
+    )?;
+    Ok(())
+}
+
 impl Store {
     pub fn insert_message(&self, msg: &Message, folder_ids: &[String]) -> Result<()> {
         self.with_write(|conn| {
@@ -180,48 +307,16 @@ impl Store {
         attachments: &[Attachment],
     ) -> Result<()> {
         self.with_write(|conn| {
-            let to_json = serde_json::to_string(&msg.to_list).map_err(|e| PebbleError::Storage(e.to_string()))?;
-            let cc_json = serde_json::to_string(&msg.cc_list).map_err(|e| PebbleError::Storage(e.to_string()))?;
-            let bcc_json = serde_json::to_string(&msg.bcc_list).map_err(|e| PebbleError::Storage(e.to_string()))?;
-
             let tx = conn.unchecked_transaction()?;
+            upsert_message_with_conn(&tx, msg)?;
 
-            tx.execute("DELETE FROM messages WHERE id = ?1", params![msg.id])?;
             tx.execute(
-                "INSERT INTO messages (id, account_id, remote_id, message_id_header, in_reply_to,
-                 references_header, thread_id, subject, snippet, from_address, from_name,
-                 to_list, cc_list, bcc_list, body_text, body_html_raw,
-                 has_attachments, is_read, is_starred, is_draft,
-                 date, remote_version, is_deleted, deleted_at, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,?21, ?22, ?23, ?24, ?25, ?26)",
-                params![
-                    msg.id,
-                    msg.account_id,
-                    msg.remote_id,
-                    msg.message_id_header,
-                    msg.in_reply_to,
-                    msg.references_header,
-                    msg.thread_id,
-                    msg.subject,
-                    msg.snippet,
-                    msg.from_address,
-                    msg.from_name,
-                    to_json,
-                    cc_json,
-                    bcc_json,
-                    msg.body_text,
-                    msg.body_html_raw,
-                    msg.has_attachments as i32,
-                    msg.is_read as i32,
-                    msg.is_starred as i32,
-                    msg.is_draft as i32,
-                    msg.date,
-                    msg.remote_version,
-                    msg.is_deleted as i32,
-                    msg.deleted_at,
-                    msg.created_at,
-                    msg.updated_at,
-                ],
+                "DELETE FROM message_folders WHERE message_id = ?1",
+                params![msg.id],
+            )?;
+            tx.execute(
+                "DELETE FROM attachments WHERE message_id = ?1",
+                params![msg.id],
             )?;
 
             for folder_id in folder_ids {
@@ -234,10 +329,10 @@ impl Store {
             for attachment in attachments {
                 tx.execute(
                     "INSERT INTO attachments (id, message_id, filename, mime_type, size, local_path, content_id, is_inline)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                     params![
                         attachment.id,
-                        attachment.message_id,
+                        msg.id,
                         attachment.filename,
                         attachment.mime_type,
                         attachment.size,
@@ -248,6 +343,138 @@ impl Store {
                 )?;
             }
 
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    /// Atomically persist an outgoing message, its attachment records, and
+    /// an in-progress send operation before any remote send is attempted.
+    pub fn prepare_outgoing_send(
+        &self,
+        msg: &Message,
+        folder_ids: &[String],
+        attachments: &[Attachment],
+        payload_json: &str,
+    ) -> Result<String> {
+        self.with_write(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            upsert_message_with_conn(&tx, msg)?;
+
+            for folder_id in folder_ids {
+                tx.execute(
+                    "INSERT INTO message_folders (message_id, folder_id) VALUES (?1, ?2)",
+                    params![msg.id, folder_id],
+                )?;
+            }
+            for attachment in attachments {
+                tx.execute(
+                    "INSERT INTO attachments (id, message_id, filename, mime_type, size, local_path, content_id, is_inline)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        attachment.id,
+                        msg.id,
+                        attachment.filename,
+                        attachment.mime_type,
+                        attachment.size,
+                        attachment.local_path,
+                        attachment.content_id,
+                        attachment.is_inline as i32,
+                    ],
+                )?;
+            }
+
+            let op_id = pebble_core::new_id();
+            let now = pebble_core::now_timestamp();
+            tx.execute(
+                "INSERT INTO pending_mail_ops
+                    (id, account_id, message_id, op_type, payload_json, status, attempts,
+                     last_error, created_at, updated_at, next_retry_at)
+                 VALUES (?1, ?2, ?3, 'send', ?4, ?5, 0, NULL, ?6, ?6, NULL)",
+                params![
+                    op_id,
+                    msg.account_id,
+                    msg.id,
+                    payload_json,
+                    PendingMailOpStatus::InProgress.as_str(),
+                    now,
+                ],
+            )?;
+            tx.commit()?;
+            Ok(op_id)
+        })
+    }
+
+    /// Finalize a remotely acknowledged send without exposing an intermediate
+    /// state where the message is in Sent but its operation remains active.
+    pub fn complete_outgoing_send(
+        &self,
+        message_id: &str,
+        op_id: &str,
+        sent_folder_id: Option<&str>,
+    ) -> Result<()> {
+        self.with_write(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let updated = if let Some(sent_folder_id) = sent_folder_id {
+                tx.execute(
+                    "DELETE FROM message_folders WHERE message_id = ?1",
+                    params![message_id],
+                )?;
+                tx.execute(
+                    "INSERT INTO message_folders (message_id, folder_id) VALUES (?1, ?2)",
+                    params![message_id, sent_folder_id],
+                )?;
+                tx.execute(
+                    "UPDATE pending_mail_ops
+                     SET status = ?1, updated_at = ?2, next_retry_at = NULL
+                     WHERE id = ?3 AND message_id = ?4 AND op_type = 'send'",
+                    params![
+                        PendingMailOpStatus::Done.as_str(),
+                        pebble_core::now_timestamp(),
+                        op_id,
+                        message_id,
+                    ],
+                )?
+            } else {
+                let deleted = tx.execute(
+                    "DELETE FROM pending_mail_ops
+                     WHERE id = ?1 AND message_id = ?2 AND op_type = 'send'",
+                    params![op_id, message_id],
+                )?;
+                if deleted == 1 {
+                    tx.execute(
+                        "DELETE FROM message_folders WHERE message_id = ?1",
+                        params![message_id],
+                    )?;
+                    tx.execute("DELETE FROM messages WHERE id = ?1", params![message_id])?;
+                }
+                deleted
+            };
+            if updated != 1 {
+                return Err(PebbleError::Storage(format!(
+                    "Prepared send operation not found: {op_id}"
+                )));
+            }
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    /// Remove a prepared send after a known pre-delivery failure. The pending
+    /// operation is not foreign-keyed to messages, so both rows are deleted in
+    /// the same transaction.
+    pub fn discard_prepared_outgoing_send(&self, message_id: &str, op_id: &str) -> Result<()> {
+        self.with_write(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute(
+                "DELETE FROM pending_mail_ops WHERE id = ?1 AND message_id = ?2 AND op_type = 'send'",
+                params![op_id, message_id],
+            )?;
+            tx.execute(
+                "DELETE FROM message_folders WHERE message_id = ?1",
+                params![message_id],
+            )?;
+            tx.execute("DELETE FROM messages WHERE id = ?1", params![message_id])?;
             tx.commit()?;
             Ok(())
         })
@@ -565,6 +792,40 @@ impl Store {
         })
     }
 
+    /// Move a message to a folder and record the remote ID that folder
+    /// assigned, in one transaction so per-folder UID uniqueness is checked
+    /// against the destination rather than the old folder.
+    pub fn move_message_to_folder_with_remote_id(
+        &self,
+        message_id: &str,
+        target_folder_id: &str,
+        new_remote_id: &str,
+    ) -> Result<()> {
+        self.with_write(|conn| {
+            let now = pebble_core::now_timestamp();
+            let tx = conn.unchecked_transaction()?;
+            tx.execute(
+                "DELETE FROM message_folders WHERE message_id = ?1",
+                params![message_id],
+            )?;
+            let changed = tx.execute(
+                "UPDATE messages SET remote_id = ?1, is_deleted = 0, deleted_at = NULL, updated_at = ?2 WHERE id = ?3",
+                params![new_remote_id, now, message_id],
+            )?;
+            if changed == 0 {
+                return Err(PebbleError::Internal(format!(
+                    "Message not found for remote_id update: {message_id}"
+                )));
+            }
+            tx.execute(
+                "INSERT INTO message_folders (message_id, folder_id) VALUES (?1, ?2)",
+                params![message_id, target_folder_id],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
     pub fn update_remote_id(&self, message_id: &str, new_remote_id: &str) -> Result<()> {
         self.with_write(|conn| {
             let now = pebble_core::now_timestamp();
@@ -800,6 +1061,296 @@ impl Store {
         })
     }
 
+    /// Find legacy half-written rows that claim attachments but have no
+    /// attachment records. Callers must force-refetch these instead of
+    /// treating their remote IDs as complete sync hits.
+    pub fn get_incomplete_attachment_message_map_by_remote_ids(
+        &self,
+        account_id: &str,
+        folder_id: Option<&str>,
+        remote_ids: &[String],
+    ) -> Result<HashMap<String, String>> {
+        if remote_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        self.with_read(|conn| {
+            let first_remote_param = if folder_id.is_some() { 3 } else { 2 };
+            let placeholders: Vec<String> = (0..remote_ids.len())
+                .map(|index| format!("?{}", index + first_remote_param))
+                .collect();
+            let folder_join = if folder_id.is_some() {
+                "JOIN message_folders mf ON mf.message_id = m.id"
+            } else {
+                ""
+            };
+            let folder_filter = if folder_id.is_some() {
+                "AND mf.folder_id = ?2"
+            } else {
+                ""
+            };
+            let sql = format!(
+                "SELECT m.remote_id, m.id
+                 FROM messages m
+                 {folder_join}
+                 WHERE m.account_id = ?1
+                   {folder_filter}
+                   AND m.remote_id IN ({})
+                   AND m.is_deleted = 0
+                   AND m.has_attachments = 1
+                   AND NOT EXISTS (
+                       SELECT 1 FROM attachments a WHERE a.message_id = m.id
+                   )",
+                placeholders.join(", ")
+            );
+            let mut values: Vec<Box<dyn rusqlite::types::ToSql>> =
+                Vec::with_capacity(remote_ids.len() + 2);
+            values.push(Box::new(account_id.to_string()));
+            if let Some(folder_id) = folder_id {
+                values.push(Box::new(folder_id.to_string()));
+            }
+            for remote_id in remote_ids {
+                values.push(Box::new(remote_id.clone()));
+            }
+            let params: Vec<&dyn rusqlite::types::ToSql> =
+                values.iter().map(|value| value.as_ref()).collect();
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(params.as_slice(), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let mut result = HashMap::new();
+            for row in rows {
+                let (remote_id, message_id) = row?;
+                result.insert(remote_id, message_id);
+            }
+            Ok(result)
+        })
+    }
+
+    /// Atomically replace one IMAP mailbox after UIDVALIDITY changes.
+    ///
+    /// A unique, non-empty Message-ID lets an unchanged single-mailbox
+    /// message reuse its local ID, preserving user-owned relations. Missing
+    /// or ambiguous Message-IDs never inherit local state. Search recovery
+    /// work and obsolete attachment discovery are committed with the data.
+    pub fn reconcile_imap_folder_uidvalidity(
+        &self,
+        account_id: &str,
+        folder_id: &str,
+        mut fresh: Vec<ImapFolderSnapshotMessage>,
+    ) -> Result<ImapFolderReconcileResult> {
+        self.with_write(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let old_messages = {
+                let sql = format!(
+                    "SELECT m.{MSG_SELECT}
+                     FROM messages m
+                     JOIN message_folders mf ON mf.message_id = m.id
+                     WHERE m.account_id = ?1
+                       AND mf.folder_id = ?2
+                       AND m.remote_id != ''
+                       AND m.remote_id NOT GLOB '*[^0-9]*'"
+                );
+                let mut stmt = tx.prepare(&sql)?;
+                let rows = stmt.query_map(params![account_id, folder_id], row_to_message)?;
+                let mut messages = Vec::new();
+                for row in rows {
+                    messages.push(row?);
+                }
+                messages
+            };
+            let old_attachment_paths = {
+                let mut stmt = tx.prepare(
+                    "SELECT DISTINCT a.local_path
+                     FROM attachments a
+                     JOIN messages m ON m.id = a.message_id
+                     JOIN message_folders mf ON mf.message_id = m.id
+                     WHERE m.account_id = ?1
+                       AND mf.folder_id = ?2
+                       AND m.remote_id != ''
+                       AND m.remote_id NOT GLOB '*[^0-9]*'
+                       AND a.local_path IS NOT NULL",
+                )?;
+                let rows = stmt.query_map(params![account_id, folder_id], |row| {
+                    row.get::<_, String>(0)
+                })?;
+                let mut paths = Vec::new();
+                for row in rows {
+                    paths.push(row?);
+                }
+                paths
+            };
+
+            let mut old_header_counts: HashMap<String, usize> = HashMap::new();
+            let mut old_by_header: HashMap<String, Message> = HashMap::new();
+            for message in &old_messages {
+                if let Some(header) = message
+                    .message_id_header
+                    .as_deref()
+                    .filter(|header| !header.is_empty())
+                {
+                    *old_header_counts.entry(header.to_string()).or_default() += 1;
+                    old_by_header.insert(header.to_string(), message.clone());
+                }
+            }
+            let mut fresh_header_counts: HashMap<String, usize> = HashMap::new();
+            for entry in &fresh {
+                if let Some(header) = entry
+                    .message
+                    .message_id_header
+                    .as_deref()
+                    .filter(|header| !header.is_empty())
+                {
+                    *fresh_header_counts.entry(header.to_string()).or_default() += 1;
+                }
+            }
+
+            let mut matched_old_ids = HashSet::new();
+            for entry in &mut fresh {
+                let Some(header) = entry
+                    .message
+                    .message_id_header
+                    .as_deref()
+                    .filter(|header| !header.is_empty())
+                else {
+                    continue;
+                };
+                if old_header_counts.get(header) != Some(&1)
+                    || fresh_header_counts.get(header) != Some(&1)
+                {
+                    continue;
+                }
+                let Some(old) = old_by_header.get(header) else {
+                    continue;
+                };
+                let folder_count: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM message_folders WHERE message_id = ?1",
+                    params![old.id],
+                    |row| row.get(0),
+                )?;
+                if folder_count != 1 {
+                    continue;
+                }
+
+                matched_old_ids.insert(old.id.clone());
+                entry.message.id = old.id.clone();
+                entry.message.is_read = old.is_read;
+                entry.message.is_starred = old.is_starred;
+                entry.message.created_at = old.created_at;
+                for attachment in &mut entry.attachments {
+                    attachment.message_id = old.id.clone();
+                }
+            }
+
+            let now = pebble_core::now_timestamp();
+            let mut indexed_message_ids = Vec::new();
+            let mut removed_messages = Vec::new();
+            // Release the old mailbox-scoped UID namespace before applying
+            // any updates. This also handles valid UID swaps (A:1/B:2 ->
+            // A:2/B:1) without tripping the same-folder uniqueness trigger.
+            for old in &old_messages {
+                tx.execute(
+                    "DELETE FROM message_folders WHERE message_id = ?1 AND folder_id = ?2",
+                    params![old.id, folder_id],
+                )?;
+            }
+            for old in &old_messages {
+                if matched_old_ids.contains(&old.id) {
+                    continue;
+                }
+                let remaining_folder_count: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM message_folders WHERE message_id = ?1",
+                    params![old.id],
+                    |row| row.get(0),
+                )?;
+                if remaining_folder_count > 0 {
+                    indexed_message_ids.push(old.id.clone());
+                    tx.execute(
+                        "INSERT OR REPLACE INTO search_pending
+                             (message_id, operation, created_at)
+                         VALUES (?1, 'index', ?2)",
+                        params![old.id, now],
+                    )?;
+                } else {
+                    tx.execute(
+                        "DELETE FROM pending_mail_ops WHERE message_id = ?1",
+                        params![old.id],
+                    )?;
+                    tx.execute("DELETE FROM messages WHERE id = ?1", params![old.id])?;
+                    removed_messages.push(old.clone());
+                    tx.execute(
+                        "INSERT OR REPLACE INTO search_pending
+                             (message_id, operation, created_at)
+                         VALUES (?1, 'remove', ?2)",
+                        params![old.id, now],
+                    )?;
+                }
+            }
+
+            for entry in &fresh {
+                upsert_message_with_conn(&tx, &entry.message)?;
+                tx.execute(
+                    "INSERT OR IGNORE INTO message_folders (message_id, folder_id)
+                     VALUES (?1, ?2)",
+                    params![entry.message.id, folder_id],
+                )?;
+                tx.execute(
+                    "DELETE FROM attachments WHERE message_id = ?1",
+                    params![entry.message.id],
+                )?;
+                for attachment in &entry.attachments {
+                    tx.execute(
+                        "INSERT INTO attachments
+                             (id, message_id, filename, mime_type, size,
+                              local_path, content_id, is_inline)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                        params![
+                            attachment.id,
+                            entry.message.id,
+                            attachment.filename,
+                            attachment.mime_type,
+                            attachment.size,
+                            attachment.local_path,
+                            attachment.content_id,
+                            attachment.is_inline as i32,
+                        ],
+                    )?;
+                }
+                indexed_message_ids.push(entry.message.id.clone());
+                tx.execute(
+                    "INSERT OR REPLACE INTO search_pending
+                         (message_id, operation, created_at)
+                     VALUES (?1, 'index', ?2)",
+                    params![entry.message.id, now],
+                )?;
+            }
+
+            tx.execute(
+                "DELETE FROM sync_failures WHERE account_id = ?1 AND folder_id = ?2",
+                params![account_id, folder_id],
+            )?;
+
+            let mut unreferenced_paths = Vec::new();
+            for path in old_attachment_paths {
+                let still_referenced: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM attachments WHERE local_path = ?1)",
+                    params![path],
+                    |row| row.get(0),
+                )?;
+                if !still_referenced {
+                    unreferenced_paths.push(path);
+                }
+            }
+
+            tx.commit()?;
+            Ok(ImapFolderReconcileResult {
+                indexed_message_ids,
+                removed_messages,
+                unreferenced_attachment_paths: unreferenced_paths,
+            })
+        })
+    }
+
     /// Get the maximum remote_id (interpreted as integer) for messages in a folder.
     pub fn get_max_remote_id(&self, account_id: &str, folder_id: &str) -> Result<Option<String>> {
         self.with_read(|conn| {
@@ -842,6 +1393,21 @@ impl Store {
                 results.push(row?);
             }
             Ok(results)
+        })
+    }
+
+    pub fn list_cached_remote_ids_by_account(&self, account_id: &str) -> Result<Vec<String>> {
+        self.with_read(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT remote_id FROM messages
+                 WHERE account_id = ?1 AND is_deleted = 0 AND remote_id != ''",
+            )?;
+            let rows = stmt.query_map(params![account_id], |row| row.get::<_, String>(0))?;
+            let mut remote_ids = Vec::new();
+            for row in rows {
+                remote_ids.push(row?);
+            }
+            Ok(remote_ids)
         })
     }
 
@@ -1320,12 +1886,16 @@ impl Store {
 
 #[cfg(test)]
 mod remote_id_scope_tests {
+    use super::ImapFolderSnapshotMessage;
     use crate::Store;
     use pebble_core::*;
+    use std::collections::HashMap;
 
     fn make_account() -> Account {
         let now = now_timestamp();
         Account {
+            account_label: None,
+            provider_display_name: None,
             id: new_id(),
             email: "imap@example.com".to_string(),
             display_name: "IMAP".to_string(),
@@ -1412,6 +1982,188 @@ mod remote_id_scope_tests {
     }
 
     #[test]
+    fn cached_remote_ids_include_folderless_messages_and_are_account_scoped() {
+        let store = Store::open_in_memory().unwrap();
+        let mut account = make_account();
+        account.provider = ProviderType::Gmail;
+        let mut other_account = make_account();
+        other_account.provider = ProviderType::Gmail;
+        store.insert_account(&account).unwrap();
+        store.insert_account(&other_account).unwrap();
+        let inbox = make_folder(&account.id, "INBOX", FolderRole::Inbox, 0);
+        store.insert_folder(&inbox).unwrap();
+
+        let folderless = make_message(&account.id, "folderless");
+        let in_folder = make_message(&account.id, "in-folder");
+        let mut deleted = make_message(&account.id, "deleted");
+        deleted.is_deleted = true;
+        let empty_remote_id = make_message(&account.id, "");
+        let other_account_message = make_message(&other_account.id, "other-account");
+
+        store.insert_message(&folderless, &[]).unwrap();
+        store
+            .insert_message(&in_folder, std::slice::from_ref(&inbox.id))
+            .unwrap();
+        store.insert_message(&deleted, &[]).unwrap();
+        store.insert_message(&empty_remote_id, &[]).unwrap();
+        store.insert_message(&other_account_message, &[]).unwrap();
+
+        let mut remote_ids = store
+            .list_cached_remote_ids_by_account(&account.id)
+            .unwrap();
+        remote_ids.sort();
+        assert_eq!(
+            remote_ids,
+            vec!["folderless".to_string(), "in-folder".to_string()]
+        );
+    }
+
+    #[test]
+    fn numeric_imap_uids_can_repeat_in_different_folders() {
+        let store = Store::open_in_memory().unwrap();
+        let account = make_account();
+        let inbox = make_folder(&account.id, "INBOX", FolderRole::Inbox, 0);
+        let sent = make_folder(&account.id, "Sent", FolderRole::Sent, 1);
+        let inbox_message = make_message(&account.id, "123");
+        let mut sent_message = make_message(&account.id, "123");
+        sent_message.subject = "different mailbox message".to_string();
+
+        store.insert_account(&account).unwrap();
+        store.insert_folder(&inbox).unwrap();
+        store.insert_folder(&sent).unwrap();
+        store
+            .insert_message(&inbox_message, std::slice::from_ref(&inbox.id))
+            .unwrap();
+        store
+            .insert_message(&sent_message, std::slice::from_ref(&sent.id))
+            .expect("the same IMAP UID in another mailbox must be a distinct message");
+
+        let inbox_state = store
+            .list_remote_ids_by_folder(&account.id, &inbox.id)
+            .unwrap();
+        let sent_state = store
+            .list_remote_ids_by_folder(&account.id, &sent.id)
+            .unwrap();
+        assert_eq!(inbox_state.len(), 1);
+        assert_eq!(sent_state.len(), 1);
+        assert_ne!(inbox_state[0].0, sent_state[0].0);
+    }
+
+    #[test]
+    fn non_imap_numeric_remote_ids_remain_account_wide_unique() {
+        let store = Store::open_in_memory().unwrap();
+        let mut account = make_account();
+        account.provider = ProviderType::Gmail;
+        let inbox = make_folder(&account.id, "INBOX", FolderRole::Inbox, 0);
+        let sent = make_folder(&account.id, "Sent", FolderRole::Sent, 1);
+        let inbox_message = make_message(&account.id, "123");
+        let sent_message = make_message(&account.id, "123");
+
+        store.insert_account(&account).unwrap();
+        store.insert_folder(&inbox).unwrap();
+        store.insert_folder(&sent).unwrap();
+        store
+            .insert_message(&inbox_message, std::slice::from_ref(&inbox.id))
+            .unwrap();
+        let duplicate = store.insert_message(&sent_message, std::slice::from_ref(&sent.id));
+
+        assert!(duplicate.is_err());
+    }
+
+    #[test]
+    fn imap_uid_is_rejected_when_repeated_in_the_same_folder() {
+        let store = Store::open_in_memory().unwrap();
+        let account = make_account();
+        let inbox = make_folder(&account.id, "INBOX", FolderRole::Inbox, 0);
+        let first = make_message(&account.id, "123");
+        let second = make_message(&account.id, "123");
+
+        store.insert_account(&account).unwrap();
+        store.insert_folder(&inbox).unwrap();
+        store
+            .insert_message(&first, std::slice::from_ref(&inbox.id))
+            .unwrap();
+        let duplicate = store.insert_message(&second, std::slice::from_ref(&inbox.id));
+
+        assert!(duplicate.is_err());
+        assert!(store.get_message(&second.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn moving_with_destination_uid_ignores_collisions_in_the_source_folder() {
+        let store = Store::open_in_memory().unwrap();
+        let account = make_account();
+        let inbox = make_folder(&account.id, "INBOX", FolderRole::Inbox, 0);
+        let archive = make_folder(&account.id, "Archive", FolderRole::Archive, 1);
+        let moved = make_message(&account.id, "5");
+        let inbox_neighbor = make_message(&account.id, "2");
+        store.insert_account(&account).unwrap();
+        store.insert_folder(&inbox).unwrap();
+        store.insert_folder(&archive).unwrap();
+        store
+            .insert_message(&moved, std::slice::from_ref(&inbox.id))
+            .unwrap();
+        store
+            .insert_message(&inbox_neighbor, std::slice::from_ref(&inbox.id))
+            .unwrap();
+
+        assert!(store.update_remote_id(&moved.id, "2").is_err());
+        store
+            .move_message_to_folder_with_remote_id(&moved.id, &archive.id, "2")
+            .unwrap();
+
+        assert_eq!(
+            store.get_message(&moved.id).unwrap().unwrap().remote_id,
+            "2"
+        );
+        assert_eq!(
+            store.get_message_folder_ids(&moved.id).unwrap(),
+            vec![archive.id.clone()]
+        );
+    }
+
+    #[test]
+    fn incomplete_attachment_rows_are_detected_for_forced_refetch() {
+        let store = Store::open_in_memory().unwrap();
+        let account = make_account();
+        let inbox = make_folder(&account.id, "INBOX", FolderRole::Inbox, 0);
+        store.insert_account(&account).unwrap();
+        store.insert_folder(&inbox).unwrap();
+        let mut message = make_message(&account.id, "42");
+        message.has_attachments = true;
+        store
+            .insert_message(&message, std::slice::from_ref(&inbox.id))
+            .unwrap();
+
+        let remote_ids = vec![message.remote_id.clone()];
+        let incomplete = store
+            .get_incomplete_attachment_message_map_by_remote_ids(
+                &account.id,
+                Some(&inbox.id),
+                &remote_ids,
+            )
+            .unwrap();
+        assert_eq!(incomplete.get("42"), Some(&message.id));
+
+        store
+            .insert_attachment(&Attachment {
+                id: new_id(),
+                message_id: message.id.clone(),
+                filename: "complete.bin".to_string(),
+                mime_type: "application/octet-stream".to_string(),
+                size: 1,
+                local_path: None,
+                content_id: None,
+                is_inline: false,
+            })
+            .unwrap();
+        assert!(store
+            .get_incomplete_attachment_message_map_by_remote_ids(&account.id, None, &remote_ids,)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
     fn update_remote_id_reports_missing_message() {
         let store = Store::open_in_memory().unwrap();
 
@@ -1425,13 +2177,322 @@ mod remote_id_scope_tests {
     }
 
     #[test]
+    fn reconciling_imap_uidvalidity_preserves_only_unambiguous_stable_identity() {
+        let store = Store::open_in_memory().unwrap();
+        let account = make_account();
+        let inbox = make_folder(&account.id, "INBOX", FolderRole::Inbox, 0);
+        let sent = make_folder(&account.id, "Sent", FolderRole::Sent, 1);
+        let mut stable = make_message(&account.id, "42");
+        stable.message_id_header = Some("<stable@example.com>".to_string());
+        stable.is_read = true;
+        stable.is_starred = true;
+        let mut different = make_message(&account.id, "50");
+        different.message_id_header = Some("<old@example.com>".to_string());
+        let mut shared = make_message(&account.id, "43");
+        shared.message_id_header = Some("<shared@example.com>".to_string());
+        let sent_only = make_message(&account.id, "44");
+
+        store.insert_account(&account).unwrap();
+        store.insert_folder(&inbox).unwrap();
+        store.insert_folder(&sent).unwrap();
+        store
+            .insert_message(&stable, std::slice::from_ref(&inbox.id))
+            .unwrap();
+        store
+            .insert_message(&different, std::slice::from_ref(&inbox.id))
+            .unwrap();
+        store
+            .insert_message(&shared, &[inbox.id.clone(), sent.id.clone()])
+            .unwrap();
+        store
+            .insert_message(&sent_only, std::slice::from_ref(&sent.id))
+            .unwrap();
+        store.add_label(&stable.id, "Keep").unwrap();
+        store
+            .upsert_kanban_card(&KanbanCard {
+                message_id: stable.id.clone(),
+                column: KanbanColumn::Waiting,
+                position: 1,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        store
+            .snooze_message(&SnoozedMessage {
+                message_id: stable.id.clone(),
+                snoozed_at: 1,
+                unsnoozed_at: 2,
+                return_to: "inbox".to_string(),
+            })
+            .unwrap();
+        store.add_label(&different.id, "Must not inherit").unwrap();
+        store
+            .upsert_sync_failure(&account.id, &inbox.id, "42", "imap", "old generation")
+            .unwrap();
+        store
+            .upsert_sync_failure(&account.id, &sent.id, "44", "imap", "other folder")
+            .unwrap();
+        store
+            .insert_pending_mail_op(&account.id, &different.id, "mark_read", "{}")
+            .unwrap();
+        store
+            .insert_pending_mail_op(&account.id, &shared.id, "mark_read", "{}")
+            .unwrap();
+
+        let mut fresh_stable = make_message(&account.id, "99");
+        fresh_stable.message_id_header = Some("<stable@example.com>".to_string());
+        fresh_stable.subject = "fresh stable".to_string();
+        let fresh_stable_generated_id = fresh_stable.id.clone();
+        let mut same_uid_different_identity = make_message(&account.id, "50");
+        same_uid_different_identity.message_id_header = Some("<new@example.com>".to_string());
+        let different_new_id = same_uid_different_identity.id.clone();
+
+        let result = store
+            .reconcile_imap_folder_uidvalidity(
+                &account.id,
+                &inbox.id,
+                vec![
+                    ImapFolderSnapshotMessage {
+                        message: fresh_stable,
+                        attachments: Vec::new(),
+                    },
+                    ImapFolderSnapshotMessage {
+                        message: same_uid_different_identity,
+                        attachments: Vec::new(),
+                    },
+                ],
+            )
+            .unwrap();
+
+        assert!(result.unreferenced_attachment_paths.is_empty());
+        assert!(store
+            .get_message(&fresh_stable_generated_id)
+            .unwrap()
+            .is_none());
+        let reconciled_stable = store.get_message(&stable.id).unwrap().unwrap();
+        assert_eq!(reconciled_stable.remote_id, "99");
+        assert_eq!(reconciled_stable.subject, "fresh stable");
+        assert!(reconciled_stable.is_read);
+        assert!(reconciled_stable.is_starred);
+        assert_eq!(store.get_message_labels(&stable.id).unwrap().len(), 1);
+        assert!(store
+            .list_kanban_cards(None)
+            .unwrap()
+            .iter()
+            .any(|card| card.message_id == stable.id));
+        assert!(store.get_snoozed_message(&stable.id).unwrap().is_some());
+
+        assert!(store.get_message(&different.id).unwrap().is_none());
+        assert!(store.get_message(&different_new_id).unwrap().is_some());
+        assert!(store
+            .get_message_labels(&different_new_id)
+            .unwrap()
+            .is_empty());
+        assert!(store.get_message(&shared.id).unwrap().is_some());
+        assert_eq!(
+            store.get_message_folder_ids(&shared.id).unwrap(),
+            vec![sent.id.clone()]
+        );
+        assert!(store.get_message(&sent_only.id).unwrap().is_some());
+        assert!(!store
+            .has_sync_failures_for_folder(&account.id, &inbox.id)
+            .unwrap());
+        assert!(store
+            .has_sync_failures_for_folder(&account.id, &sent.id)
+            .unwrap());
+        let pending_ops = store.list_pending_mail_ops(&account.id).unwrap();
+        assert_eq!(pending_ops.len(), 1);
+        assert_eq!(pending_ops[0].message_id, shared.id);
+
+        let pending: HashMap<String, String> =
+            store.list_search_pending().unwrap().into_iter().collect();
+        assert_eq!(pending.get(&stable.id).map(String::as_str), Some("index"));
+        assert_eq!(
+            pending.get(&different.id).map(String::as_str),
+            Some("remove")
+        );
+        assert_eq!(
+            pending.get(&different_new_id).map(String::as_str),
+            Some("index")
+        );
+        assert_eq!(pending.get(&shared.id).map(String::as_str), Some("index"));
+        assert!(result
+            .removed_messages
+            .iter()
+            .any(|message| message.id == different.id));
+    }
+
+    #[test]
+    fn failed_imap_uidvalidity_reconcile_keeps_the_old_generation_intact() {
+        let store = Store::open_in_memory().unwrap();
+        let account = make_account();
+        let inbox = make_folder(&account.id, "INBOX", FolderRole::Inbox, 0);
+        let sent = make_folder(&account.id, "Sent", FolderRole::Sent, 1);
+        store.insert_account(&account).unwrap();
+        store.insert_folder(&inbox).unwrap();
+        store.insert_folder(&sent).unwrap();
+
+        let mut old = make_message(&account.id, "42");
+        old.message_id_header = Some("<stable@example.com>".to_string());
+        old.subject = "old generation".to_string();
+        store
+            .insert_message(&old, std::slice::from_ref(&inbox.id))
+            .unwrap();
+        store.add_label(&old.id, "Keep").unwrap();
+        store
+            .upsert_sync_failure(&account.id, &inbox.id, "42", "imap", "keep until commit")
+            .unwrap();
+
+        let blocker = make_message(&account.id, "77");
+        let duplicate_attachment_id = new_id();
+        store
+            .replace_message_with_attachments(
+                &blocker,
+                std::slice::from_ref(&sent.id),
+                &[Attachment {
+                    id: duplicate_attachment_id.clone(),
+                    message_id: blocker.id.clone(),
+                    filename: "blocker.bin".to_string(),
+                    mime_type: "application/octet-stream".to_string(),
+                    size: 1,
+                    local_path: None,
+                    content_id: None,
+                    is_inline: false,
+                }],
+            )
+            .unwrap();
+
+        let mut fresh = make_message(&account.id, "99");
+        fresh.message_id_header = old.message_id_header.clone();
+        fresh.subject = "fresh generation".to_string();
+        let result = store.reconcile_imap_folder_uidvalidity(
+            &account.id,
+            &inbox.id,
+            vec![ImapFolderSnapshotMessage {
+                message: fresh,
+                attachments: vec![Attachment {
+                    id: duplicate_attachment_id,
+                    message_id: "temporary-id".to_string(),
+                    filename: "new.bin".to_string(),
+                    mime_type: "application/octet-stream".to_string(),
+                    size: 2,
+                    local_path: None,
+                    content_id: None,
+                    is_inline: false,
+                }],
+            }],
+        );
+        assert!(result.is_err());
+
+        let retained = store.get_message(&old.id).unwrap().unwrap();
+        assert_eq!(retained.remote_id, "42");
+        assert_eq!(retained.subject, "old generation");
+        assert_eq!(
+            store.get_message_folder_ids(&old.id).unwrap(),
+            vec![inbox.id.clone()]
+        );
+        assert_eq!(store.get_message_labels(&old.id).unwrap().len(), 1);
+        assert!(store
+            .has_sync_failures_for_folder(&account.id, &inbox.id)
+            .unwrap());
+        assert!(store.list_search_pending().unwrap().is_empty());
+    }
+
+    #[test]
+    fn imap_uidvalidity_reconcile_allows_stable_messages_to_swap_uids() {
+        let store = Store::open_in_memory().unwrap();
+        let account = make_account();
+        let inbox = make_folder(&account.id, "INBOX", FolderRole::Inbox, 0);
+        store.insert_account(&account).unwrap();
+        store.insert_folder(&inbox).unwrap();
+
+        let mut old_a = make_message(&account.id, "1");
+        old_a.message_id_header = Some("<a@example.com>".to_string());
+        let mut old_b = make_message(&account.id, "2");
+        old_b.message_id_header = Some("<b@example.com>".to_string());
+        store
+            .insert_message(&old_a, std::slice::from_ref(&inbox.id))
+            .unwrap();
+        store
+            .insert_message(&old_b, std::slice::from_ref(&inbox.id))
+            .unwrap();
+
+        let mut fresh_a = make_message(&account.id, "2");
+        fresh_a.message_id_header = old_a.message_id_header.clone();
+        let mut fresh_b = make_message(&account.id, "1");
+        fresh_b.message_id_header = old_b.message_id_header.clone();
+        store
+            .reconcile_imap_folder_uidvalidity(
+                &account.id,
+                &inbox.id,
+                vec![
+                    ImapFolderSnapshotMessage {
+                        message: fresh_a,
+                        attachments: Vec::new(),
+                    },
+                    ImapFolderSnapshotMessage {
+                        message: fresh_b,
+                        attachments: Vec::new(),
+                    },
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.get_message(&old_a.id).unwrap().unwrap().remote_id,
+            "2"
+        );
+        assert_eq!(
+            store.get_message(&old_b.id).unwrap().unwrap().remote_id,
+            "1"
+        );
+        assert_eq!(
+            store.get_message_folder_ids(&old_a.id).unwrap(),
+            vec![inbox.id.clone()]
+        );
+        assert_eq!(
+            store.get_message_folder_ids(&old_b.id).unwrap(),
+            vec![inbox.id]
+        );
+    }
+
+    #[test]
+    fn replace_message_updates_non_imap_row_without_triggering_self_duplicate() {
+        let store = Store::open_in_memory().unwrap();
+        let mut account = make_account();
+        account.provider = ProviderType::Outlook;
+        account.email = "outlook@example.com".to_string();
+        store.insert_account(&account).unwrap();
+        let inbox = make_folder(&account.id, "Inbox", FolderRole::Inbox, 0);
+        store.insert_folder(&inbox).unwrap();
+
+        let message = make_message(&account.id, "graph-message-id");
+        store
+            .replace_message_with_attachments(&message, std::slice::from_ref(&inbox.id), &[])
+            .unwrap();
+
+        let mut updated = message.clone();
+        updated.subject = "Updated by delta sync".to_string();
+        store
+            .replace_message_with_attachments(&updated, std::slice::from_ref(&inbox.id), &[])
+            .unwrap();
+
+        assert_eq!(
+            store.get_message(&message.id).unwrap().unwrap().subject,
+            "Updated by delta sync"
+        );
+    }
+
+    #[test]
     fn replace_message_with_attachments_replaces_old_attachment_set() {
         let store = Store::open_in_memory().unwrap();
         let account = make_account();
         store.insert_account(&account).unwrap();
 
         let drafts = make_folder(&account.id, "Drafts", FolderRole::Drafts, 0);
+        let archive = make_folder(&account.id, "Archive", FolderRole::Archive, 1);
         store.insert_folder(&drafts).unwrap();
+        store.insert_folder(&archive).unwrap();
 
         let mut msg = make_message(&account.id, "draft-1");
         msg.is_draft = true;
@@ -1454,6 +2515,24 @@ mod remote_id_scope_tests {
                 &[old_attachment],
             )
             .unwrap();
+        store.add_label(&msg.id, "Important").unwrap();
+        store
+            .upsert_kanban_card(&KanbanCard {
+                message_id: msg.id.clone(),
+                column: KanbanColumn::Waiting,
+                position: 7,
+                created_at: 1,
+                updated_at: 2,
+            })
+            .unwrap();
+        store
+            .snooze_message(&SnoozedMessage {
+                message_id: msg.id.clone(),
+                snoozed_at: 3,
+                unsnoozed_at: 4,
+                return_to: "archive".to_string(),
+            })
+            .unwrap();
 
         let mut updated = msg.clone();
         updated.subject = "Updated draft".to_string();
@@ -1470,7 +2549,7 @@ mod remote_id_scope_tests {
         store
             .replace_message_with_attachments(
                 &updated,
-                std::slice::from_ref(&drafts.id),
+                std::slice::from_ref(&archive.id),
                 &[new_attachment],
             )
             .unwrap();
@@ -1482,6 +2561,163 @@ mod remote_id_scope_tests {
         let attachments = store.list_attachments_by_message(&updated.id).unwrap();
         assert_eq!(attachments.len(), 1);
         assert_eq!(attachments[0].filename, "new.pdf");
+        assert_eq!(
+            store.get_message_folder_ids(&updated.id).unwrap(),
+            vec![archive.id]
+        );
+        assert_eq!(store.get_message_labels(&updated.id).unwrap().len(), 1);
+        assert_eq!(store.list_kanban_cards(None).unwrap().len(), 1);
+        assert!(store.get_snoozed_message(&updated.id).unwrap().is_some());
+    }
+
+    #[test]
+    fn replace_message_with_attachments_rolls_back_all_state_on_insert_failure() {
+        let store = Store::open_in_memory().unwrap();
+        let account = make_account();
+        store.insert_account(&account).unwrap();
+        let drafts = make_folder(&account.id, "Drafts", FolderRole::Drafts, 0);
+        let archive = make_folder(&account.id, "Archive", FolderRole::Archive, 1);
+        store.insert_folder(&drafts).unwrap();
+        store.insert_folder(&archive).unwrap();
+
+        let mut original = make_message(&account.id, "draft-original");
+        original.subject = "Original".to_string();
+        let old_attachment = Attachment {
+            id: new_id(),
+            message_id: original.id.clone(),
+            filename: "old.pdf".to_string(),
+            mime_type: "application/pdf".to_string(),
+            size: 10,
+            local_path: Some("C:\\tmp\\old.pdf".to_string()),
+            content_id: None,
+            is_inline: false,
+        };
+        store
+            .replace_message_with_attachments(
+                &original,
+                std::slice::from_ref(&drafts.id),
+                std::slice::from_ref(&old_attachment),
+            )
+            .unwrap();
+        store.add_label(&original.id, "Keep").unwrap();
+        store
+            .upsert_kanban_card(&KanbanCard {
+                message_id: original.id.clone(),
+                column: KanbanColumn::Todo,
+                position: 1,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        store
+            .snooze_message(&SnoozedMessage {
+                message_id: original.id.clone(),
+                snoozed_at: 1,
+                unsnoozed_at: 2,
+                return_to: "inbox".to_string(),
+            })
+            .unwrap();
+
+        let blocker = make_message(&account.id, "blocker");
+        let duplicate_id = new_id();
+        store
+            .replace_message_with_attachments(
+                &blocker,
+                std::slice::from_ref(&archive.id),
+                &[Attachment {
+                    id: duplicate_id.clone(),
+                    message_id: blocker.id.clone(),
+                    filename: "blocker.pdf".to_string(),
+                    mime_type: "application/pdf".to_string(),
+                    size: 1,
+                    local_path: None,
+                    content_id: None,
+                    is_inline: false,
+                }],
+            )
+            .unwrap();
+
+        let mut attempted = original.clone();
+        attempted.subject = "Must roll back".to_string();
+        let failure = store.replace_message_with_attachments(
+            &attempted,
+            std::slice::from_ref(&archive.id),
+            &[Attachment {
+                id: duplicate_id,
+                message_id: attempted.id.clone(),
+                filename: "new.pdf".to_string(),
+                mime_type: "application/pdf".to_string(),
+                size: 20,
+                local_path: None,
+                content_id: None,
+                is_inline: false,
+            }],
+        );
+        assert!(failure.is_err());
+
+        assert_eq!(
+            store.get_message(&original.id).unwrap().unwrap().subject,
+            "Original"
+        );
+        assert_eq!(
+            store.get_message_folder_ids(&original.id).unwrap(),
+            vec![drafts.id]
+        );
+        let attachments = store.list_attachments_by_message(&original.id).unwrap();
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].id, old_attachment.id);
+        assert_eq!(store.get_message_labels(&original.id).unwrap().len(), 1);
+        assert_eq!(store.list_kanban_cards(None).unwrap().len(), 1);
+        assert!(store.get_snoozed_message(&original.id).unwrap().is_some());
+    }
+
+    #[test]
+    fn prepared_send_rolls_back_message_and_attachments_when_op_insert_fails() {
+        let store = Store::open_in_memory().unwrap();
+        let account = make_account();
+        store.insert_account(&account).unwrap();
+        let outbox = make_folder(&account.id, "Outbox", FolderRole::Inbox, 0);
+        store.insert_folder(&outbox).unwrap();
+        let mut message = make_message(&account.id, "local-outbox-rollback");
+        message.has_attachments = true;
+        let attachment = Attachment {
+            id: new_id(),
+            message_id: message.id.clone(),
+            filename: "evidence.txt".to_string(),
+            mime_type: "text/plain".to_string(),
+            size: 8,
+            local_path: Some("C:\\tmp\\evidence.txt".to_string()),
+            content_id: None,
+            is_inline: false,
+        };
+        store
+            .with_write(|conn| {
+                conn.execute_batch(
+                    "CREATE TRIGGER fail_prepared_send_op
+                     BEFORE INSERT ON pending_mail_ops
+                     WHEN NEW.op_type = 'send'
+                     BEGIN
+                         SELECT RAISE(ABORT, 'injected pending-op failure');
+                     END;",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let result = store.prepare_outgoing_send(
+            &message,
+            std::slice::from_ref(&outbox.id),
+            std::slice::from_ref(&attachment),
+            r#"{"op":"send","payload":{}}"#,
+        );
+
+        assert!(result.is_err());
+        assert!(store.get_message(&message.id).unwrap().is_none());
+        assert!(store
+            .list_attachments_by_message(&message.id)
+            .unwrap()
+            .is_empty());
+        assert!(store.list_pending_mail_ops(&account.id).unwrap().is_empty());
     }
 }
 
@@ -1494,6 +2730,8 @@ mod tombstone_tests {
         let store = Store::open_in_memory().unwrap();
         let now = now_timestamp();
         let account = Account {
+            account_label: None,
+            provider_display_name: None,
             id: new_id(),
             email: "test@example.com".to_string(),
             display_name: "Test".to_string(),
@@ -1589,6 +2827,8 @@ mod thread_listing_tests {
     fn seed_account_and_folder(store: &Store) -> (String, String) {
         let now = now_timestamp();
         let account = Account {
+            account_label: None,
+            provider_display_name: None,
             id: new_id(),
             email: "test@example.com".to_string(),
             display_name: "Test".to_string(),

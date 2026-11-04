@@ -281,6 +281,12 @@ export function useKeyboard() {
           setNotificationsEnabled(!notificationsEnabled);
           break;
         }
+        case "translate-selection":
+          document.dispatchEvent(new CustomEvent("pebble:translate-selection"));
+          break;
+        case "toggle-bilingual":
+          document.dispatchEvent(new CustomEvent("pebble:toggle-bilingual"));
+          break;
         default:
           break;
       }

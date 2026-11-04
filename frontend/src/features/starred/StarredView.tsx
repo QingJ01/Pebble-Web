@@ -56,13 +56,16 @@ export default function StarredView() {
   }, [hasNextPage, isFetchingNextPage, fetchNextPage]);
 
   const handleToggleStar = useCallback((messageId: string, newStarred: boolean) => {
-    if (newStarred) return;
     setRemovedIds((prev) => {
       const next = new Set(prev);
-      next.add(messageId);
+      if (newStarred) {
+        next.delete(messageId);
+      } else {
+        next.add(messageId);
+      }
       return next;
     });
-    if (scopedSelectedId === messageId) {
+    if (!newStarred && scopedSelectedId === messageId) {
       setSelectedId(null);
     }
   }, [scopedSelectedId]);

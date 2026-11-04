@@ -31,9 +31,8 @@ pub async fn translate(
         .get_translate_config()
         .map_err(|e| ApiError::Internal(format!("Failed to load translate config: {e}")))?;
 
-    let config = config.ok_or_else(|| {
-        ApiError::BadRequest("Translation is not configured".to_string())
-    })?;
+    let config =
+        config.ok_or_else(|| ApiError::BadRequest("Translation is not configured".to_string()))?;
 
     if !config.is_enabled {
         return Err(ApiError::BadRequest(
@@ -42,16 +41,15 @@ pub async fn translate(
     }
 
     // Parse the provider config from the stored JSON blob
-    let provider_config: TranslateProviderConfig =
-        serde_json::from_str(&config.config).map_err(|e| {
-            ApiError::Internal(format!("Invalid translate provider config: {e}"))
-        })?;
+    let provider_config: TranslateProviderConfig = serde_json::from_str(&config.config)
+        .map_err(|e| ApiError::Internal(format!("Invalid translate provider config: {e}")))?;
 
     let source_lang = body.source_lang.as_deref().unwrap_or("auto");
 
-    let result = TranslateService::translate(&provider_config, &body.text, source_lang, &body.target_lang)
-        .await
-        .map_err(|e| ApiError::Internal(format!("Translation failed: {e}")))?;
+    let result =
+        TranslateService::translate(&provider_config, &body.text, source_lang, &body.target_lang)
+            .await
+            .map_err(|e| ApiError::Internal(format!("Translation failed: {e}")))?;
 
     Ok(Json(TranslateResponse {
         translated: result.translated,
@@ -114,14 +112,14 @@ pub async fn save_translate_config(
 pub async fn test_translate_connection(
     Json(body): Json<SaveTranslateConfigRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let provider_config: TranslateProviderConfig =
-        serde_json::from_str(&body.config).map_err(|e| {
-            ApiError::BadRequest(format!("Invalid provider config: {e}"))
-        })?;
+    let provider_config: TranslateProviderConfig = serde_json::from_str(&body.config)
+        .map_err(|e| ApiError::BadRequest(format!("Invalid provider config: {e}")))?;
 
     let result = TranslateService::translate(&provider_config, "Hello", "auto", "zh")
         .await
         .map_err(|e| ApiError::BadRequest(format!("Connection test failed: {e}")))?;
 
-    Ok(Json(serde_json::json!({ "ok": true, "result": result.translated })))
+    Ok(Json(
+        serde_json::json!({ "ok": true, "result": result.translated }),
+    ))
 }

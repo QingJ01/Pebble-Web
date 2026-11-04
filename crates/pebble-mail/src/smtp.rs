@@ -2,7 +2,7 @@ use crate::imap::{ConnectionSecurity, ProxyConfig};
 use lettre::message::header::ContentType;
 use lettre::message::{Attachment, Body, Mailbox, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::{Credentials, Mechanism};
-use lettre::transport::smtp::client::{AsyncSmtpConnection, AsyncTokioStream, TlsParameters};
+use lettre::transport::smtp::client::{AsyncSmtpConnection, AsyncTokioStream, Tls, TlsParameters};
 use lettre::transport::smtp::extension::ClientId;
 use lettre::{AsyncSmtpTransport, AsyncTransport};
 use pebble_core::{PebbleError, Result};
@@ -10,12 +10,14 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::path::Path;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio_native_tls as async_native_tls;
 
 pub struct SmtpSender {
     host: String,
     port: u16,
     credentials: Credentials,
     security: ConnectionSecurity,
+    accept_invalid_certs: bool,
     proxy: Option<ProxyConfig>,
 }
 
@@ -26,6 +28,7 @@ impl SmtpSender {
         username: String,
         password: String,
         security: ConnectionSecurity,
+        accept_invalid_certs: bool,
         proxy: Option<ProxyConfig>,
     ) -> Self {
         Self {
@@ -33,6 +36,7 @@ impl SmtpSender {
             port,
             credentials: Credentials::new(username, password),
             security,
+            accept_invalid_certs,
             proxy,
         }
     }
@@ -40,7 +44,7 @@ impl SmtpSender {
     #[allow(clippy::too_many_arguments)]
     pub async fn send(
         &self,
-        from: &str,
+        from: &pebble_core::EmailAddress,
         to: &[String],
         cc: &[String],
         bcc: &[String],
@@ -50,88 +54,17 @@ impl SmtpSender {
         in_reply_to: Option<&str>,
         attachment_paths: &[String],
     ) -> Result<()> {
-        if to.is_empty() {
-            return Err(PebbleError::Internal("No recipients".to_string()));
-        }
-
-        let from_mailbox: Mailbox = from
-            .parse()
-            .map_err(|e| PebbleError::Internal(format!("Invalid from address: {e}")))?;
-
-        let mut builder = lettre::Message::builder()
-            .from(from_mailbox)
-            .subject(subject);
-
-        for addr in to {
-            let mailbox: Mailbox = addr
-                .parse()
-                .map_err(|e| PebbleError::Internal(format!("Invalid to address '{addr}': {e}")))?;
-            builder = builder.to(mailbox);
-        }
-
-        for addr in cc {
-            let mailbox: Mailbox = addr
-                .parse()
-                .map_err(|e| PebbleError::Internal(format!("Invalid cc address '{addr}': {e}")))?;
-            builder = builder.cc(mailbox);
-        }
-
-        for addr in bcc {
-            let mailbox: Mailbox = addr
-                .parse()
-                .map_err(|e| PebbleError::Internal(format!("Invalid bcc address '{addr}': {e}")))?;
-            builder = builder.bcc(mailbox);
-        }
-
-        if let Some(reply_to) = in_reply_to {
-            builder = builder.in_reply_to(reply_to.to_string());
-        }
-
-        let alternative_body = MultiPart::alternative()
-            .singlepart(
-                SinglePart::builder()
-                    .content_type(ContentType::TEXT_PLAIN)
-                    .body(body_text.to_string()),
-            )
-            .singlepart(
-                SinglePart::builder()
-                    .content_type(ContentType::TEXT_HTML)
-                    .body(body_html.unwrap_or(body_text).to_string()),
-            );
-
-        let email = if attachment_paths.is_empty() {
-            builder
-                .multipart(alternative_body)
-                .map_err(|e| PebbleError::Internal(format!("Failed to build email: {e}")))?
-        } else {
-            let mut mixed = MultiPart::mixed().multipart(alternative_body);
-
-            for path_str in attachment_paths {
-                let path = Path::new(path_str);
-                let filename = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("attachment")
-                    .to_string();
-
-                let file_bytes = std::fs::read(path).map_err(|e| {
-                    PebbleError::Internal(format!("Failed to read attachment '{}': {e}", path_str))
-                })?;
-
-                let content_type = mime_type_from_extension(
-                    path.extension().and_then(|e| e.to_str()).unwrap_or(""),
-                );
-
-                let attachment =
-                    Attachment::new(filename).body(Body::new(file_bytes), content_type);
-
-                mixed = mixed.singlepart(attachment);
-            }
-
-            builder
-                .multipart(mixed)
-                .map_err(|e| PebbleError::Internal(format!("Failed to build email: {e}")))?
-        };
+        let email = build_message(
+            from,
+            to,
+            cc,
+            bcc,
+            subject,
+            body_text,
+            body_html,
+            in_reply_to,
+            attachment_paths,
+        )?;
 
         if let Some(ref proxy) = self.proxy {
             self.send_via_proxy(&email, proxy).await
@@ -142,23 +75,25 @@ impl SmtpSender {
 
     /// Send without a proxy using the standard lettre AsyncSmtpTransport.
     async fn send_direct(&self, email: &lettre::Message) -> Result<()> {
+        let tls_parameters = || smtp_tls_parameters(&self.host, self.accept_invalid_certs);
         let transport = match self.security {
             ConnectionSecurity::Tls => {
-                AsyncSmtpTransport::<lettre::Tokio1Executor>::relay(&self.host)
-                    .map_err(|e| PebbleError::Network(format!("SMTP relay error: {e}")))?
+                AsyncSmtpTransport::<lettre::Tokio1Executor>::builder_dangerous(&self.host)
+                    .tls(Tls::Wrapper(tls_parameters()?))
                     .port(self.port)
                     .credentials(self.credentials.clone())
                     .build()
             }
             ConnectionSecurity::StartTls => {
-                AsyncSmtpTransport::<lettre::Tokio1Executor>::starttls_relay(&self.host)
-                    .map_err(|e| PebbleError::Network(format!("SMTP STARTTLS error: {e}")))?
+                AsyncSmtpTransport::<lettre::Tokio1Executor>::builder_dangerous(&self.host)
+                    .tls(Tls::Required(tls_parameters()?))
                     .port(self.port)
                     .credentials(self.credentials.clone())
                     .build()
             }
             ConnectionSecurity::Plain => {
                 AsyncSmtpTransport::<lettre::Tokio1Executor>::builder_dangerous(&self.host)
+                    .tls(Tls::None)
                     .port(self.port)
                     .credentials(self.credentials.clone())
                     .build()
@@ -190,25 +125,56 @@ impl SmtpSender {
                         .await
                         .map_err(|e| PebbleError::Network(format!("SOCKS5 connect failed: {e}")))?;
 
-                // We need to upgrade the raw TCP stream to TLS before SMTP handshake.
-                // Use tokio-rustls directly since we already have a connected stream.
-                let rustls_config = build_rustls_client_config()?;
+                // Try rustls first, fall back to native-tls if handshake fails
+                let rustls_config = build_rustls_client_config(self.accept_invalid_certs)?;
                 let connector = tokio_rustls::TlsConnector::from(rustls_config);
                 let domain = rustls::pki_types::ServerName::try_from(self.host.clone())
-                    .map_err(|e| PebbleError::Network(format!("Invalid TLS server name: {e}")))?;
-                let tls_stream = connector
-                    .connect(domain, socks_stream.into_inner())
-                    .await
-                    .map_err(|e| PebbleError::Network(format!("TLS handshake failed: {e}")))?;
+                    .map_err(|e| PebbleError::Network(format!("Invalid TLS server name: {e}")))?
+                    .to_owned();
 
-                let mut conn = AsyncSmtpConnection::connect_with_transport(
-                    Box::new(DebugStream(tls_stream)),
-                    &hello_name,
-                )
-                .await
-                .map_err(|e| PebbleError::Network(format!("SMTP handshake failed: {e}")))?;
-
-                authenticate_and_send(&mut conn, &self.credentials, email).await?;
+                match connector.connect(domain, socks_stream.into_inner()).await {
+                    Ok(tls_stream) => {
+                        let mut conn = AsyncSmtpConnection::connect_with_transport(
+                            Box::new(DebugStream(tls_stream)),
+                            &hello_name,
+                        )
+                        .await
+                        .map_err(|e| PebbleError::Network(format!("SMTP handshake failed: {e}")))?;
+                        authenticate_and_send(&mut conn, &self.credentials, email).await?;
+                    }
+                    Err(rustls_err) => {
+                        tracing::debug!(
+                            "SMTP rustls handshake failed ({}), retrying with native-tls",
+                            rustls_err
+                        );
+                        // Reconnect SOCKS5 and try native-tls
+                        let socks_stream = tokio_socks::tcp::Socks5Stream::connect(
+                            proxy_addr.as_str(),
+                            target.as_str(),
+                        )
+                        .await
+                        .map_err(|e| {
+                            PebbleError::Network(format!("SOCKS5 reconnect failed: {e}"))
+                        })?;
+                        let native_connector =
+                            build_native_tls_connector(self.accept_invalid_certs)?;
+                        let tls_stream = native_connector
+                            .connect(&self.host, socks_stream.into_inner())
+                            .await
+                            .map_err(|e| {
+                                PebbleError::Network(format!(
+                                    "TLS failed with both backends — rustls: {rustls_err}, native-tls: {e}"
+                                ))
+                            })?;
+                        let mut conn = AsyncSmtpConnection::connect_with_transport(
+                            Box::new(DebugStream(tls_stream)),
+                            &hello_name,
+                        )
+                        .await
+                        .map_err(|e| PebbleError::Network(format!("SMTP handshake failed: {e}")))?;
+                        authenticate_and_send(&mut conn, &self.credentials, email).await?;
+                    }
+                }
             }
             ConnectionSecurity::StartTls => {
                 let socks_stream =
@@ -228,8 +194,7 @@ impl SmtpSender {
                         "STARTTLS required but server does not support it — refusing to send in plaintext".to_string(),
                     ));
                 }
-                let tls_params = TlsParameters::new(self.host.clone())
-                    .map_err(|e| PebbleError::Network(format!("TLS parameters error: {e}")))?;
+                let tls_params = smtp_tls_parameters(&self.host, self.accept_invalid_certs)?;
                 conn.starttls(tls_params, &hello_name)
                     .await
                     .map_err(|e| PebbleError::Network(format!("STARTTLS failed: {e}")))?;
@@ -257,6 +222,14 @@ impl SmtpSender {
     }
 }
 
+fn smtp_tls_parameters(host: &str, accept_invalid_certs: bool) -> Result<TlsParameters> {
+    TlsParameters::builder(host.to_string())
+        .dangerous_accept_invalid_certs(accept_invalid_certs)
+        .dangerous_accept_invalid_hostnames(accept_invalid_certs)
+        .build()
+        .map_err(|e| PebbleError::Network(format!("TLS parameters error: {e}")))
+}
+
 /// Authenticate on an open `AsyncSmtpConnection` and send one message.
 async fn authenticate_and_send(
     conn: &mut AsyncSmtpConnection,
@@ -279,16 +252,44 @@ async fn authenticate_and_send(
 }
 
 /// Build a rustls ClientConfig that trusts the system/webpki roots.
-fn build_rustls_client_config() -> Result<std::sync::Arc<rustls::ClientConfig>> {
+fn build_rustls_client_config(
+    accept_invalid_certs: bool,
+) -> Result<std::sync::Arc<rustls::ClientConfig>> {
     let provider = std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let mut root_store = rustls::RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let config = rustls::ClientConfig::builder_with_provider(provider)
+    let builder = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
-        .map_err(|e| PebbleError::Network(format!("TLS protocol versions: {e}")))?
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
+        .map_err(|e| PebbleError::Network(format!("TLS protocol versions: {e}")))?;
+    let config = if accept_invalid_certs {
+        builder
+            .dangerous()
+            .with_custom_certificate_verifier(std::sync::Arc::new(
+                crate::imap::AcceptInvalidCertsVerifier::new(root_store),
+            ))
+            .with_no_client_auth()
+    } else {
+        builder
+            .with_root_certificates(root_store)
+            .with_no_client_auth()
+    };
     Ok(std::sync::Arc::new(config))
+}
+
+/// Build a native-tls connector (OS TLS backend: SChannel/SecureTransport/OpenSSL).
+fn build_native_tls_connector(
+    accept_invalid_certs: bool,
+) -> Result<async_native_tls::TlsConnector> {
+    let mut builder = native_tls::TlsConnector::builder();
+    if accept_invalid_certs {
+        builder.danger_accept_invalid_certs(true);
+        builder.danger_accept_invalid_hostnames(true);
+        builder.min_protocol_version(Some(native_tls::Protocol::Tlsv10));
+    }
+    let connector = builder
+        .build()
+        .map_err(|e| PebbleError::Network(format!("native-tls init: {e}")))?;
+    Ok(async_native_tls::TlsConnector::from(connector))
 }
 
 // ---------------------------------------------------------------------------
@@ -450,10 +451,145 @@ fn mime_type_from_extension(ext: &str) -> ContentType {
 
 #[cfg(test)]
 mod tls_config_tests {
-    use super::build_rustls_client_config;
+    use super::{build_native_tls_connector, build_rustls_client_config};
 
     #[test]
     fn build_rustls_client_config_returns_result() {
-        assert!(build_rustls_client_config().is_ok());
+        assert!(build_rustls_client_config(false).is_ok());
+        assert!(build_rustls_client_config(true).is_ok());
+    }
+
+    #[test]
+    fn build_native_tls_connector_returns_result() {
+        assert!(build_native_tls_connector(false).is_ok());
+        assert!(build_native_tls_connector(true).is_ok());
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_message(
+    from: &pebble_core::EmailAddress,
+    to: &[String],
+    cc: &[String],
+    bcc: &[String],
+    subject: &str,
+    body_text: &str,
+    body_html: Option<&str>,
+    in_reply_to: Option<&str>,
+    attachment_paths: &[String],
+) -> Result<lettre::Message> {
+    if to.is_empty() {
+        return Err(PebbleError::Internal("No recipients".to_string()));
+    }
+
+    let from_mailbox = crate::sender::sender_mailbox(from)?;
+
+    let mut builder = lettre::Message::builder()
+        .from(from_mailbox)
+        .subject(subject);
+
+    for addr in to {
+        let mailbox: Mailbox = addr
+            .parse()
+            .map_err(|e| PebbleError::Internal(format!("Invalid to address '{addr}': {e}")))?;
+        builder = builder.to(mailbox);
+    }
+
+    for addr in cc {
+        let mailbox: Mailbox = addr
+            .parse()
+            .map_err(|e| PebbleError::Internal(format!("Invalid cc address '{addr}': {e}")))?;
+        builder = builder.cc(mailbox);
+    }
+
+    for addr in bcc {
+        let mailbox: Mailbox = addr
+            .parse()
+            .map_err(|e| PebbleError::Internal(format!("Invalid bcc address '{addr}': {e}")))?;
+        builder = builder.bcc(mailbox);
+    }
+
+    if let Some(reply_to) = in_reply_to {
+        builder = builder.in_reply_to(reply_to.to_string());
+    }
+
+    let alternative_body = MultiPart::alternative()
+        .singlepart(
+            SinglePart::builder()
+                .content_type(ContentType::TEXT_PLAIN)
+                .body(body_text.to_string()),
+        )
+        .singlepart(
+            SinglePart::builder()
+                .content_type(ContentType::TEXT_HTML)
+                .body(body_html.unwrap_or(body_text).to_string()),
+        );
+
+    let email = if attachment_paths.is_empty() {
+        builder
+            .multipart(alternative_body)
+            .map_err(|e| PebbleError::Internal(format!("Failed to build email: {e}")))?
+    } else {
+        let mut mixed = MultiPart::mixed().multipart(alternative_body);
+
+        for path_str in attachment_paths {
+            let path = Path::new(path_str);
+            let filename = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("attachment")
+                .to_string();
+
+            let file_bytes = std::fs::read(path).map_err(|e| {
+                PebbleError::Internal(format!("Failed to read attachment '{}': {e}", path_str))
+            })?;
+
+            let content_type =
+                mime_type_from_extension(path.extension().and_then(|e| e.to_str()).unwrap_or(""));
+
+            let attachment = Attachment::new(filename).body(Body::new(file_bytes), content_type);
+
+            mixed = mixed.singlepart(attachment);
+        }
+
+        builder
+            .multipart(mixed)
+            .map_err(|e| PebbleError::Internal(format!("Failed to build email: {e}")))?
+    };
+
+    Ok(email)
+}
+
+#[cfg(test)]
+mod sender_identity_tests {
+    use super::*;
+
+    #[test]
+    fn smtp_wire_name_is_encoded_without_changing_envelope_address() {
+        let from = pebble_core::EmailAddress {
+            name: Some("张三, \"财务\"".into()),
+            address: "sender@example.com".into(),
+        };
+        let message = build_message(
+            &from,
+            &["to@example.com".into()],
+            &[],
+            &[],
+            "Subject",
+            "Body",
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            message.envelope().from().unwrap().to_string(),
+            "sender@example.com"
+        );
+        let raw = message.formatted();
+        let parsed = mail_parser::MessageParser::default().parse(&raw).unwrap();
+        let sender = parsed.from().unwrap().first().unwrap();
+        assert_eq!(sender.name.as_deref(), from.name.as_deref());
+        assert_eq!(sender.address.as_deref(), Some("sender@example.com"));
     }
 }

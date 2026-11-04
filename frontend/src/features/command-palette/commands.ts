@@ -26,6 +26,12 @@ export function buildCommands(t: (key: string, defaultValue: string) => string):
       execute: () => useUIStore.getState().setActiveView("kanban"),
     },
     {
+      id: "nav:contacts",
+      name: t("commands.goToContacts", "Go to Contacts"),
+      category: t("commands.navigation", "Navigation"),
+      execute: () => useUIStore.getState().setActiveView("contacts"),
+    },
+    {
       id: "nav:settings",
       name: t("commands.goToSettings", "Go to Settings"),
       category: t("commands.navigation", "Navigation"),
