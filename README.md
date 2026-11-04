@@ -135,6 +135,10 @@ npm run dev
 | `PEBBLE_REALTIME_PREFERENCE` | 否 | `balanced` | 服务端同步偏好：`realtime`、`balanced`、`battery` 或 `manual`；已保存的应用设置优先 |
 | `PEBBLE_SYNC_INTERVAL` | 否 | — | 已弃用并忽略；如设置会在启动时警告。请改用 `PEBBLE_REALTIME_PREFERENCE` |
 | `PEBBLE_ENCRYPTION_KEY` | 否 | 自动生成 | 32 字节 Hex 编码加密密钥 |
+| `PEBBLE_PUBLIC_BASE_URL` | OAuth 时必填 | 无 | 对外访问地址（HTTPS，本机可用 `http://localhost`），用于生成 OAuth 回调 `<地址>/api/v1/oauth/{gmail,outlook}/callback` |
+| `PEBBLE_GOOGLE_CLIENT_ID` / `PEBBLE_GOOGLE_CLIENT_SECRET` | 否 | 无 | Gmail OAuth；两项都需配置 |
+| `PEBBLE_MICROSOFT_CLIENT_ID` | 否 | 无 | Outlook OAuth；只配置 ID 时按公共客户端（PKCE，无 secret）登录，需在 Azure 应用中开启“允许公共客户端流”并注册回调地址 |
+| `PEBBLE_MICROSOFT_CLIENT_SECRET` | 否 | 无 | Outlook 机密客户端 secret；留空则使用公共客户端 |
 
 安全建议：
 
